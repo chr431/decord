@@ -21,6 +21,28 @@ namespace ffmpeg {
 static const int DECORD_CPU_FRAME_QUEUE_SIZE = std::stoi(
     decord::runtime::GetEnvironmentVariableOrDefault("DECORD_CPU_FRAME_QUEUE_SIZE", "32"));
 
+// FFmpeg 8+: use synchronous decode mode (AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS)
+// which bypasses internal frame threading.  This eliminates EAGAIN from
+// avcodec_send_packet and reduces thread-synchronisation overhead, which can
+// help latency-sensitive workloads.  Frame-threading generally wins for
+// throughput, so this defaults to OFF.  Set DECORD_SYNC_DECODE=1 to enable.
+static const bool DECORD_SYNC_DECODE = std::stoi(
+    decord::runtime::GetEnvironmentVariableOrDefault("DECORD_SYNC_DECODE", "0")) != 0;
+
+// FFmpeg 8+: prefer avcodec_receive_frame_flags with SYNCHRONOUS flag
+// to bypass internal frame threading overhead.  Falls back to the
+// standard avcodec_receive_frame on older FFmpeg or when sync decode
+// is disabled via DECORD_SYNC_DECODE=0.
+static inline int ReceiveFrame(AVCodecContext *ctx, AVFrame *frame) {
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(62, 0, 0)
+    if (DECORD_SYNC_DECODE) {
+        return avcodec_receive_frame_flags(
+            ctx, frame, AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS);
+    }
+#endif
+    return avcodec_receive_frame(ctx, frame);
+}
+
 FFMPEGThreadedDecoder::FFMPEGThreadedDecoder()
     : frame_count_(0), draining_(false), run_(false),
       error_status_(false), error_message_(),
@@ -221,7 +243,7 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
             // draining mode, pulling buffered frames out
             CHECK_GE(avcodec_send_packet(dec_ctx_.get(), NULL), 0) << "Thread worker: Error entering draining mode.";
             while (true) {
-                got_picture = avcodec_receive_frame(dec_ctx_.get(), frame.get());
+                got_picture = ReceiveFrame(dec_ctx_.get(), frame.get());
                 if (got_picture == AVERROR_EOF) {
                     // LOG(INFO) << "stop draining";
                     for (int cnt = 0; cnt < 128; ++cnt) {
@@ -244,7 +266,7 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
             // full; drain any available output, then yield and retry.
             while ((send_ret = avcodec_send_packet(dec_ctx_.get(),
                                                    pkt.get())) == AVERROR(EAGAIN)) {
-                got_picture = avcodec_receive_frame(dec_ctx_.get(), frame.get());
+                got_picture = ReceiveFrame(dec_ctx_.get(), frame.get());
                 if (got_picture == 0) {
                     NDArray out_buf;
                     bool get_buf = buffer_queue_->Pop(&out_buf);
