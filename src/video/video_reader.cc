@@ -567,7 +567,18 @@ double VideoReader::GetRotation() const {
     if (rotate && *rotate->value && strcmp(rotate->value, "0"))
         theta = atof(rotate->value);
 
-    uint8_t* displaymatrix = av_stream_get_side_data(active_st, AV_PKT_DATA_DISPLAYMATRIX, NULL);
+    uint8_t* displaymatrix = NULL;
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(62, 0, 0)
+    // FFmpeg 8+: av_stream_get_side_data removed; iterate coded_side_data directly
+    for (int i = 0; i < active_st->codecpar->nb_coded_side_data; ++i) {
+        if (active_st->codecpar->coded_side_data[i].type == AV_PKT_DATA_DISPLAYMATRIX) {
+            displaymatrix = active_st->codecpar->coded_side_data[i].data;
+            break;
+        }
+    }
+#else
+    displaymatrix = av_stream_get_side_data(active_st, AV_PKT_DATA_DISPLAYMATRIX, NULL);
+#endif
     if (displaymatrix && !theta)
         theta = -av_display_rotation_get((int32_t*) displaymatrix);
 

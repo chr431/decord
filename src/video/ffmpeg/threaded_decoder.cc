@@ -36,17 +36,17 @@ void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, 
     char descr[128];
     switch(rotation) {
         case 90:
-            std::snprintf(descr, sizeof(descr), "transpose=1,scale=%d:%d", width, height);
+            std::snprintf(descr, sizeof(descr), "transpose=1,scale=%d:%d,format=rgb24", width, height);
             break;
         case 180:
-            std::snprintf(descr, sizeof(descr), "transpose=1,transpose=1,scale=%d:%d", width, height);
+            std::snprintf(descr, sizeof(descr), "transpose=1,transpose=1,scale=%d:%d,format=rgb24", width, height);
             break;
         case 270:
-            std::snprintf(descr, sizeof(descr), "transpose=2,scale=%d:%d", width, height);
+            std::snprintf(descr, sizeof(descr), "transpose=2,scale=%d:%d,format=rgb24", width, height);
             break;
         case 0:
         default:
-            std::snprintf(descr, sizeof(descr), "scale=%d:%d", width, height);
+            std::snprintf(descr, sizeof(descr), "scale=%d:%d,format=rgb24", width, height);
     }
     filter_graph_ = FFMPEGFilterGraphPtr(new FFMPEGFilterGraph(descr, dec_ctx_.get()));
     if (running) {

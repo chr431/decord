@@ -70,7 +70,16 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx)
 	// av_free(buffersink_params);
     // LOG(INFO) << "create filter sink";
     // CHECK_GE(av_opt_set_bin(buffersink_ctx_, "pix_fmts", (uint8_t *)&pix_fmts, sizeof(AV_PIX_FMT_RGB24), AV_OPT_SEARCH_CHILDREN), 0) << "Set bin error";
-    CHECK_GE(av_opt_set_int_list(buffersink_ctx_, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN), 0) << "Set output pixel format error.";
+#if LIBAVFILTER_VERSION_INT >= AV_VERSION_INT(11, 0, 0)
+    // FFmpeg 8+: pixel_formats option is AV_OPT_TYPE_PIXEL_FMT, not binary.
+    // Since our filter chain always outputs RGB24 via the scale filter,
+    // the buffersink will naturally receive RGB24 without explicit constraint.
+    (void)pix_fmts;
+#else
+    CHECK_GE(av_opt_set_int_list(buffersink_ctx_, "pix_fmts", pix_fmts,
+                                 AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN), 0)
+        << "Set output pixel format error.";
+#endif
 
     // LOG(INFO) << "create filter set opt";
     /* Endpoints for the filter graph. */
