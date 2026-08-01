@@ -239,7 +239,26 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
             }
         } else {
             // normal mode, push in valid packets and retrieve frames
-            CHECK_GE(avcodec_send_packet(dec_ctx_.get(), pkt.get()), 0) << "Thread worker: Error sending packet.";
+            int send_ret;
+            // FFmpeg 8+ may return EAGAIN when the codec internal queue is
+            // full; drain any available output, then yield and retry.
+            while ((send_ret = avcodec_send_packet(dec_ctx_.get(),
+                                                   pkt.get())) == AVERROR(EAGAIN)) {
+                got_picture = avcodec_receive_frame(dec_ctx_.get(), frame.get());
+                if (got_picture == 0) {
+                    NDArray out_buf;
+                    bool get_buf = buffer_queue_->Pop(&out_buf);
+                    if (!get_buf) return;
+                    ProcessFrame(frame, out_buf);
+                } else {
+                    // No output ready yet — frame-threaded workers are busy.
+                    // Yield briefly so they can finish and free input slots.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if (!run_.load()) return;
+                }
+            }
+            CHECK_GE(send_ret, 0) << "Thread worker: Error sending packet: "
+                                  << send_ret;
             got_picture = avcodec_receive_frame(dec_ctx_.get(), frame.get());
             if (got_picture == 0) {
                 NDArray out_buf;

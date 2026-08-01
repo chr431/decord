@@ -322,6 +322,11 @@ void CUThreadedDecoder::LaunchThreadImpl() {
         if (!ret) return;
 
         if (avpkt && avpkt->size) {
+            // Strip side data before BSF: the hardware decoder only needs raw
+            // bitstream data.  FFmpeg 8.x may attach side data (HDR metadata,
+            // display matrix, etc.) to every packet; clearing it avoids
+            // unnecessary allocation/copy overhead in the BSF hot path.
+            av_packet_free_side_data(avpkt.get());
             // bitstream filter raw packet
             AVPacketPtr filtered_avpkt = ffmpeg::AVPacketPool::Get()->Acquire();
             if (filtered_avpkt->data) {
