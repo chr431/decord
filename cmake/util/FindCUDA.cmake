@@ -65,9 +65,14 @@ macro(find_cuda use_cuda)
     # directory, e.g.:
     #   .../NVIDIA GPU Computing Toolkit/Video_Codec_SDK_13.1.15
     #   .../NVIDIA GPU Computing Toolkit/Video_Codec_Interface_13.1.15
-    get_filename_component(_cuda_parent ${CUDA_TOOLKIT_ROOT_DIR} DIRECTORY)
-    file(GLOB _codec_sdk_dirs "${_cuda_parent}/Video_Codec_SDK_*")
-    file(GLOB _codec_if_dirs  "${_cuda_parent}/Video_Codec_Interface_*")
+    # CUDA_TOOLKIT_ROOT_DIR is e.g. .../CUDA/v13.3 — go up two levels
+    # to reach the Toolkit root (where Video_Codec_SDK_* lives)
+    get_filename_component(_cuda_parent1 ${CUDA_TOOLKIT_ROOT_DIR} DIRECTORY)
+    get_filename_component(_cuda_parent2 ${_cuda_parent1} DIRECTORY)
+    file(GLOB _codec_sdk_dirs "${_cuda_parent1}/Video_Codec_SDK_*"
+                               "${_cuda_parent2}/Video_Codec_SDK_*")
+    file(GLOB _codec_if_dirs  "${_cuda_parent1}/Video_Codec_Interface_*"
+                               "${_cuda_parent2}/Video_Codec_Interface_*")
 
     # Build search paths for nvcuvid.lib on Windows
     set(_nvcuvid_lib_hints "")
