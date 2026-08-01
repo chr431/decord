@@ -9,7 +9,7 @@
 #include <dmlc/logging.h>
 #include <thread>
 #include <chrono>
-#include "../runtime/str_util.h"
+#include "../../runtime/str_util.h"
 
 namespace decord {
 namespace ffmpeg {

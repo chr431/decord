@@ -264,7 +264,8 @@ int DECORDCFuncSetReturn(DECORDRetValueHandle ret,
   API_BEGIN();
   CHECK_EQ(num_ret, 1);
   DECORDRetValue* rv = static_cast<DECORDRetValue*>(ret);
-  *rv = DECORDArgValue(value[0], type_code[0]);
+  static_cast<DECORDPODValue_&>(*rv) =
+      static_cast<const DECORDPODValue_&>(DECORDArgValue(value[0], type_code[0]));
   API_END();
 }
 
@@ -353,7 +354,9 @@ int DECORDStreamStreamSynchronize(int device_type,
 int DECORDCbArgToReturn(DECORDValue* value, int code) {
   API_BEGIN();
   decord::runtime::DECORDRetValue rv;
-  rv = decord::runtime::DECORDArgValue(*value, code);
+  static_cast<decord::runtime::DECORDPODValue_&>(rv) =
+      static_cast<const decord::runtime::DECORDPODValue_&>(
+          decord::runtime::DECORDArgValue(*value, code));
   int tcode;
   rv.MoveToCHost(value, &tcode);
   CHECK_EQ(tcode, code);

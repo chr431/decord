@@ -39,14 +39,27 @@ if (FFMPEG_DIR)
       ${FFMPEG_DIR}/lib/libswresample.so
     )
   else()
-    set(FFMPEG_LIBRARIES
-      ${FFMPEG_DIR}/lib/libavformat.lib
-      ${FFMPEG_DIR}/lib/libavfilter.lib
-      ${FFMPEG_DIR}/lib/libavcodec.lib
-      ${FFMPEG_DIR}/lib/libavutil.lib
-      ${FFMPEG_DIR}/lib/libavdevice.lib
-      ${FFMPEG_DIR}/lib/libswresample.lib
-    )
+    # FFmpeg 5+ Windows builds drop the "lib" prefix (avformat.lib vs libavformat.lib).
+    # Try new-style names first, fall back to old-style.
+    if(EXISTS ${FFMPEG_DIR}/lib/avformat.lib)
+      set(FFMPEG_LIBRARIES
+        ${FFMPEG_DIR}/lib/avformat.lib
+        ${FFMPEG_DIR}/lib/avfilter.lib
+        ${FFMPEG_DIR}/lib/avcodec.lib
+        ${FFMPEG_DIR}/lib/avutil.lib
+        ${FFMPEG_DIR}/lib/avdevice.lib
+        ${FFMPEG_DIR}/lib/swresample.lib
+      )
+    else()
+      set(FFMPEG_LIBRARIES
+        ${FFMPEG_DIR}/lib/libavformat.lib
+        ${FFMPEG_DIR}/lib/libavfilter.lib
+        ${FFMPEG_DIR}/lib/libavcodec.lib
+        ${FFMPEG_DIR}/lib/libavutil.lib
+        ${FFMPEG_DIR}/lib/libavdevice.lib
+        ${FFMPEG_DIR}/lib/libswresample.lib
+      )
+    endif()
   endif()
 endif (FFMPEG_DIR)
 
