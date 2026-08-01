@@ -66,6 +66,7 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         std::mutex error_mutex_;
         std::atomic<bool> error_status_;
         std::string error_message_;
+        int max_queue_frames_;
 
     DISALLOW_COPY_AND_ASSIGN(FFMPEGThreadedDecoder);
 };

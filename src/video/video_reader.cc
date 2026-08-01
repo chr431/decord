@@ -30,6 +30,11 @@ static const int REWIND_RETRY_MAX = std::stoi(runtime::GetEnvironmentVariableOrD
 static const int EOF_RETRY_MAX = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_EOF_RETRY_MAX", "10240"));
 // (corrupted video only): The warning threshold(0.0 - 1.0) when multiple frames are unavailable and fallbacked to cached frames
 static const float DUPLICATE_WARNING_THRESHOLD = std::stof(runtime::GetEnvironmentVariableOrDefault("DECORD_DUPLICATE_WARNING_THRESHOLD", "0.25"));
+// Number of FFmpeg decode threads.  0 = auto (can use 16+ threads causing
+// high memory on CPU path).  For CPU decoding we default to 2 to keep
+// FFmpeg's internal frame-buffer pool small (~600 MB instead of >9 GB).
+// Set DECORD_FFMPEG_THREAD_COUNT=0 to restore old auto behaviour.
+static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "2"));
 
 VideoReader::VideoReader(std::string fn, DLContext ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol)
      : ctx_(ctx), key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
@@ -172,7 +177,15 @@ void VideoReader::SetVideoStream(int stream_nb) {
 
     auto dec_ctx = avcodec_alloc_context3(dec);
     // LOG(INFO) << "nb_thread_decoding_: " << nb_thread_decoding_;
-    dec_ctx->thread_count = nb_thread_decoding_;
+    // CPU decoding: use DECORD_FFMPEG_THREAD_COUNT (default 2) to keep
+    // FFmpeg's internal frame-buffer pool small.  GPU (NVDEC) is unaffected.
+    if (kDLCPU == ctx_.device_type) {
+        dec_ctx->thread_count = nb_thread_decoding_ > 0
+            ? nb_thread_decoding_
+            : DECORD_FFMPEG_THREAD_COUNT;
+    } else {
+        dec_ctx->thread_count = nb_thread_decoding_;
+    }
     // LOG(INFO) << "Original decoder multithreading: " << dec_ctx->thread_count;
     // CHECK_GE(avcodec_copy_context(dec_ctx, fmt_ctx_->streams[stream_nb]->codec), 0) << "Error: copy context";
     // CHECK_GE(avcodec_parameters_to_context(dec_ctx, fmt_ctx_->streams[st_nb]->codecpar), 0) << "Error: copy parameters to codec context.";

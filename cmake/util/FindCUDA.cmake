@@ -59,6 +59,31 @@ macro(find_cuda use_cuda)
 
   # additional libraries
   if(CUDA_FOUND)
+    # ── Locate NVIDIA Video Codec SDK (nvcuvid) ──
+    # Modern CUDA distributions ship the Video Codec SDK separately from the
+    # CUDA Toolkit.  The SDK is typically installed under the same parent
+    # directory, e.g.:
+    #   .../NVIDIA GPU Computing Toolkit/Video_Codec_SDK_13.1.15
+    #   .../NVIDIA GPU Computing Toolkit/Video_Codec_Interface_13.1.15
+    get_filename_component(_cuda_parent ${CUDA_TOOLKIT_ROOT_DIR} DIRECTORY)
+    file(GLOB _codec_sdk_dirs "${_cuda_parent}/Video_Codec_SDK_*")
+    file(GLOB _codec_if_dirs  "${_cuda_parent}/Video_Codec_Interface_*")
+
+    # Build search paths for nvcuvid.lib on Windows
+    set(_nvcuvid_lib_hints "")
+    foreach(_dir ${_codec_sdk_dirs})
+      if(EXISTS "${_dir}/Lib/win/x64")
+        list(APPEND _nvcuvid_lib_hints "${_dir}/Lib/win/x64")
+      endif()
+    endforeach()
+
+    # Add Video Codec SDK Interface headers to CUDA_INCLUDE_DIRS
+    foreach(_dir ${_codec_sdk_dirs} ${_codec_if_dirs})
+      if(EXISTS "${_dir}/Interface")
+        list(APPEND CUDA_INCLUDE_DIRS "${_dir}/Interface")
+      endif()
+    endforeach()
+
     if(MSVC)
       find_library(CUDA_CUDA_LIBRARY cuda
         ${CUDA_TOOLKIT_ROOT_DIR}/lib/x64
@@ -77,7 +102,8 @@ macro(find_cuda use_cuda)
         ${CUDA_TOOLKIT_ROOT_DIR}/lib/Win32)
       find_library(CUDA_NVCUVID_LIBRARY nvcuvid
         ${CUDA_TOOLKIT_ROOT_DIR}/lib/x64
-        ${CUDA_TOOLKIT_ROOT_DIR}/lib/Win32)
+        ${CUDA_TOOLKIT_ROOT_DIR}/lib/Win32
+        ${_nvcuvid_lib_hints})
     else(MSVC)
       find_library(_CUDA_CUDA_LIBRARY cuda
         PATHS ${CUDA_TOOLKIT_ROOT_DIR}
@@ -105,7 +131,8 @@ macro(find_cuda use_cuda)
           PATH_SUFFIXES lib lib64 targets/x86_64-linux/lib targets/x86_64-linux/lib/stubs lib64/stubs lib/x86_64-linux-gnu
           NO_DEFAULT_PATH
         PATHS /usr
-          PATH_SUFFIXES lib/x86_64-linux-gnu NO_DEFAULT_PATH)
+          PATH_SUFFIXES lib/x86_64-linux-gnu NO_DEFAULT_PATH
+        ${_nvcuvid_lib_hints})
     endif(MSVC)
     message(STATUS "Found CUDA_TOOLKIT_ROOT_DIR=" ${CUDA_TOOLKIT_ROOT_DIR})
     message(STATUS "Found CUDA_CUDA_LIBRARY=" ${CUDA_CUDA_LIBRARY})

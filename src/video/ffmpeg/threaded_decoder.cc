@@ -7,11 +7,24 @@
 #include "threaded_decoder.h"
 
 #include <dmlc/logging.h>
+#include <thread>
+#include <chrono>
+#include "../runtime/str_util.h"
 
 namespace decord {
 namespace ffmpeg {
 
-FFMPEGThreadedDecoder::FFMPEGThreadedDecoder() : frame_count_(0), draining_(false), run_(false), error_status_(false), error_message_() {
+// Upper bound on frame_queue_ to prevent unbounded memory growth.
+// When the consumer (Python) is slower than the producer (decoder),
+// the queue would otherwise grow to hold every decoded frame.
+// 0 = unlimited (old behaviour).
+static const int DECORD_CPU_FRAME_QUEUE_SIZE = std::stoi(
+    decord::runtime::GetEnvironmentVariableOrDefault("DECORD_CPU_FRAME_QUEUE_SIZE", "32"));
+
+FFMPEGThreadedDecoder::FFMPEGThreadedDecoder()
+    : frame_count_(0), draining_(false), run_(false),
+      error_status_(false), error_message_(),
+      max_queue_frames_(DECORD_CPU_FRAME_QUEUE_SIZE) {
 }
 
 void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int height, int rotation) {
@@ -159,6 +172,17 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
     CHECK(filter_graph_->Pop(&out_frame_p)) << "Error fetch filtered frame.";
 
     auto tmp = AsNDArray(out_frame);
+    // ── Backpressure: if the frame queue is full, wait for consumer ──
+    // Prevents unbounded queue growth when Python consumes frames slower
+    // than the decoder produces them.  0 (max_queue_frames_ default) or
+    // negative disables backpressure entirely.
+    if (max_queue_frames_ > 0) {
+        while (frame_queue_->Size() >= static_cast<size_t>(max_queue_frames_)
+               && run_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+    if (!run_.load()) return;
     if (out_buf.defined()) {
         CHECK(out_buf.Size() == tmp.Size());
         out_buf.CopyFrom(tmp);
