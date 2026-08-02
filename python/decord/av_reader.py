@@ -1,15 +1,11 @@
 """AV Reader."""
 from __future__ import absolute_import
 
-import ctypes
 import numpy as np
-import math
 from .video_reader import VideoReader
 from .audio_reader import AudioReader
 
 from .ndarray import cpu, gpu
-from . import ndarray as _nd
-from .bridge import bridge_out
 
 class AVReader(object):
     """Individual audio video reader with convenient indexing function.
@@ -125,15 +121,6 @@ class AVReader(object):
             prev_video_idx = idx
             prev_audio_end_idx = audio_end_idx
         return (audio_arr, self.__video_reader.get_batch(indices))
-
-    def _get_slice(self, sl):
-        audio_arr = np.empty(shape=(self.__audio_reader.shape()[0], 0), dtype='float32')
-        for idx in list(sl):
-            audio_start_idx, audio_end_idx = self.__video_reader.get_frame_timestamp(idx)
-            audio_start_idx = self.__audio_reader._time_to_sample(audio_start_idx)
-            audio_end_idx = self.__audio_reader._time_to_sample(audio_end_idx)
-            audio_arr = np.concatenate((audio_arr, self.__audio_reader[audio_start_idx:audio_end_idx].asnumpy()), axis=1)
-        return (bridge_out(_nd.array(audio_arr)), self.__video_reader.get_batch(sl))
 
     def _validate_indices(self, indices):
         """Validate int64 integers and convert negative integers to positive by backward search"""

@@ -20,16 +20,17 @@ _CURRENT_BRIDGE.type = 'native'
 _GLOBAL_BRIDGE_TYPE = 'native'  # child threads will derive from the global type but not overwrite
 
 def reset_bridge():
+    global _GLOBAL_BRIDGE_TYPE
     _CURRENT_BRIDGE.type = 'native'
     if threading.current_thread().name == 'MainThread':
         _GLOBAL_BRIDGE_TYPE = 'native'
 
 def set_bridge(new_bridge):
+    global _GLOBAL_BRIDGE_TYPE
     assert isinstance(new_bridge, str), (
         "New bridge type must be str. Choices: {}".format(_BRIDGE_TYPES.keys()))
     assert new_bridge in _BRIDGE_TYPES.keys(), (
         "valid bridges: {}".format(_BRIDGE_TYPES.keys()))
-    global _CURRENT_BRIDGE
     _CURRENT_BRIDGE.type = new_bridge
     if threading.current_thread().name == 'MainThread':
         _GLOBAL_BRIDGE_TYPE = new_bridge

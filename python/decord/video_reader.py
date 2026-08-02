@@ -147,7 +147,7 @@ class VideoReader(object):
         """
         assert self._handle is not None
         if isinstance(idx, slice):
-            idx = self.get_batch(range(*idx.indices(len(self))))
+            idx = range(*idx.indices(len(self)))
         idx = self._validate_indices(idx)
         if self._frame_pts is None:
             self._frame_pts = _CAPI_VideoReaderGetFramePTS(self._handle).asnumpy()
