@@ -22,10 +22,10 @@ CUMappedFrame::CUMappedFrame(CUVIDPARSERDISPINFO* disp_info,
                                     CUstream stream)
     : disp_info{disp_info}, valid_{false}, decoder_(decoder), params_{0} {
 
-    if (!disp_info->progressive_frame) {
-        LOG(FATAL) << "Got an interlaced frame. We don't do interlaced frames.";
-    }
-
+    // Interlaced content is deinterlaced by cuvidMapVideoFrame according to
+    // the decoder's DeinterlaceMode (cudaVideoDeinterlaceMode_Adaptive, see
+    // cuda_decoder_impl.cc): passing progressive_frame=0 triggers adaptive
+    // deinterlacing, while progressive frames pass through untouched.
     params_.progressive_frame = disp_info->progressive_frame;
     params_.top_field_first = disp_info->top_field_first;
     params_.second_field = 0;

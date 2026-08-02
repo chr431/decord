@@ -27,8 +27,9 @@ namespace decord {
             return;
         }
         avformat_close_input(&pFormatContext);
-        // Calculate accurate duration
-        duration = totalSamplesPerChannel / originalSampleRate;
+        // Calculate accurate duration (double division: totalSamplesPerChannel
+        // is an int, and integer division would truncate the fraction)
+        duration = static_cast<double>(totalSamplesPerChannel) / originalSampleRate;
         // Construct NDArray
         ToNDArray();
     }
