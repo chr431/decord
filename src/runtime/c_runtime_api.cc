@@ -5,9 +5,7 @@
  */
 #include <dmlc/thread_local.h>
 #include <decord/runtime/c_runtime_api.h>
-#include <decord/runtime/c_backend_api.h>
 #include <decord/runtime/packed_func.h>
-#include <decord/runtime/module.h>
 #include <decord/runtime/registry.h>
 #include <decord/runtime/device_api.h>
 #ifdef _LIBCPP_SGX_CONFIG
@@ -129,92 +127,6 @@ void DECORDAPISetLastError(const char* msg) {
 #endif
 }
 
-int DECORDModLoadFromFile(const char* file_name,
-                       const char* format,
-                       DECORDModuleHandle* out) {
-  API_BEGIN();
-  Module m = Module::LoadFromFile(file_name, format);
-  *out = new Module(m);
-  API_END();
-}
-
-int DECORDModImport(DECORDModuleHandle mod,
-                 DECORDModuleHandle dep) {
-  API_BEGIN();
-  static_cast<Module*>(mod)->Import(
-      *static_cast<Module*>(dep));
-  API_END();
-}
-
-int DECORDModGetFunction(DECORDModuleHandle mod,
-                      const char* func_name,
-                      int query_imports,
-                      DECORDFunctionHandle *func) {
-  API_BEGIN();
-  PackedFunc pf = static_cast<Module*>(mod)->GetFunction(
-      func_name, query_imports != 0);
-  if (pf != nullptr) {
-    *func = new PackedFunc(pf);
-  } else {
-    *func = nullptr;
-  }
-  API_END();
-}
-
-int DECORDModFree(DECORDModuleHandle mod) {
-  API_BEGIN();
-  delete static_cast<Module*>(mod);
-  API_END();
-}
-
-int DECORDBackendGetFuncFromEnv(void* mod_node,
-                             const char* func_name,
-                             DECORDFunctionHandle *func) {
-  API_BEGIN();
-  *func = (DECORDFunctionHandle)(
-      static_cast<ModuleNode*>(mod_node)->GetFuncFromEnv(func_name));
-  API_END();
-}
-
-void* DECORDBackendAllocWorkspace(int device_type,
-                               int device_id,
-                               uint64_t size,
-                               int dtype_code_hint,
-                               int dtype_bits_hint) {
-  DECORDContext ctx;
-  ctx.device_type = static_cast<DLDeviceType>(device_type);
-  ctx.device_id = device_id;
-
-  DECORDType type_hint;
-  type_hint.code = static_cast<decltype(type_hint.code)>(dtype_code_hint);
-  type_hint.bits = static_cast<decltype(type_hint.bits)>(dtype_bits_hint);
-  type_hint.lanes = 1;
-
-  return DeviceAPIManager::Get(ctx)->AllocWorkspace(ctx,
-                                                    static_cast<size_t>(size),
-                                                    type_hint);
-}
-
-int DECORDBackendFreeWorkspace(int device_type,
-                            int device_id,
-                            void* ptr) {
-  DECORDContext ctx;
-  ctx.device_type = static_cast<DLDeviceType>(device_type);
-  ctx.device_id = device_id;
-  DeviceAPIManager::Get(ctx)->FreeWorkspace(ctx, ptr);
-  return 0;
-}
-
-int DECORDBackendRunOnce(void** handle,
-                      int (*f)(void*),
-                      void* cdata,
-                      int nbytes) {
-  if (*handle == nullptr) {
-    *handle = reinterpret_cast<void*>(1);
-    return (*f)(cdata);
-  }
-  return 0;
-}
 
 int DECORDFuncFree(DECORDFunctionHandle func) {
   API_BEGIN();
@@ -364,7 +276,7 @@ int DECORDCbArgToReturn(DECORDValue* value, int code) {
 }
 
 // set device api
-DECORD_REGISTER_GLOBAL(decord::runtime::symbol::decord_set_device)
+DECORD_REGISTER_GLOBAL("decord_set_device")
 .set_body([](DECORDArgs args, DECORDRetValue *ret) {
     DECORDContext ctx;
     ctx.device_type = static_cast<DLDeviceType>(args[0].operator int());

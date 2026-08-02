@@ -15,7 +15,6 @@
 #include <memory>
 #include <type_traits>
 #include "c_runtime_api.h"
-#include "module.h"
 #include "ndarray.h"
 #include "node_base.h"
 
@@ -546,10 +545,6 @@ class DECORDArgValue : public DECORDPODValue_ {
   operator TypedPackedFunc<FType>() const {
     return TypedPackedFunc<FType>(operator PackedFunc());
   }
-  operator Module() const {
-    DECORD_CHECK_TYPE_CODE(type_code_, kModuleHandle);
-    return *ptr<Module>();
-  }
   const DECORDValue& value() const {
     return value_;
   }
@@ -635,10 +630,7 @@ class DECORDRetValue : public DECORDPODValue_ {
   operator TypedPackedFunc<FType>() const {
     return TypedPackedFunc<FType>(operator PackedFunc());
   }
-  operator Module() const {
-    DECORD_CHECK_TYPE_CODE(type_code_, kModuleHandle);
-    return *ptr<Module>();
-  }
+
   // Assign operators
   DECORDRetValue& operator=(DECORDRetValue&& other) {
     this->Clear();
@@ -710,10 +702,6 @@ class DECORDRetValue : public DECORDPODValue_ {
   DECORDRetValue& operator=(const TypedPackedFunc<FType>& f) {
     return operator=(f.packed());
   }
-  DECORDRetValue& operator=(Module m) {
-    this->SwitchToClass(kModuleHandle, m);
-    return *this;
-  }
   DECORDRetValue& operator=(const DECORDRetValue& other) {  // NOLINT(*0
     this->Assign(other);
     return *this;
@@ -784,10 +772,6 @@ class DECORDRetValue : public DECORDPODValue_ {
         SwitchToClass<PackedFunc>(kFuncHandle, other);
         break;
       }
-      case kModuleHandle: {
-        SwitchToClass<Module>(kModuleHandle, other);
-        break;
-      }
       case kNDArrayContainer: {
         *this = other.operator NDArray();
         break;
@@ -838,7 +822,6 @@ class DECORDRetValue : public DECORDPODValue_ {
     switch (type_code_) {
       case kStr: delete ptr<std::string>(); break;
       case kFuncHandle: delete ptr<PackedFunc>(); break;
-      case kModuleHandle: delete ptr<Module>(); break;
       case kNodeHandle: delete ptr<NodePtr<Node> >(); break;
       case kNDArrayContainer: {
         static_cast<NDArray::Container*>(value_.v_handle)->DecRef();
@@ -1070,10 +1053,6 @@ class DECORDArgsSetter {
   void operator()(size_t i, const TypedPackedFunc<FType>& value) const {  // NOLINT(*)
     operator()(i, value.packed());
   }
-  void operator()(size_t i, const Module& value) const {  // NOLINT(*)
-    values_[i].v_handle = const_cast<Module*>(&value);
-    type_codes_[i] = kModuleHandle;
-  }
   void operator()(size_t i, const NDArray& value) const {  // NOLINT(*)
     values_[i].v_handle = value.data_;
     type_codes_[i] = kNDArrayContainer;
@@ -1268,19 +1247,6 @@ inline ExtTypeVTable* ExtTypeVTable::Register_() {
   return ExtTypeVTable::RegisterInternal(code, vt);
 }
 
-// Implement Module::GetFunction
-// Put implementation in this file so we have seen the PackedFunc
-inline PackedFunc Module::GetFunction(const std::string& name, bool query_imports) {
-  PackedFunc pf = node_->GetFunction(name, node_);
-  if (pf != nullptr) return pf;
-  if (query_imports) {
-    for (const Module& m : node_->imports_) {
-      pf = m.node_->GetFunction(name, m.node_);
-      if (pf != nullptr) return pf;
-    }
-  }
-  return pf;
-}
 }  // namespace runtime
 }  // namespace decord
 #endif  // DECORD_RUNTIME_PACKED_FUNC_H_

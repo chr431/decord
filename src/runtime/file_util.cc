@@ -13,44 +13,6 @@
 namespace decord {
 namespace runtime {
 
-void FunctionInfo::Save(dmlc::JSONWriter* writer) const {
-  std::vector<std::string> sarg_types(arg_types.size());
-  for (size_t i = 0; i < arg_types.size(); ++i) {
-    sarg_types[i] = DECORDType2String(arg_types[i]);
-  }
-  writer->BeginObject();
-  writer->WriteObjectKeyValue("name", name);
-  writer->WriteObjectKeyValue("arg_types", sarg_types);
-  writer->WriteObjectKeyValue("thread_axis_tags", thread_axis_tags);
-  writer->EndObject();
-}
-
-void FunctionInfo::Load(dmlc::JSONReader* reader) {
-  dmlc::JSONObjectReadHelper helper;
-  std::vector<std::string> sarg_types;
-  helper.DeclareField("name", &name);
-  helper.DeclareField("arg_types", &sarg_types);
-  helper.DeclareField("thread_axis_tags", &thread_axis_tags);
-  helper.ReadAllFields(reader);
-  arg_types.resize(sarg_types.size());
-  for (size_t i = 0; i < arg_types.size(); ++i) {
-    arg_types[i] = String2DECORDType(sarg_types[i]);
-  }
-}
-
-void FunctionInfo::Save(dmlc::Stream* writer) const {
-  writer->Write(name);
-  writer->Write(arg_types);
-  writer->Write(thread_axis_tags);
-}
-
-bool FunctionInfo::Load(dmlc::Stream* reader) {
-  if (!reader->Read(&name)) return false;
-  if (!reader->Read(&arg_types)) return false;
-  if (!reader->Read(&thread_axis_tags)) return false;
-  return true;
-}
-
 std::string GetFileFormat(const std::string& file_name,
                           const std::string& format) {
   std::string fmt = format;
@@ -112,34 +74,6 @@ void SaveBinaryToFile(
   std::ofstream fs(file_name, std::ios::out | std::ios::binary);
   CHECK(!fs.fail()) << "Cannot open " << file_name;
   fs.write(&data[0], data.length());
-}
-
-void SaveMetaDataToFile(
-    const std::string& file_name,
-    const std::unordered_map<std::string, FunctionInfo>& fmap) {
-  std::string version = "0.6.0";
-  std::ofstream fs(file_name.c_str());
-  CHECK(!fs.fail()) << "Cannot open file " << file_name;
-  dmlc::JSONWriter writer(&fs);
-  writer.BeginObject();
-  writer.WriteObjectKeyValue("decord_version", version);
-  writer.WriteObjectKeyValue("func_info", fmap);
-  writer.EndObject();
-  fs.close();
-}
-
-void LoadMetaDataFromFile(
-    const std::string& file_name,
-    std::unordered_map<std::string, FunctionInfo>* fmap) {
-  std::ifstream fs(file_name.c_str());
-  CHECK(!fs.fail()) << "Cannot open file " << file_name;
-  std::string version;
-  dmlc::JSONReader reader(&fs);
-  dmlc::JSONObjectReadHelper helper;
-  helper.DeclareField("decord_version", &version);
-  helper.DeclareField("func_info", fmap);
-  helper.ReadAllFields(&reader);
-  fs.close();
 }
 
 void RemoveFile(const std::string& file_name) {
