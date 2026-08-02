@@ -1,6 +1,7 @@
 import os
 import random
 import numpy as np
+import pytest
 from decord import VideoReader, cpu, gpu
 from decord.base import DECORDError
 
@@ -55,9 +56,9 @@ def test_video_get_batch():
     frames = vr.get_batch(rand_lst)
 
 def test_video_corrupted_get_batch():
-    from nose.tools import assert_raises
     vr = _get_corrupted_test_video(ctx=cpu(0))
-    assert_raises(DECORDError, vr.get_batch, range(40))
+    with pytest.raises(DECORDError):
+        vr.get_batch(range(40))
 
 def test_rotated_video():
     # Input videos are all h=320 w=568 in metadata, but
@@ -94,6 +95,15 @@ def test_frame_timestamps():
     frame_ts = vr.get_frame_timestamp(range(4))
     assert np.allclose(frame_ts[:,0], [0.0, 0.03125, 0.0625, 0.09375]), frame_ts[:,0]
 
+def test_frame_timestamp_slice():
+    # slice input must be equivalent to the plain list input (regression test
+    # for get_frame_timestamp decoding the slice and feeding frames back in
+    # as indices)
+    vr = _get_default_test_video()
+    ts_list = vr.get_frame_timestamp(range(5))
+    ts_slice = vr.get_frame_timestamp(slice(0, 5))
+    assert np.array_equal(ts_list, ts_slice)
+
 def test_bytes_io():
     fn = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'examples', 'flipping_a_pancake.mkv'))
     with open(fn, 'rb') as f:
@@ -104,5 +114,4 @@ def test_bytes_io():
         
 
 if __name__ == '__main__':
-    import nose
-    nose.runmodule()
+    raise SystemExit(pytest.main([__file__]))
