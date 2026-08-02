@@ -128,6 +128,34 @@ CUDA toolkit and the NVIDIA Video Codec SDK:
 pip install . --config-settings="cmake.args=-DUSE_CUDA=ON;-DFFMPEG_DIR=D:\path\to\ffmpeg"
 ```
 
+#### Development build (build/ + PYTHONPATH)
+
+For hacking on decord itself, build the shared library with CMake and run
+the python package in place — `decord/_ffi/libinfo.py` finds the library
+in `build/` (or `build/Release` on Windows):
+
+```bash
+# Linux / macOS
+cmake -S . -B build -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release -DFFMPEG_DIR=/path/to/ffmpeg
+cmake --build build -j$(nproc)
+
+# Windows (CUDA enabled; omit -DUSE_CUDA=ON for CPU-only)
+cmake -S . -B build -DUSE_CUDA=ON -DFFMPEG_DIR=D:/path/to/ffmpeg
+cmake --build build --config Release
+```
+
+Then run the python bindings against the freshly built library (no pip
+install needed):
+
+```bash
+PYTHONPATH=python python -c "from decord import VideoReader; print(len(VideoReader('examples/flipping_a_pancake.mkv')))"
+```
+
+Set `DECORD_LIBRARY_PATH` to point at the shared library if it lives
+somewhere else.  Useful build options: `-DUSE_CUDA=ON|OFF` (NVDEC),
+`-DFFMPEG_DIR=...` (custom FFmpeg), `-DDECORD_INSTALL_LIBDIR=...`
+(install destination for `cmake --install`).
+
 #### Mac OS
 
 Installation on macOS is similar to Linux. But macOS users need to install building tools like clang, GNU Make, cmake first.
