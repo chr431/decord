@@ -108,6 +108,26 @@ Editable development install (rebuilds on import):
 FFMPEG_DIR=/path/to/ffmpeg pip install -e .
 ```
 
+#### Windows
+
+Install CMake, Visual Studio (with C++ toolchain) and an FFmpeg build
+(>= 5.0) such as the ones from <https://www.gyan.dev/ffmpeg/builds/>.
+Then:
+
+```powershell
+$env:FFMPEG_DIR = "D:\path\to\ffmpeg"   # folder containing include/ and lib/
+pip install .
+```
+
+At runtime the FFmpeg shared libraries (`avcodec-*.dll` etc.) must be
+findable — either on `PATH` or next to `decord.dll` (the FFmpeg bin
+folder on `PATH` is the usual setup). The GPU (NVDEC) build requires the
+CUDA toolkit and the NVIDIA Video Codec SDK:
+
+```powershell
+pip install . --config-settings="cmake.args=-DUSE_CUDA=ON;-DFFMPEG_DIR=D:\path\to\ffmpeg"
+```
+
 #### Mac OS
 
 Installation on macOS is similar to Linux. But macOS users need to install building tools like clang, GNU Make, cmake first.
@@ -152,25 +172,6 @@ echo "PYTHONPATH=$PYTHONPATH:$pwd" >> ~/.bash_profile
 source ~/.bash_profile
 # option 2: install with setuptools
 python3 setup.py install --user
-```
-
-#### Windows
-
-For windows, you will need CMake and Visual Studio for C++ compilation.
-
--   First, install `git`, `cmake`, `ffmpeg` and `python`. You can use [Chocolatey](https://chocolatey.org/) to manage packages similar to Linux/Mac OS.
--   Second, install [`Visual Studio 2017 Community`](https://visualstudio.microsoft.com/), this my take some time.
-
-When dependencies are ready, open command line prompt:
-
-```bash
-cd your-workspace
-git clone --recursive https://github.com/dmlc/decord
-cd decord
-mkdir build
-cd build
-cmake -DCMAKE_CXX_FLAGS="/DDECORD_EXPORTS" -DCMAKE_CONFIGURATION_TYPES="Release" -G "Visual Studio 15 2017 Win64" ..
-# open `decord.sln` and build project
 ```
 
 ## Usage
