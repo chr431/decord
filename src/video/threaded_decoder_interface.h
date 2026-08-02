@@ -18,6 +18,15 @@ typedef enum {
 
 class ThreadedDecoderInterface {
     public:
+        // Number of output buffers the hardware decoder keeps in flight.
+        // PushNext uses this to size the EOF drain so display callbacks
+        // can always pop a buffer instead of blocking.
+        static constexpr int kMaxOutputSurfaces = 20;
+        // Number of kInt64 "draining finished" markers pushed after EOF;
+        // NextFrameImpl interprets them as end-of-stream signals and falls
+        // back to cached frames / rewind recovery.
+        static constexpr int kDrainMarkerCount = 128;
+
         virtual void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1, int rotation = 0) = 0;
         virtual void Start() = 0;
         virtual void Stop() = 0;

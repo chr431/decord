@@ -27,7 +27,6 @@ namespace decord {
 namespace cuda {
 
 class CUThreadedDecoder final : public ThreadedDecoderInterface {
-    constexpr static int kMaxOutputSurfaces = 20;
     using NDArray = runtime::NDArray;
     using AVPacketPtr = ffmpeg::AVPacketPtr;
     using AVCodecContextPtr = ffmpeg::AVCodecContextPtr;

@@ -394,8 +394,12 @@ void VideoReader::PushNext() {
                     // no preallocated memory and memory pool, use FFMPEG AVFrame pool
                     decoder_->Push(nullptr, NDArray());
                 } else {
-                    // use preallocated memory pool for GPU
-                    decoder_->Push(nullptr, ndarray_pool_.Acquire());
+                    // use preallocated memory pool for GPU; push one buffer per
+                    // decoder surface so display callbacks for in-flight frames
+                    // can always pop a buffer instead of blocking forever
+                    for (int i = 0; i < ThreadedDecoderInterface::kMaxOutputSurfaces; ++i) {
+                        decoder_->Push(nullptr, ndarray_pool_.Acquire());
+                    }
                 }
                 return;
             } else {
@@ -463,6 +467,13 @@ NDArray VideoReader::NextFrameImpl() {
               }
               retry++;
               ret = false;
+              if (eof_) {
+                // EOF reached but the decoder has not drained yet (the NVDEC
+                // flush and its cudaStreamSynchronize calls can take tens of
+                // milliseconds). Poll with a small sleep instead of burning
+                // the retry budget on a busy loop.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+              }
             }
         }
     }

@@ -124,6 +124,12 @@ void CUThreadedDecoder::Start() {
     reorder_queue_.reset(new ReorderQueue());
     //frame_order_.reset(new FrameOrderQueue());
     avcodec_flush_buffers(dec_ctx_.get());
+    // Recreate the NVDEC decoder alongside the parser. Surfaces left in
+    // flight by the previous session (pending decode/display) would
+    // otherwise keep firing display callbacks that consume frame_queue_
+    // buffers paired 1:1 with newly pushed packets, starving later frames
+    // and deadlocking PushNext's backpressure loop.
+    decoder_ = CUVideoDecoderImpl();
     parser_ = CUVideoParser(dec_ctx_->codec_id, this, kMaxOutputSurfaces, dec_ctx_->extradata,
                             dec_ctx_->extradata_size);
     if (!parser_.Initialized()) {
@@ -137,6 +143,9 @@ void CUThreadedDecoder::Start() {
 }
 
 void CUThreadedDecoder::Stop() {
+    // a stopped decoder is no longer draining; otherwise a leftover
+    // draining_ flag would swallow the next EOF flush marker
+    draining_.store(false);
     if (run_.load()) {
         pkt_queue_->SignalForKill();
         run_.store(false);
@@ -268,10 +277,17 @@ void CUThreadedDecoder::ClearDiscardPTS() {
 
 void CUThreadedDecoder::Push(AVPacketPtr pkt, NDArray buf) {
     CHECK(run_.load());
-    if (!pkt) {
-        if (draining_.load()) return;
-        draining_.store(true);
+    if (!pkt && draining_.load()) {
+        // already draining: the EOF marker was enqueued on the first null
+        // push, but every pushed buffer must still reach frame_queue_ so
+        // display callbacks for in-flight frames can always pop one and
+        // never block (a blocked display callback stalls the whole NVDEC
+        // flush and silently drops frames)
+        frame_queue_->Push(buf);
+        ++frame_count_;
+        return;
     }
+    if (!pkt) draining_.store(true);
 
     while (pkt_queue_->Size() > kMaxOutputSurfaces) {
         // too many in queue to be processed, wait here
@@ -353,7 +369,14 @@ void CUThreadedDecoder::LaunchThreadImpl() {
             if (!CHECK_CUDA_CALL(cuvidParseVideoData(parser_, &cupkt))) {
                 LOG(FATAL) << "Problem decoding packet";
             }
-            // mark as flushing?
+            // cuvidParseVideoData callbacks are synchronous, so after
+            // ENDOFSTREAM returns every remaining frame has been displayed
+            // and pushed to reorder_queue_. Signal that draining is done the
+            // same way the CPU decoder does, so NextFrameImpl can fall back
+            // to cached frames / rewind recovery instead of spinning.
+            for (int i = 0; i < ThreadedDecoderInterface::kDrainMarkerCount; ++i) {
+                reorder_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
+            }
         }
     }
 }
