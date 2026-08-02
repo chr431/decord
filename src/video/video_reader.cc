@@ -30,11 +30,13 @@ static const int REWIND_RETRY_MAX = std::stoi(runtime::GetEnvironmentVariableOrD
 static const int EOF_RETRY_MAX = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_EOF_RETRY_MAX", "10240"));
 // (corrupted video only): The warning threshold(0.0 - 1.0) when multiple frames are unavailable and fallbacked to cached frames
 static const float DUPLICATE_WARNING_THRESHOLD = std::stof(runtime::GetEnvironmentVariableOrDefault("DECORD_DUPLICATE_WARNING_THRESHOLD", "0.25"));
-// Number of FFmpeg decode threads.  0 = auto (can use 16+ threads causing
-// high memory on CPU path).  For CPU decoding we default to 2 to keep
-// FFmpeg's internal frame-buffer pool small (~600 MB instead of >9 GB).
-// Set DECORD_FFMPEG_THREAD_COUNT=0 to restore old auto behaviour.
-static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "2"));
+// Number of FFmpeg decode threads.  0 = auto (let FFmpeg choose based on
+// CPU core count).  The frame_queue_ backpressure (DECORD_CPU_FRAME_QUEUE_SIZE)
+// prevents unbounded memory growth regardless of thread count.  FFmpeg 8
+// benchmarks show 3-4x CPU throughput with thread_count=0 vs 2, while RAM
+// stays under 500 MB peak.
+// Set DECORD_FFMPEG_THREAD_COUNT to override (e.g. =1 to minimise latency).
+static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "0"));
 
 VideoReader::VideoReader(std::string fn, DLContext ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol)
      : ctx_(ctx), key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
