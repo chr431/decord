@@ -140,4 +140,15 @@ if(GTEST_LIB)
 endif()
 
 # Installation rules
-install(TARGETS decord DESTINATION lib${LIB_SUFFIX})
+# The library installs into the python package directory by default so that
+# wheels built with scikit-build-core (see pyproject.toml) and plain
+# `cmake --install` both place libdecord next to the python code, where
+# decord/_ffi/libinfo.py searches for it.  Override the destination with
+# -DDECORD_INSTALL_LIBDIR=... if a plain library install is wanted.
+if(NOT DEFINED DECORD_INSTALL_LIBDIR)
+  set(DECORD_INSTALL_LIBDIR decord)
+endif()
+install(TARGETS decord
+  LIBRARY DESTINATION ${DECORD_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${DECORD_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${DECORD_INSTALL_LIBDIR})

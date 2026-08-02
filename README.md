@@ -52,17 +52,18 @@ Supported platforms:
 
 ### Install from source
 
+The build is driven by a `pyproject.toml` (scikit-build-core): `pip install`
+compiles the shared library with CMake and bundles it into the wheel, so
+no separate build step is needed.
+
 #### Linux
 
 Install the system packages for building the shared library, for Debian/Ubuntu users, run:
 
 ```bash
-# official PPA comes with ffmpeg 2.8, which lacks tons of features, we use ffmpeg 4.0 here
-sudo add-apt-repository ppa:jonathonf/ffmpeg-4 # for ubuntu20.04 official PPA is already version 4.2, you may skip this step
 sudo apt-get update
-sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake
-sudo apt-get install -y ffmpeg libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev
-# note: make sure you have cmake 3.8 or later, you can install from cmake official website if it's too old
+sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake ninja-build
+sudo apt-get install -y ffmpeg libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libswresample-dev
 ```
 
 Clone the repo recursively(important)
@@ -71,36 +72,40 @@ Clone the repo recursively(important)
 git clone --recursive https://github.com/dmlc/decord
 ```
 
-Build the shared library in source root directory:
+Install:
 
 ```bash
 cd decord
-mkdir build && cd build
-cmake .. -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release
-make
+pip install .
 ```
 
-you can specify `-DUSE_CUDA=ON` or `-DUSE_CUDA=/path/to/cuda` or `-DUSE_CUDA=ON` `-DCMAKE_CUDA_COMPILER=/path/to/cuda/nvcc` to enable NVDEC hardware accelerated decoding:
+If your FFmpeg is not found automatically, point CMake at it:
 
 ```bash
-cmake .. -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+FFMPEG_DIR=/path/to/ffmpeg pip install .
+```
+
+#### GPU (NVDEC) builds
+
+Enable CUDA at build time. CUDA and the NVIDIA Video Codec SDK are required:
+
+```bash
+# CPU-only:
+pip install . --config-settings='cmake.args=-DUSE_CUDA=0'
+
+# GPU (requires CUDA toolkit + Video Codec SDK; libnvcuvid must be found):
+pip install . --config-settings='cmake.args=-DUSE_CUDA=ON'
 ```
 
 Note that if you encountered the an issue with `libnvcuvid.so` (e.g., see [#102](https://github.com/dmlc/decord/issues/102)), it's probably due to the missing link for
 `libnvcuvid.so`, you can manually find it (`ldconfig -p | grep libnvcuvid`) and link the library to `CUDA_TOOLKIT_ROOT_DIR\lib64` to allow `decord` smoothly detect and link the correct library.
 
-To specify a customized FFMPEG library path, use `-DFFMPEG_DIR=/path/to/ffmpeg".
+To specify a customized FFMPEG library path, pass `-DFFMPEG_DIR=/path/to/ffmpeg` (or set the `FFMPEG_DIR` environment variable).
 
-Install python bindings:
+Editable development install (rebuilds on import):
 
 ```bash
-cd ../python
-# option 1: add python path to $PYTHONPATH, you will need to install numpy separately
-pwd=$PWD
-echo "PYTHONPATH=$PYTHONPATH:$pwd" >> ~/.bashrc
-source ~/.bashrc
-# option 2: install with setuptools
-python3 setup.py install --user
+FFMPEG_DIR=/path/to/ffmpeg pip install -e .
 ```
 
 #### Mac OS

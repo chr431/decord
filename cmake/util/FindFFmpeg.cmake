@@ -17,6 +17,12 @@
 # BSD license.
 #
 
+# Allow the location to come from an environment variable (e.g. CI, or
+# scikit-build-core builds where passing -DFFMPEG_DIR is awkward).
+if (NOT FFMPEG_DIR AND DEFINED ENV{FFMPEG_DIR})
+  set(FFMPEG_DIR $ENV{FFMPEG_DIR})
+endif()
+
 if (FFMPEG_DIR)
   set(FFMPEG_INCLUDE_DIR ${FFMPEG_DIR}/include)
   if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
