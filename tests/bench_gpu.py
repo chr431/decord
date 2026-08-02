@@ -1,11 +1,25 @@
 #!/usr/bin/env python
-"""Comprehensive decord benchmark: CPU/GPU x sequential/random, with memory monitoring."""
-import os, sys, time, argparse, random, json
-import numpy as np
+"""Comprehensive decord benchmark: CPU/GPU x sequential/random, with memory monitoring.
+
+Each (context, mode, video) combination runs in its own subprocess so that
+memory/GPU state from earlier combinations cannot leak into later ones
+(benchmark-order artifacts).  Within a combination, memory is reported both
+as the in-process peak and as the delta over the process baseline.
+
+Usage:
+    python bench_gpu.py <video_dir>                 # default subset + all contexts
+    python bench_gpu.py <video_dir> --videos test.mp4,test3.mp4
+    python bench_gpu.py <video_dir> --all-videos
+    python bench_gpu.py --worker <spec-json>        # internal: run one combo
+"""
+import os, sys, time, argparse, random, json, subprocess
 
 _FFMPEG_BIN = os.environ.get("DECORD_FFMPEG_BIN", "")
 if _FFMPEG_BIN:
     os.add_dll_directory(_FFMPEG_BIN)
+
+# Default video subset: one HEVC + two H.264 clips.  Override with --videos.
+DEFAULT_SUBSET = ["test.mp4", "test3.mp4", "test5.mp4"]
 
 from decord import VideoReader, cpu, gpu
 
@@ -105,7 +119,61 @@ def mem_peak_during(func):
     return result[0], ram_samples, vram_samples
 
 # ---------------------------------------------------------------------------
-# main
+# worker mode: run one (context, mode, video) combo in an isolated process
+# ---------------------------------------------------------------------------
+def worker(spec):
+    ctx_name = spec["ctx"]
+    mode_name = spec["mode"]
+    path = spec["path"]
+    warmup = spec["warmup"]
+    random_samples = spec["random_samples"]
+    rounds = spec["rounds"]
+
+    ctx = cpu(0) if ctx_name == "CPU" else gpu(0)
+    rng = random.Random(42)
+    probe = VideoReader(path, ctx=ctx)
+    nframes = len(probe)
+    random_indices = sorted([rng.randint(0, nframes - 1) for _ in range(random_samples)])
+    del probe
+
+    ram_start = get_ram_mb()
+    vram_start = get_vram_mb()
+
+    best = None
+    for r in range(rounds):
+        vr = VideoReader(path, ctx=ctx)
+        if mode_name == "random":
+            def _run():
+                return bench_random(vr, random_indices)
+        else:
+            def _run():
+                return bench_sequential(vr, warmup)
+        (elapsed, n, fps), rams, vrams = mem_peak_during(_run)
+        del vr
+        if best is None or elapsed < best[0]:
+            best = (elapsed, n, fps, rams, vrams)
+
+    elapsed, n, fps, rams, vrams = best
+    ram_peak = max(rams) if rams else -1.0
+    ram_delta = ram_peak - ram_start
+    vram_peak = max(vrams) if vrams and vrams[0] > 0 else -1.0
+
+    result = {
+        "video": os.path.basename(path),
+        "ctx": ctx_name,
+        "mode": mode_name,
+        "nframes": n,
+        "elapsed_s": round(elapsed, 3),
+        "fps": round(fps, 1),
+        "ram_peak_mb": round(ram_peak, 1),
+        "ram_delta_mb": round(ram_delta, 1),
+        "vram_peak_mb": round(vram_peak, 1) if ctx_name == "GPU" else None,
+    }
+    print(json.dumps(result))
+    return 0
+
+# ---------------------------------------------------------------------------
+# driver mode: spawn an isolated worker per combination
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -115,140 +183,116 @@ def main():
     parser.add_argument("--random-samples", type=int, default=200,
                         help="How many random frames to access in random test")
     parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--videos", type=str, default=None,
+                        help="Comma-separated video names to benchmark (default: "
+                             "HEVC + 2x H.264 subset)")
+    parser.add_argument("--all-videos", action="store_true",
+                        help="Benchmark every video in the directory")
     parser.add_argument("video_dir", nargs="?", default="test_video_long")
+    parser.add_argument("--worker", type=str, default=None,
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
 
+    if args.worker:
+        return worker(json.loads(args.worker))
+
     video_dir = args.video_dir
-    videos = sorted([f for f in os.listdir(video_dir)
-                     if f.endswith((".mp4", ".mkv", ".mov", ".avi"))])
-    if not videos:
+    available = sorted([f for f in os.listdir(video_dir)
+                        if f.endswith((".mp4", ".mkv", ".mov", ".avi"))])
+    if not available:
         print(f"No videos found in {video_dir}")
         sys.exit(1)
 
-    # Build test matrix
+    if args.all_videos:
+        videos = available
+    elif args.videos:
+        wanted = [v.strip() for v in args.videos.split(",")]
+        missing = [v for v in wanted if v not in available]
+        if missing:
+            print(f"Unknown videos: {missing}")
+            sys.exit(1)
+        videos = wanted
+    else:
+        videos = [v for v in DEFAULT_SUBSET if v in available]
+        if not videos:
+            videos = available
+
     ctxs = []
     if args.cpu:
-        ctxs.append(("CPU", cpu(0)))
+        ctxs.append("CPU")
     if args.gpu:
+        # verify GPU availability once in this process
         try:
-            ctxs.append(("GPU", gpu(0)))
+            gpu(0)
+            ctxs.append("GPU")
         except Exception as e:
             print(f"GPU not available: {e}")
             if not ctxs:
-                ctxs.append(("CPU", cpu(0)))
+                ctxs.append("CPU")
+    if not ctxs:
+        ctxs.append("CPU")
 
-    modes = [
-        ("seq",    bench_sequential),
-        ("random", bench_random),
-    ]
+    modes = ["seq", "random"]
 
     results = []
     sep = "=" * 80
-
     print(sep)
-    print(f"DECORD BENCHMARK  |  {len(videos)} videos  |  {len(ctxs)} mode(s)  |  "
-          f"{len(modes)} access pattern(s)  |  {args.rounds} round(s)")
+    print(f"DECORD BENCHMARK (subprocess-isolated) | {len(videos)} video(s) | "
+          f"{len(ctxs)} ctx | {len(modes)} mode(s) | {args.rounds} round(s)")
     print(sep)
 
-    for ctx_name, ctx in ctxs:
-        is_gpu = (ctx_name == "GPU")
-        ctx_results = {"context": ctx_name, "videos": {}}
-
-        for mode_name, mode_fn in modes:
-            use_random = (mode_name == "random")
-
+    for ctx_name in ctxs:
+        for mode_name in modes:
             for vname in videos:
-                path = os.path.join(video_dir, vname)
-                try:
-                    probe = VideoReader(path, ctx=ctx)
-                    nframes = len(probe)
-                except Exception as e:
-                    print(f"  SKIP  {vname}  [{ctx_name}/{mode_name}]: {e}")
-                    continue
-
-                # prepare random indices once
-                rng = random.Random(42)
-                random_indices = sorted(
-                    [rng.randint(0, nframes - 1) for _ in range(args.random_samples)]
-                )
-
-                best_elapsed = float("inf")
-                best_ram = best_vram = None
-                best_n = best_fps = 0
-
-                for r in range(args.rounds):
-                    vr = VideoReader(path, ctx=ctx)
-
-                    if use_random:
-                        def _run():
-                            return bench_random(vr, random_indices)
-                    else:
-                        def _run():
-                            return bench_sequential(vr, args.warmup)
-
-                    (elapsed, n, fps), rams, vrams = mem_peak_during(_run)
-
-                    if elapsed < best_elapsed:
-                        best_elapsed = elapsed
-                        best_n = n
-                        best_fps = fps
-                        best_ram = rams
-                        best_vram = vrams
-
-                # stats
-                ram_peak = max(best_ram) if best_ram else -1
-                ram_mean = sum(best_ram) / len(best_ram) if best_ram else -1
-                vram_peak = max(best_vram) if best_vram else -1
-                vram_mean = sum(best_vram) / len(best_vram) if best_vram and best_vram[0] > 0 else -1
-
-                label = f"{vname:30s} [{ctx_name}/{mode_name}]"
-                mem_str = f"RAM_peak={ram_peak:7.1f}MB"
-                if is_gpu and vram_peak > 0:
-                    mem_str += f"  VRAM_peak={vram_peak:7.1f}MB"
-
-                print(f"  {label}  {best_n:5d}f  "
-                      f"{best_elapsed:7.3f}s  {best_fps:8.1f} fps  {mem_str}")
-
-                ctx_results["videos"].setdefault(vname, {})[mode_name] = {
-                    "nframes": nframes,
-                    "elapsed_s": round(best_elapsed, 3),
-                    "fps": round(best_fps, 1),
-                    "ram_peak_mb": round(ram_peak, 1),
-                    "vram_peak_mb": round(vram_peak, 1) if is_gpu else None,
+                spec = {
+                    "ctx": ctx_name,
+                    "mode": mode_name,
+                    "path": os.path.join(video_dir, vname),
+                    "warmup": args.warmup,
+                    "random_samples": args.random_samples,
+                    "rounds": args.rounds,
                 }
-
-        results.append(ctx_results)
+                try:
+                    out = subprocess.run(
+                        [sys.executable, os.path.abspath(__file__),
+                         "--worker", json.dumps(spec)],
+                        capture_output=True, text=True, timeout=1800)
+                except subprocess.TimeoutExpired:
+                    print(f"  {vname:30s} [{ctx_name}/{mode_name}] TIMEOUT")
+                    continue
+                if out.returncode != 0:
+                    tail = out.stderr.strip().splitlines()[-1] if out.stderr.strip() else "?"
+                    print(f"  {vname:30s} [{ctx_name}/{mode_name}] ERROR: {tail[:120]}")
+                    continue
+                r = json.loads(out.stdout.strip().splitlines()[-1])
+                results.append(r)
+                mem_str = f"RAM_peak={r['ram_peak_mb']:7.1f}MB (delta {r['ram_delta_mb']:+.1f})"
+                if r.get("vram_peak_mb"):
+                    mem_str += f"  VRAM_peak={r['vram_peak_mb']:7.1f}MB"
+                print(f"  {r['video']:30s} [{r['ctx']}/{r['mode']}] "
+                      f"{r['nframes']:5d}f  {r['elapsed_s']:7.3f}s  {r['fps']:8.1f} fps  {mem_str}")
 
     # summary
     print(f"\n{sep}")
     print("SUMMARY (fps)")
     print(f"{'Video':30s}", end="")
-    for ctx_name, _ in ctxs:
-        for mode_name, _ in modes:
+    for ctx_name in ctxs:
+        for mode_name in modes:
             print(f"  {ctx_name}/{mode_name:6s}", end="")
     print()
-
     for vname in videos:
         print(f"{vname:30s}", end="")
-        for ctx_name, _ in ctxs:
-            for mode_name, _ in modes:
+        for ctx_name in ctxs:
+            for mode_name in modes:
                 fps_val = -1
                 for r in results:
-                    if r["context"] == ctx_name:
-                        v = r["videos"].get(vname, {}).get(mode_name)
-                        if v:
-                            fps_val = v["fps"]
-                if fps_val > 0:
-                    print(f"  {fps_val:8.1f}", end="")
-                else:
-                    print(f"       N/A", end="")
+                    if r["video"] == vname and r["ctx"] == ctx_name and r["mode"] == mode_name:
+                        fps_val = r["fps"]
+                print(f"  {fps_val:8.1f}", end="")
         print()
-
     print(sep)
     print("Done.")
 
-    return results
-
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
