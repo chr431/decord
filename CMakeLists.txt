@@ -57,17 +57,25 @@ if(MSVC)
     endforeach(flag_var)
   endif()
 else(MSVC)
-  include(CheckCXXCompilerFlag)
-  check_cxx_compiler_flag("-std=c++11"    SUPPORT_CXX11)
-  #set(CMAKE_CUDA_FLAGS "-std=c++11 ${CMAKE_CUDA_FLAGS}")
+  # Default to Release unless a build type was explicitly requested. With an
+  # empty build type the old code path below used to inject "-O0 -g" into the
+  # C++ flags, silently producing unoptimized binaries.
+  if(NOT CMAKE_BUILD_TYPE)
+    message(STATUS "No CMAKE_BUILD_TYPE specified, defaulting to Release")
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+  endif()
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
   if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
     message(STATUS "Build in Debug mode")
     set(CMAKE_C_FLAGS "-O0 -g -Wall -fPIC ${CMAKE_C_FLAGS}")
     set(CMAKE_CXX_FLAGS "-O0 -g -Wall -fPIC -std=c++11 ${CMAKE_CXX_FLAGS}")
   else()
-    set(CMAKE_C_FLAGS "-O2 -Wall -fPIC -fvisibility=hidden ${CMAKE_C_FLAGS}")
-    set(CMAKE_CXX_FLAGS "-O0 -g -Wall -fPIC -std=c++11 ${CMAKE_CXX_FLAGS}")
+    # No -O flag here on purpose: CMake appends the per-config flags
+    # (-O3 -DNDEBUG for Release) after these, which is where optimization
+    # belongs. Hardcoding -O0 in this branch silently disabled optimization
+    # for builds without a CMAKE_BUILD_TYPE.
+    set(CMAKE_C_FLAGS "-Wall -fPIC -fvisibility=hidden ${CMAKE_C_FLAGS}")
+    set(CMAKE_CXX_FLAGS "-Wall -fPIC -std=c++11 ${CMAKE_CXX_FLAGS}")
   endif ()
   if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
     set(CMAKE_CXX_FLAGS "-Wno-unknown-pragmas ${CMAKE_CXX_FLAGS}")
