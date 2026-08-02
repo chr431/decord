@@ -28,8 +28,8 @@ inline bool operator== (const DLDataType &d1, const DLDataType &d2) {
   return (d1.bits == d2.bits && d1.code == d2.code && d1.lanes == d2.lanes);
 }
 
-static const DLContext kCPU = {kDLCPU, 0};
-static const DLContext kGPU = {kDLGPU, 0};
+static const DLDevice kCPU = {kDLCPU, 0};
+static const DLDevice kGPU = {kDLCUDA, 0};
 
 /*! \brief performance flags */
 int constexpr kCPUAlignment = 32;  // For video width alignment, not comply to this will result in sparse arrays

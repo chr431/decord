@@ -34,7 +34,7 @@ class VideoReader : public VideoReaderInterface {
     using ThreadedDecoderPtr = std::unique_ptr<ThreadedDecoderInterface>;
     using NDArray = runtime::NDArray;
     public:
-        VideoReader(std::string fn, DLContext ctx, int width=-1, int height=-1,
+        VideoReader(std::string fn, DLDevice ctx, int width=-1, int height=-1,
                     int nb_thread=0, int io_type=kNormal, std::string fault_tol="-1");
         /*! \brief Destructor, note that FFMPEG resources has to be managed manually to avoid resource leak */
         ~VideoReader();
@@ -66,7 +66,7 @@ class VideoReader : public VideoReaderInterface {
         void CacheFrame(NDArray frame);
         bool FetchCachedFrame(NDArray &frame, int64_t pos);
 
-        DLContext ctx_;
+        DLDevice ctx_;
         std::vector<int64_t> key_indices_;
         std::map<int64_t, int64_t> pts_frame_map_;
         NDArray tmp_key_frame_;

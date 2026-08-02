@@ -328,7 +328,7 @@ NDArray FFMPEGThreadedDecoder::CopyToNDArray(AVFramePtr p) {
     //     << "AVFrame data is not a compact array. linesize: " << p->linesize[0]
     //     << " width: " << p->width;
 
-    DLContext ctx;
+    DLDevice ctx;
     CHECK(!p->hw_frames_ctx) << "Not supported hw_frames_ctx";
     ctx = kCPU;
     NDArray arr = NDArray::Empty({p->height, p->width, channel}, kUInt8, ctx);

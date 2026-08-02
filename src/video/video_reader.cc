@@ -38,7 +38,7 @@ static const float DUPLICATE_WARNING_THRESHOLD = std::stof(runtime::GetEnvironme
 // Set DECORD_FFMPEG_THREAD_COUNT to override (e.g. =1 to minimise latency).
 static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "0"));
 
-VideoReader::VideoReader(std::string fn, DLContext ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol)
+VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol)
      : ctx_(ctx), key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
      actv_stm_idx_(-1), fmt_ctx_(nullptr), decoder_(nullptr), curr_frame_(0),
      nb_thread_decoding_(nb_thread), width_(width), height_(height), eof_(false), io_ctx_(),
@@ -165,7 +165,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
         << "Error copy stream->codecpar to buffer codecpar";
     if (kDLCPU == ctx_.device_type) {
         decoder_ = std::unique_ptr<ThreadedDecoderInterface>(new FFMPEGThreadedDecoder());
-    } else if (kDLGPU == ctx_.device_type) {
+    } else if (kDLCUDA == ctx_.device_type) {
 #ifdef DECORD_USE_CUDA
         // note: cuda threaded decoder will modify codecpar
         decoder_ = std::unique_ptr<ThreadedDecoderInterface>(new cuda::CUThreadedDecoder(
@@ -213,7 +213,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
     int original_width = codecpar->width;
     int original_height = codecpar->height;
 
-    if ((rotation == 90 || rotation == 270) && ctx_.device_type != kDLGPU) {
+    if ((rotation == 90 || rotation == 270) && ctx_.device_type != kDLCUDA) {
         std::swap(original_width, original_height);
     }
 
@@ -224,7 +224,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
         height_ = original_height;
     }
 
-    if (ctx_.device_type == kDLGPU) {
+    if (ctx_.device_type == kDLCUDA) {
         ndarray_pool_ = NDArrayPool(0, {height_, width_, 3}, kUInt8, ctx_);
     }
 
@@ -390,7 +390,7 @@ void VideoReader::PushNext() {
             if (ret == AVERROR_EOF) {
                 eof_ = true;
                 // flush buffer
-                if (ctx_.device_type != kDLGPU) {
+                if (ctx_.device_type != kDLCUDA) {
                     // no preallocated memory and memory pool, use FFMPEG AVFrame pool
                     decoder_->Push(nullptr, NDArray());
                 } else {
@@ -408,7 +408,7 @@ void VideoReader::PushNext() {
             return;
         }
         if (packet->stream_index == actv_stm_idx_) {
-            if (ctx_.device_type != kDLGPU) {
+            if (ctx_.device_type != kDLCUDA) {
                     // no preallocated memory and memory pool, use FFMPEG AVFrame pool
                     decoder_->Push(packet, NDArray());
                 } else {

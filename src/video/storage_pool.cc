@@ -12,7 +12,7 @@ NDArrayPool::NDArrayPool() : init_(false) {
 
 }
 
-NDArrayPool::NDArrayPool(std::size_t sz, std::vector<int64_t> shape, DLDataType dtype, DLContext ctx)
+NDArrayPool::NDArrayPool(std::size_t sz, std::vector<int64_t> shape, DLDataType dtype, DLDevice ctx)
     : size_(sz), shape_(shape), dtype_(dtype), ctx_(ctx), init_(true) {
 }
 
@@ -44,16 +44,16 @@ void NDArrayPool::Deleter(NDArray::Container* ptr) {
     if (ptr->manager_ctx != nullptr) {
         auto pool = static_cast<NDArrayPool*>(ptr->manager_ctx);
         if (pool->size_ <= pool->queue_.size()) {
-            decord::runtime::DeviceAPI::Get(ptr->dl_tensor.ctx)->FreeDataSpace(
-          ptr->dl_tensor.ctx, ptr->dl_tensor.data);
+            decord::runtime::DeviceAPI::Get(ptr->dl_tensor.device)->FreeDataSpace(
+          ptr->dl_tensor.device, ptr->dl_tensor.data);
             delete ptr;
             ptr = nullptr;
         } else {
             static_cast<NDArrayPool*>(ptr->manager_ctx)->queue_.push(NDArray(ptr));
         }
     } else if (ptr->dl_tensor.data != nullptr) {
-        decord::runtime::DeviceAPI::Get(ptr->dl_tensor.ctx)->FreeDataSpace(
-          ptr->dl_tensor.ctx, ptr->dl_tensor.data);
+        decord::runtime::DeviceAPI::Get(ptr->dl_tensor.device)->FreeDataSpace(
+          ptr->dl_tensor.device, ptr->dl_tensor.data);
         delete ptr;
         ptr = nullptr;
     }

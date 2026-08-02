@@ -11,7 +11,7 @@ namespace decord {
     // AVIO buffer size when reading from raw bytes
     static const int AVIO_BUFFER_SIZE = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_AVIO_BUFFER_SIZE", "40960"));
 
-    AudioReader::AudioReader(std::string fn, int sampleRate, DLContext ctx, int io_type, bool mono)
+    AudioReader::AudioReader(std::string fn, int sampleRate, DLDevice ctx, int io_type, bool mono)
     : ctx(ctx), io_ctx_(), pFormatContext(nullptr), swr(nullptr), pCodecParameters(nullptr),
       pCodecContext(nullptr), audioStreamIndex(-1), outputVector(), output(), padding(-1.0), filename(fn), originalSampleRate(0),
       targetSampleRate(sampleRate), numChannels(0), mono(mono), totalSamplesPerChannel(0), totalConvertedSamplesPerChannel(0),

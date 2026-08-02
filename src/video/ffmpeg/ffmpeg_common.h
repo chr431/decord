@@ -201,10 +201,10 @@ inline void ToDLTensor(AVFramePtr p, DLTensor& dlt, int64_t *shape) {
         << "AVFrame data is not a compact array. linesize: " << p->linesize[0]
         << " width: " << p->width;
 
-	DLContext ctx;
+	DLDevice ctx;
 	if (p->hw_frames_ctx) {
         LOG(FATAL) << "HW ctx not supported";
-		ctx = DLContext({ kDLGPU, 0 });
+		ctx = DLDevice({ kDLCUDA, 0 });
 	}
 	else {
 		ctx = kCPU;
@@ -216,7 +216,7 @@ inline void ToDLTensor(AVFramePtr p, DLTensor& dlt, int64_t *shape) {
 	shape[1] = p->width;
 	shape[2] = p->linesize[0] / p->width;
 	dlt.data = p->data[0];
-	dlt.ctx = ctx;
+	dlt.device = ctx;
 	dlt.ndim = 3;
 	dlt.dtype = kUInt8;
 	dlt.shape = shape;

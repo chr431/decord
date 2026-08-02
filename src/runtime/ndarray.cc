@@ -40,8 +40,8 @@ struct NDArray::Internal {
     if (ptr->manager_ctx != nullptr) {
       static_cast<NDArray::Container*>(ptr->manager_ctx)->DecRef();
     } else if (ptr->dl_tensor.data != nullptr) {
-      decord::runtime::DeviceAPI::Get(ptr->dl_tensor.ctx)->FreeDataSpace(
-          ptr->dl_tensor.ctx, ptr->dl_tensor.data);
+      decord::runtime::DeviceAPI::Get(ptr->dl_tensor.device)->FreeDataSpace(
+          ptr->dl_tensor.device, ptr->dl_tensor.data);
     }
     delete ptr;
   }
@@ -61,7 +61,7 @@ struct NDArray::Internal {
   // but does not allocate space for the data.
   static NDArray Create(std::vector<int64_t> shape,
                         DLDataType dtype,
-                        DLContext ctx) {
+                        DLDevice ctx) {
     VerifyDataType(dtype);
     // critical zone
     NDArray::Container* data = new NDArray::Container();
@@ -76,7 +76,7 @@ struct NDArray::Internal {
     // setup dtype
     data->dl_tensor.dtype = dtype;
     // setup ctx
-    data->dl_tensor.ctx = ctx;
+    data->dl_tensor.device = ctx;
     return ret;
   }
   // Implementation of API function
@@ -103,7 +103,7 @@ NDArray NDArray::CreateView(std::vector<int64_t> shape,
   CHECK(data_ != nullptr);
   CHECK(data_->dl_tensor.strides == nullptr)
       << "Can only create view for compact tensor";
-  NDArray ret = Internal::Create(shape, dtype, data_->dl_tensor.ctx);
+  NDArray ret = Internal::Create(shape, dtype, data_->dl_tensor.device);
   ret.data_->dl_tensor.byte_offset =
       this->data_->dl_tensor.byte_offset;
   size_t curr_size = GetDataSize(this->data_->dl_tensor);
@@ -122,7 +122,7 @@ NDArray NDArray::CreateOffsetView(std::vector<int64_t> shape,
   CHECK(data_ != nullptr);
   CHECK(data_->dl_tensor.strides == nullptr)
       << "Can only create offset view for compact tensor";
-  NDArray ret = Internal::Create(shape, dtype, data_->dl_tensor.ctx);
+  NDArray ret = Internal::Create(shape, dtype, data_->dl_tensor.device);
   ret.data_->dl_tensor.byte_offset =
       this->data_->dl_tensor.byte_offset;
   size_t curr_size = GetDataSize(this->data_->dl_tensor);
@@ -143,14 +143,14 @@ DLManagedTensor* NDArray::ToDLPack() const {
 
 NDArray NDArray::Empty(std::vector<int64_t> shape,
                        DLDataType dtype,
-                       DLContext ctx) {
+                       DLDevice ctx) {
   NDArray ret = Internal::Create(shape, dtype, ctx);
   // setup memory content
   size_t size = GetDataSize(ret.data_->dl_tensor);
   size_t alignment = GetDataAlignment(ret.data_->dl_tensor);
   ret.data_->dl_tensor.data =
-      DeviceAPI::Get(ret->ctx)->AllocDataSpace(
-          ret->ctx, size, alignment, ret->dtype);
+      DeviceAPI::Get(ret->device)->AllocDataSpace(
+          ret->device, size, alignment, ret->dtype);
   return ret;
 }
 
@@ -171,19 +171,19 @@ void NDArray::CopyFromTo(DLTensor* from,
   CHECK_EQ(from_size, to_size)
     << "DECORDArrayCopyFromTo: The size must exactly match";
 
-  CHECK(from->ctx.device_type == to->ctx.device_type
-        || from->ctx.device_type == kDLCPU
-        || to->ctx.device_type == kDLCPU)
+  CHECK(from->device.device_type == to->device.device_type
+        || from->device.device_type == kDLCPU
+        || to->device.device_type == kDLCPU)
     << "Can not copy across different ctx types directly";
 
   // Use the context that is *not* a cpu context to get the correct device
   // api manager.
-  DECORDContext ctx = from->ctx.device_type != kDLCPU ? from->ctx : to->ctx;
+  DECORDContext ctx = from->device.device_type != kDLCPU ? from->device : to->device;
 
   DeviceAPI::Get(ctx)->CopyDataFromTo(
     from->data, static_cast<size_t>(from->byte_offset),
     to->data, static_cast<size_t>(to->byte_offset),
-    from_size, from->ctx, to->ctx, from->dtype, stream);
+    from_size, from->device, to->device, from->dtype, stream);
 }
 
 }  // namespace runtime
@@ -209,7 +209,7 @@ int DECORDArrayAlloc(const decord_index_t* shape,
   dtype.code = static_cast<uint8_t>(dtype_code);
   dtype.bits = static_cast<uint8_t>(dtype_bits);
   dtype.lanes = static_cast<uint16_t>(dtype_lanes);
-  DLContext ctx;
+  DLDevice ctx;
   ctx.device_type = static_cast<DLDeviceType>(device_type);
   ctx.device_id = device_id;
   *out = NDArray::Internal::MoveAsDLTensor(
@@ -259,10 +259,10 @@ int DECORDArrayCopyFromBytes(DECORDArrayHandle handle,
   size_t arr_size = GetDataSize(*handle);
   CHECK_EQ(arr_size, nbytes)
       << "DECORDArrayCopyFromBytes: size mismatch";
-  DeviceAPI::Get(handle->ctx)->CopyDataFromTo(
+  DeviceAPI::Get(handle->device)->CopyDataFromTo(
       data, 0,
       handle->data, static_cast<size_t>(handle->byte_offset),
-      nbytes, cpu_ctx, handle->ctx, handle->dtype, nullptr);
+      nbytes, cpu_ctx, handle->device, handle->dtype, nullptr);
   API_END();
 }
 
@@ -276,9 +276,9 @@ int DECORDArrayCopyToBytes(DECORDArrayHandle handle,
   size_t arr_size = GetDataSize(*handle);
   CHECK_EQ(arr_size, nbytes)
       << "DECORDArrayCopyToBytes: size mismatch";
-  DeviceAPI::Get(handle->ctx)->CopyDataFromTo(
+  DeviceAPI::Get(handle->device)->CopyDataFromTo(
       handle->data, static_cast<size_t>(handle->byte_offset),
       data, 0,
-      nbytes, handle->ctx, cpu_ctx, handle->dtype, nullptr);
+      nbytes, handle->device, cpu_ctx, handle->dtype, nullptr);
   API_END();
 }

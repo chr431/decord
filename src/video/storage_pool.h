@@ -102,7 +102,7 @@ class NDArrayPool {
     using NDArray = runtime::NDArray;
     public:
         NDArrayPool();
-        NDArrayPool(std::size_t sz, std::vector<int64_t> shape, DLDataType dtype, DLContext ctx);
+        NDArrayPool(std::size_t sz, std::vector<int64_t> shape, DLDataType dtype, DLDevice ctx);
         NDArray Acquire();
         ~NDArrayPool();
         static void Deleter(NDArray::Container* ptr);
@@ -112,7 +112,7 @@ class NDArrayPool {
         std::size_t size_;
         std::vector<int64_t> shape_;
         DLDataType dtype_;
-        DLContext ctx_;
+        DLDevice ctx_;
         std::queue<runtime::NDArray> queue_;
         bool init_;
 };  // NDArrayPool

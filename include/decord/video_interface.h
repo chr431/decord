@@ -87,7 +87,7 @@ class VideoReaderInterface {
 };  // class VideoReader
 
 
-DECORD_DLL VideoReaderPtr GetVideoReader(std::string fname, DLContext ctx,
+DECORD_DLL VideoReaderPtr GetVideoReader(std::string fname, DLDevice ctx,
                                          int width=-1, int height=-1, int nb_thread=0,
                                          int io_type=kNormal);
 

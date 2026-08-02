@@ -14,7 +14,7 @@
 
 namespace decord {
 
-VideoLoader::VideoLoader(std::vector<std::string> filenames, std::vector<DLContext> ctxs,
+VideoLoader::VideoLoader(std::vector<std::string> filenames, std::vector<DLDevice> ctxs,
                          std::vector<int> shape, int interval,
                          int skip, int shuffle, int prefetch)
     : readers_(), shape_(shape), intvl_(interval), skip_(skip), shuffle_(shuffle),

@@ -17,7 +17,7 @@
 
 namespace decord {
 
-VideoReaderPtr GetVideoReader(std::string fn, DLContext ctx, int width, int height, int nb_thread,
+VideoReaderPtr GetVideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread,
                               int io_type, std::string fault_tol) {
     std::shared_ptr<VideoReaderInterface> ptr;
     ptr = std::make_shared<VideoReader>(fn, ctx, width, height, nb_thread, io_type, fault_tol);
@@ -35,7 +35,7 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetVideoReader")
     int num_thread = args[5];
     int io_type = args[6];
     std::string fault_tol = args[7];
-    DLContext ctx;
+    DLDevice ctx;
     ctx.device_type = static_cast<DLDeviceType>(device_type);
     ctx.device_id = device_id;
     auto reader = new VideoReader(fn, ctx, width, height, num_thread, io_type, fault_tol);
@@ -153,12 +153,12 @@ DECORD_REGISTER_GLOBAL("video_loader._CAPI_VideoLoaderGetVideoLoader")
     device_types.CopyTo(dev_types);
     std::vector<long int> dev_ids;
     device_ids.CopyTo(dev_ids);
-    std::vector<DLContext> ctxs;
+    std::vector<DLDevice> ctxs;
     ctxs.reserve(dev_ids.size());
     CHECK(dev_types.size() > 0);
     CHECK_EQ(dev_types.size(), dev_ids.size());
     for (std::size_t i = 0; i < dev_types.size(); ++i) {
-      DLContext ctx;
+      DLDevice ctx;
       ctx.device_type = static_cast<DLDeviceType>(dev_types[i]);
       ctx.device_id = static_cast<int>(dev_ids[i]);
       ctxs.emplace_back(ctx);

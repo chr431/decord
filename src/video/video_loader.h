@@ -26,7 +26,7 @@ enum ShuffleTypes {
 
 class VideoLoader : public VideoLoaderInterface {
 public:
-        VideoLoader(std::vector<std::string> filenames, std::vector<DLContext> ctxs,
+        VideoLoader(std::vector<std::string> filenames, std::vector<DLDevice> ctxs,
                           std::vector<int> shape, int interval,
                           int skip, int shuffle,
                           int prefetch);
@@ -62,7 +62,7 @@ public:
         // std::vector<std::size_t> visit_bounds_;
         // std::vector<std::vector<std::pair<std::size_t, int64_t> > > visit_buffer_;
         // std::size_t curr_;
-        std::vector<DLContext> ctxs_;
+        std::vector<DLDevice> ctxs_;
         NDArrayPool ndarray_pool_;
 };  // class VideoLoader
 }  // namespace decord

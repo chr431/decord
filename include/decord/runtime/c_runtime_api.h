@@ -112,7 +112,7 @@ typedef DLDataType DECORDType;
 /*!
  * \brief The Device information, abstract away common device types.
  */
-typedef DLContext DECORDContext;
+typedef DLDevice DECORDContext;
 
 /*!
  * \brief The tensor array stucture to DECORD API.

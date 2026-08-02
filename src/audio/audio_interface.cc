@@ -11,7 +11,7 @@
 
 namespace decord {
 
-    AudioReaderPtr GetAudioReader(std::string fn, int sampleRate, DLContext ctx, int io_type, bool mono) {
+    AudioReaderPtr GetAudioReader(std::string fn, int sampleRate, DLDevice ctx, int io_type, bool mono) {
         std::shared_ptr<AudioReaderInterface> ptr;
         ptr = std::make_shared<AudioReader>(fn, sampleRate, ctx, io_type, mono);
         return ptr;
@@ -29,7 +29,7 @@ namespace decord {
             bool mono = int(args[5]) == 1 ? true : false;
 
             // TODO: add io type
-            DLContext ctx;
+            DLDevice ctx;
             ctx.device_type = static_cast<DLDeviceType>(device_type);
             ctx.device_id = device_id;
             auto reader = new AudioReader(fn, sampleRate, ctx, io_type, mono);
