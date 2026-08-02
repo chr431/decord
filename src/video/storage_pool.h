@@ -9,6 +9,7 @@
 
 #include <queue>
 #include <vector>
+#include <mutex>
 
 #include <decord/runtime/ndarray.h>
 #include <decord/runtime/device_api.h>
@@ -103,6 +104,7 @@ class NDArrayPool {
     public:
         NDArrayPool();
         NDArrayPool(std::size_t sz, std::vector<int64_t> shape, DLDataType dtype, DLDevice ctx);
+        void Reset(std::size_t sz, std::vector<int64_t> shape, DLDataType dtype, DLDevice ctx);
         NDArray Acquire();
         ~NDArrayPool();
         static void Deleter(NDArray::Container* ptr);
@@ -113,6 +115,9 @@ class NDArrayPool {
         std::vector<int64_t> shape_;
         DLDataType dtype_;
         DLDevice ctx_;
+        // Acquire() runs on the decoder thread while Deleter() runs on the
+        // Python thread, so the queue needs synchronization.
+        std::mutex mutex_;
         std::queue<runtime::NDArray> queue_;
         bool init_;
 };  // NDArrayPool
