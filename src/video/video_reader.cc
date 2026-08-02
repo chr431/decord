@@ -351,10 +351,10 @@ bool VideoReader::SeekAccurate(int64_t pos) {
     if (key_pos != curr_key_pos || pos < curr_frame_) {
         // need to seek to keyframes first
         // std::cout << "need to seek to keyframe " << key_pos << " first " << std::endl;
-        // first rewind to 0, in order to increase seek accuracy
-        bool ret = Seek(0);
-        if (!ret) return false;
-        ret = Seek(key_pos);
+        // Seek directly to the target keyframe.  Modern containers (MP4/MKV)
+        // carry frame indexes so av_seek_frame lands exactly; the rewind to 0
+        // below used to double the I/O of every random access.
+        bool ret = Seek(key_pos);
         if (!ret) return false;
         // double check if keyframe was jumpped correctly
         if(CheckKeyFrame()){

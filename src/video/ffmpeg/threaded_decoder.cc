@@ -263,21 +263,34 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
             // normal mode, push in valid packets and retrieve frames
             int send_ret;
             // FFmpeg 8+ may return EAGAIN when the codec internal queue is
-            // full; drain any available output, then yield and retry.
+            // full. Drain every available output frame (possibly several)
+            // before retrying the send; only sleep when nothing is ready.
             while ((send_ret = avcodec_send_packet(dec_ctx_.get(),
                                                    pkt.get())) == AVERROR(EAGAIN)) {
-                got_picture = ReceiveFrame(dec_ctx_.get(), frame.get());
-                if (got_picture == 0) {
-                    NDArray out_buf;
-                    bool get_buf = buffer_queue_->Pop(&out_buf);
-                    if (!get_buf) return;
-                    ProcessFrame(frame, out_buf);
-                } else {
-                    // No output ready yet — frame-threaded workers are busy.
-                    // Yield briefly so they can finish and free input slots.
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    if (!run_.load()) return;
+                // Drain every output frame that is ready before sleeping:
+                // with frame threading, several frames can be pending, and
+                // sleeping per frame would cap throughput at ~1 frame/ms.
+                while (true) {
+                    // a fresh frame per iteration: ProcessFrame wraps the
+                    // frame in a shared_ptr that outlives this loop
+                    AVFramePtr drain_frame = AVFramePool::Get()->Acquire();
+                    got_picture = ReceiveFrame(dec_ctx_.get(), drain_frame.get());
+                    if (got_picture == 0) {
+                        NDArray out_buf;
+                        bool get_buf = buffer_queue_->Pop(&out_buf);
+                        if (!get_buf) return;
+                        ProcessFrame(drain_frame, out_buf);
+                    } else if (got_picture == AVERROR(EAGAIN) ||
+                               got_picture == AVERROR_EOF) {
+                        break;
+                    } else {
+                        LOG(FATAL) << "Thread worker: Error decoding frame: " << got_picture;
+                    }
                 }
+                // Input queue slots are freed by the internal workers, not by
+                // receive, so yield once before retrying the send.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (!run_.load()) return;
             }
             CHECK_GE(send_ret, 0) << "Thread worker: Error sending packet: "
                                   << send_ret;
