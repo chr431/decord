@@ -158,7 +158,11 @@ int CUVideoDecoderImpl::Initialize(CUVIDEOFORMAT* format) {
     decoder_info_.ChromaFormat = format->chroma_format;
     decoder_info_.OutputFormat = cudaVideoSurfaceFormat_NV12;
     decoder_info_.bitDepthMinus8 = format->bit_depth_luma_minus8; // in ffmpeg but not sample
-    decoder_info_.DeinterlaceMode = cudaVideoDeinterlaceMode_Adaptive;
+    // Deinterlace: for progressive content, use Weave (passthrough) to
+    // avoid unnecessary processing overhead.
+    decoder_info_.DeinterlaceMode = format->progressive_sequence
+        ? cudaVideoDeinterlaceMode_Weave
+        : cudaVideoDeinterlaceMode_Adaptive;
     decoder_info_.ulTargetWidth = format->display_area.right - format->display_area.left;
     decoder_info_.ulTargetHeight = format->display_area.bottom - format->display_area.top;
 

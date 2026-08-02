@@ -35,7 +35,10 @@ void CUVideoParser::InitParams(AVCodecID codec, CUThreadedDecoder* decoder, int 
     }
     parser_info_.ulMaxNumDecodeSurfaces = decode_surfaces;
     parser_info_.ulErrorThreshold = 0;
-    parser_info_.ulMaxDisplayDelay = 0;
+    // Pipeline up to 4 display frames so the GPU decoder can stay busy
+    // while the CUDA kernel processes earlier frames.  0 = no pipelining.
+    // Recommended by Video Codec SDK docs: 2–4.
+    parser_info_.ulMaxDisplayDelay = 4;
     parser_info_.pUserData = decoder;
     parser_info_.pfnSequenceCallback = CUThreadedDecoder::HandlePictureSequence;
     parser_info_.pfnDecodePicture = CUThreadedDecoder::HandlePictureDecode;
