@@ -21,6 +21,10 @@ namespace ffmpeg {
 static const int DECORD_CPU_FRAME_QUEUE_SIZE = std::stoi(
     decord::runtime::GetEnvironmentVariableOrDefault("DECORD_CPU_FRAME_QUEUE_SIZE", "32"));
 
+// EAGAIN yield interval in ms (experimental tuning).
+static const int DECORD_EAGAIN_SLEEP_MS = std::stoi(
+    decord::runtime::GetEnvironmentVariableOrDefault("DECORD_EAGAIN_SLEEP_MS", "1"));
+
 // FFmpeg 8+: use synchronous decode mode (AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS)
 // which bypasses internal frame threading.  This eliminates EAGAIN from
 // avcodec_send_packet and reduces thread-synchronisation overhead, which can
@@ -289,7 +293,8 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
                 }
                 // Input queue slots are freed by the internal workers, not by
                 // receive, so yield once before retrying the send.
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(DECORD_EAGAIN_SLEEP_MS));
                 if (!run_.load()) return;
             }
             CHECK_GE(send_ret, 0) << "Thread worker: Error sending packet: "
