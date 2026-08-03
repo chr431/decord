@@ -60,8 +60,9 @@ CUTextureRegistry::CUTextureRegistry() {
 
 const CUImageTexture& CUTextureRegistry::GetTexture(uint8_t* ptr, unsigned int input_pitch,
                                                     uint16_t input_width, uint16_t input_height,
-                                                    ScaleMethod scale_method, ChromaUpMethod chroma_up_method) {
-    auto tex_id = std::make_tuple(ptr, scale_method, chroma_up_method);
+                                                    ScaleMethod scale_method, ChromaUpMethod chroma_up_method,
+                                                    int bit_depth) {
+    auto tex_id = std::make_tuple(ptr, scale_method, chroma_up_method, bit_depth);
 
     // find existing registed texture, if so return directly
     auto tex = textures_.find(tex_id);
@@ -85,7 +86,12 @@ const CUImageTexture& CUTextureRegistry::GetTexture(uint8_t* ptr, unsigned int i
     cudaResourceDesc res_desc = {};
     res_desc.resType = cudaResourceTypePitch2D;
     res_desc.res.pitch2D.devPtr = ptr;
-    res_desc.res.pitch2D.desc = cudaCreateChannelDesc<uchar1>();
+    if (bit_depth > 8) {
+        // P016: 16-bit luma + interleaved 16-bit chroma
+        res_desc.res.pitch2D.desc = cudaCreateChannelDesc<ushort1>();
+    } else {
+        res_desc.res.pitch2D.desc = cudaCreateChannelDesc<uchar1>();
+    }
     res_desc.res.pitch2D.width = input_width;
     res_desc.res.pitch2D.height = input_height;
     res_desc.res.pitch2D.pitchInBytes = input_pitch;
@@ -101,7 +107,11 @@ const CUImageTexture& CUTextureRegistry::GetTexture(uint8_t* ptr, unsigned int i
 
     res_desc.resType = cudaResourceTypePitch2D;
     res_desc.res.pitch2D.devPtr = ptr + (input_height * input_pitch);
-    res_desc.res.pitch2D.desc = cudaCreateChannelDesc<uchar2>();
+    if (bit_depth > 8) {
+        res_desc.res.pitch2D.desc = cudaCreateChannelDesc<ushort2>();
+    } else {
+        res_desc.res.pitch2D.desc = cudaCreateChannelDesc<uchar2>();
+    }
     res_desc.res.pitch2D.width = input_width / 2;  // YUV420
     res_desc.res.pitch2D.height = input_height / 2;  // YUV420
     res_desc.res.pitch2D.pitchInBytes = input_pitch;

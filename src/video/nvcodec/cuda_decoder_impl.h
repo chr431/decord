@@ -33,6 +33,8 @@ class CUVideoDecoderImpl {
 
     uint16_t Width() const;
     uint16_t Height() const;
+    /*! \brief Bit depth of the decoded output (8, 10, 12, ...). */
+    int BitDepth() const;
 
   private:
     CUvideodecoder decoder_;

@@ -81,6 +81,15 @@ void CUThreadedDecoder::InitBitStreamFilter(AVCodecParameters *codecpar, const A
     } else if (AV_CODEC_ID_MPEG4 == codecpar->codec_id && !strcmp(iformat->name, "avi")) {
         // MPEG4
         bsf_name = "mpeg4_unpack_bframes";
+    } else if (AV_CODEC_ID_AV1 == codecpar->codec_id) {
+        // AV1.  FFmpeg 7+ removed av1_mp4toannexb: the AV1 decoder consumes
+        // the MP4 sample (OBU stream) directly, and NVDEC does too via the
+        // null BSF (the AV1C config record travels in extradata).
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(61, 0, 0)
+        bsf_name = "av1_mp4toannexb";
+#else
+        bsf_name = "null";
+#endif
     } else {
         bsf_name = "null";
     }
@@ -255,7 +264,8 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
                                             input_width,
                                             input_height,
                                             ScaleMethod_Linear,
-                                            ChromaUpMethod_Linear);
+                                            ChromaUpMethod_Linear,
+                                            decoder_.BitDepth());
     ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_, input_width, input_height, width_, height_);
     if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
         LOG(FATAL) << "Error synchronize cuda stream";

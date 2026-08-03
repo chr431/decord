@@ -156,7 +156,11 @@ int CUVideoDecoderImpl::Initialize(CUVIDEOFORMAT* format) {
     decoder_info_.ulHeight = format->coded_height;
     decoder_info_.ulNumDecodeSurfaces = 20;
     decoder_info_.ChromaFormat = format->chroma_format;
-    decoder_info_.OutputFormat = cudaVideoSurfaceFormat_NV12;
+    // 8-bit content uses NV12; 10-bit and above needs the 16-bit P016
+    // surface format (the kernel and textures normalize both to [0, 1]).
+    decoder_info_.OutputFormat = format->bit_depth_luma_minus8 > 0
+        ? cudaVideoSurfaceFormat_P016
+        : cudaVideoSurfaceFormat_NV12;
     decoder_info_.bitDepthMinus8 = format->bit_depth_luma_minus8; // in ffmpeg but not sample
     // Deinterlace: for progressive content, use Weave (passthrough) to
     // avoid unnecessary processing overhead.
@@ -199,6 +203,10 @@ uint16_t CUVideoDecoderImpl::Width() const {
 
 uint16_t CUVideoDecoderImpl::Height() const {
     return static_cast<uint16_t>(decoder_info_.ulTargetHeight);
+}
+
+int CUVideoDecoderImpl::BitDepth() const {
+    return decoder_info_.bitDepthMinus8 + 8;
 }
 
 }  // namespace cuda
