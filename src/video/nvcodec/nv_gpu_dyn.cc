@@ -6,6 +6,8 @@
 
 #include "nv_gpu_dyn.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <windows.h>
 
 namespace nv {
@@ -82,6 +84,16 @@ bool g_attempted = false;
 bool gpu_loaded() {
   if (g_attempted) return g_loaded;
   g_attempted = true;
+
+  /* Test hook: DECORD_FORCE_NO_GPU=1 simulates a machine without the NVIDIA
+     driver (skips loading nvcuda/nvcuvid/nvml). Same effect as the real
+     driver-less case: wrappers return error codes -> GPU init fails ->
+     Python falls back to CPU decode. */
+  const char* force_no_gpu = std::getenv("DECORD_FORCE_NO_GPU");
+  if (force_no_gpu && std::strcmp(force_no_gpu, "1") == 0) {
+    g_loaded = false;
+    return false;
+  }
 
   HMODULE nvcuda = LoadLibraryA("nvcuda.dll");
   HMODULE nvcuvid = LoadLibraryA("nvcuvid.dll");
