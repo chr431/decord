@@ -7,7 +7,7 @@
 #ifndef DECORD_VIDEO_NVCODEC_CUDA_MAPPED_FRAME_H_
 #define DECORD_VIDEO_NVCODEC_CUDA_MAPPED_FRAME_H_
 
-#include "nvcuvid/nvcuvid.h"
+#include "nv_gpu_dyn.h"
 
 #include <dmlc/base.h>
 

@@ -16,17 +16,17 @@ CUContext::CUContext() : context_{0}, initialized_{false} {
 
 CUContext::CUContext(CUdevice device, unsigned int flags)
     : device_{device}, context_{0}, initialized_{false} {
-    CHECK_CUDA_CALL(cuInit(0));
-    if (!CHECK_CUDA_CALL(cuDevicePrimaryCtxRetain(&context_, device))) {
+    CHECK_CUDA_CALL(nv::cuInit(0));
+    if (!CHECK_CUDA_CALL(nv::cuDevicePrimaryCtxRetain(&context_, device))) {
         throw std::runtime_error("cuDevicePrimaryCtxRetain failed, can't go forward without a context");
     }
     Push();
     CUdevice dev;
-    if (!CHECK_CUDA_CALL(cuCtxGetDevice(&dev))) {
+    if (!CHECK_CUDA_CALL(nv::cuCtxGetDevice(&dev))) {
         throw std::runtime_error("Unable to get device");
     }
     initialized_ = true;
-    CHECK_CUDA_CALL(cuCtxSynchronize());
+    CHECK_CUDA_CALL(nv::cuCtxSynchronize());
 }
 
 CUContext::CUContext(CUcontext ctx)
@@ -36,7 +36,7 @@ CUContext::CUContext(CUcontext ctx)
 CUContext::~CUContext() {
     if (initialized_) {
         // cuCtxPopCurrent?
-        CHECK_CUDA_CALL(cuDevicePrimaryCtxRelease(device_));
+        CHECK_CUDA_CALL(nv::cuDevicePrimaryCtxRelease(device_));
     }
 }
 
@@ -50,7 +50,9 @@ CUContext::CUContext(CUContext&& other)
 
 CUContext& CUContext::operator=(CUContext&& other) {
     if (initialized_) {
-        CHECK_CUDA_CALL(cuCtxDestroy(context_));
+        // This context came from cuDevicePrimaryCtxRetain; primary contexts must be
+        // released with Release (cuCtxDestroy returns CUDA_ERROR_INVALID_CONTEXT 201)
+        CHECK_CUDA_CALL(nv::cuDevicePrimaryCtxRelease(device_));
     }
     device_ = other.device_;
     context_ = other.context_;
@@ -63,12 +65,16 @@ CUContext& CUContext::operator=(CUContext&& other) {
 
 void CUContext::Push() const {
     CUcontext current;
-    if (!CHECK_CUDA_CALL(cuCtxGetCurrent(&current))) {
+    if (!CHECK_CUDA_CALL(nv::cuCtxGetCurrent(&current))) {
         throw std::runtime_error("Unable to get current context");
     }
     if (current != context_) {
-        if (!CHECK_CUDA_CALL(cuCtxPushCurrent(context_))) {
-            throw std::runtime_error("Unable to push current context");
+        // Use cuCtxSetCurrent instead of cuCtxPushCurrent:
+        // after cudart init (cudaSetDevice) the primary current state is owned by cudart,
+        // so cuCtxPushCurrent(primary) returns CUDA_ERROR_INVALID_CONTEXT (201);
+        // SetCurrent sets it directly without a stack, per-thread.
+        if (!CHECK_CUDA_CALL(nv::cuCtxSetCurrent(context_))) {
+            throw std::runtime_error("Unable to set current context");
         }
     }
 }

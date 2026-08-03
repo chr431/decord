@@ -7,7 +7,7 @@
 #ifndef DECORD_VIDEO_NVCODEC_CUDA_DECODER_IMPL_H_
 #define DECORD_VIDEO_NVCODEC_CUDA_DECODER_IMPL_H_
 
-#include "nvcuvid/nvcuvid.h"
+#include "nv_gpu_dyn.h"
 #include <stdint.h>
 
 namespace decord {

@@ -8,8 +8,7 @@
 #include "cuda_mapped_frame.h"
 #include "cuda_texture.h"
 #include "../../improc/improc.h"
-#include "nvcuvid/nvcuvid.h"
-#include <nvml.h>
+#include "nv_gpu_dyn.h"
 #include <chrono>
 
 
@@ -28,20 +27,20 @@ CUThreadedDecoder::CUThreadedDecoder(int device_id, AVCodecParameters *codecpar,
     // initialize bitstream filters
     InitBitStreamFilter(codecpar, iformat);
 
-    CHECK_CUDA_CALL(cuInit(0));
-    CHECK_CUDA_CALL(cuDeviceGet(&device_, device_id_));
+    CHECK_CUDA_CALL(nv::cuInit(0));
+    CHECK_CUDA_CALL(nv::cuDeviceGet(&device_, device_id_));
 
     char device_name[100];
-    CHECK_CUDA_CALL(cuDeviceGetName(device_name, 100, device_));
+    CHECK_CUDA_CALL(nv::cuDeviceGetName(device_name, 100, device_));
     DLOG(INFO) << "Using device: " << device_name;
 
     try {
-        auto nvml_ret = nvmlInit();
+        auto nvml_ret = nv::nvmlInit();
         if (nvml_ret != NVML_SUCCESS) {
             LOG(FATAL) << "nvmlInit returned error " << nvml_ret;
         }
         char nvmod_version_string[NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE];
-        nvml_ret = nvmlSystemGetDriverVersion(nvmod_version_string,
+        nvml_ret = nv::nvmlSystemGetDriverVersion(nvmod_version_string,
                                               sizeof(nvmod_version_string));
         if (nvml_ret != NVML_SUCCESS) {
             LOG(FATAL) << "nvmlSystemGetDriverVersion returned error " << nvml_ret;
@@ -145,6 +144,8 @@ void CUThreadedDecoder::Start() {
         LOG(FATAL) << "Problem creating video parser";
         return;
     }
+    // Push() uses cuCtxSetCurrent (no stack); the main-thread current setting
+    // does not affect the decode thread (current is thread-local), no pop needed.
     run_.store(true);
     // launch worker threads
     auto launcher_t = std::thread{&CUThreadedDecoder::LaunchThread, this};
@@ -221,7 +222,7 @@ int CUThreadedDecoder::HandlePictureDecode_(CUVIDPICPARAMS* pic_params) {
     // int tmp;
     // while (permit_queue->Size() < 1) continue;
     // int ret = permit_queue->Pop(&tmp);
-    if (!CHECK_CUDA_CALL(cuvidDecodePicture(decoder_, pic_params))) {
+    if (!CHECK_CUDA_CALL(nv::cuvidDecodePicture(decoder_, pic_params))) {
         LOG(FATAL) << "Failed to launch cuvidDecodePicture";
         return 0;
     }
@@ -369,14 +370,14 @@ void CUThreadedDecoder::LaunchThreadImpl() {
                     cupkt.timestamp = filtered_avpkt->pts;
                 }
 
-                if (!CHECK_CUDA_CALL(cuvidParseVideoData(parser_, &cupkt))) {
+                if (!CHECK_CUDA_CALL(nv::cuvidParseVideoData(parser_, &cupkt))) {
                     LOG(FATAL) << "Problem decoding packet";
                 }
             }
         } else {
             CUVIDSOURCEDATAPACKET cupkt = {0};
             cupkt.flags = CUVID_PKT_ENDOFSTREAM;
-            if (!CHECK_CUDA_CALL(cuvidParseVideoData(parser_, &cupkt))) {
+            if (!CHECK_CUDA_CALL(nv::cuvidParseVideoData(parser_, &cupkt))) {
                 LOG(FATAL) << "Problem decoding packet";
             }
             // cuvidParseVideoData callbacks are synchronous, so after

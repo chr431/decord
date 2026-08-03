@@ -4,7 +4,7 @@
  * \brief NVCUVID mapped frame
  */
 
-#include "nvcuvid/cuviddec.h"
+#include "nv_gpu_dyn.h"
 #include "cuda_mapped_frame.h"
 #include "../../runtime/cuda/cuda_common.h"
 #include <dmlc/logging.h>
@@ -31,7 +31,7 @@ CUMappedFrame::CUMappedFrame(CUVIDPARSERDISPINFO* disp_info,
     params_.second_field = 0;
     params_.output_stream = stream;
 
-    if (!CHECK_CUDA_CALL(cuvidMapVideoFrame(decoder_, disp_info->picture_index,
+    if (!CHECK_CUDA_CALL(nv::cuvidMapVideoFrame(decoder_, disp_info->picture_index,
                                    &ptr_, &pitch_, &params_))) {
         LOG(FATAL) << "Unable to map video frame";
     }
@@ -47,7 +47,7 @@ CUMappedFrame::CUMappedFrame(CUMappedFrame&& other)
 
 CUMappedFrame::~CUMappedFrame() {
     if (valid_) {
-        if (!CHECK_CUDA_CALL(cuvidUnmapVideoFrame(decoder_, ptr_))) {
+        if (!CHECK_CUDA_CALL(nv::cuvidUnmapVideoFrame(decoder_, ptr_))) {
             LOG(FATAL) << "Error unmapping video frame";
         }
     }

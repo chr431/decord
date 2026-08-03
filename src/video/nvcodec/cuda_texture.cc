@@ -5,7 +5,7 @@
  */
 
 #include "cuda_texture.h"
-#include "nvcuvid/nvcuvid.h"
+#include "nv_gpu_dyn.h"
 
 #include "../../runtime/cuda/cuda_common.h"
 

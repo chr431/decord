@@ -7,7 +7,7 @@
 #ifndef DECORD_VIDEO_NVCODEC_CUDA_TEXTURE_H_
 #define DECORD_VIDEO_NVCODEC_CUDA_TEXTURE_H_
 
-#include "nvcuvid/nvcuvid.h"
+#include "nv_gpu_dyn.h"
 #include "../../runtime/cuda/cuda_common.h"
 
 #include <unordered_map>

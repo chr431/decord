@@ -9,7 +9,7 @@
 
 #include <cstring>
 
-#include "nvcuvid/nvcuvid.h"
+#include "nv_gpu_dyn.h"
 #include "../../runtime/cuda/cuda_common.h"
 
 #ifdef __cplusplus
@@ -36,7 +36,7 @@ class CUVideoParser {
     {
         InitParams(codec, decoder, decode_surfaces, extradata, extradata_size);
 
-        CUDA_DRIVER_CALL(cuvidCreateVideoParser(&parser_, &parser_info_));
+        CUDA_DRIVER_CALL(nv::cuvidCreateVideoParser(&parser_, &parser_info_));
         initialized_ = true;
     }
 
@@ -47,7 +47,7 @@ class CUVideoParser {
 
     ~CUVideoParser() {
         if (initialized_) {
-            CUDA_DRIVER_CALL(cuvidDestroyVideoParser(parser_));
+            CUDA_DRIVER_CALL(nv::cuvidDestroyVideoParser(parser_));
         }
     }
 
@@ -60,7 +60,7 @@ class CUVideoParser {
 
     CUVideoParser& operator=(CUVideoParser&& other) {
         if (initialized_) {
-            CUDA_DRIVER_CALL(cuvidDestroyVideoParser(parser_));
+            CUDA_DRIVER_CALL(nv::cuvidDestroyVideoParser(parser_));
         }
         parser_ = other.parser_;
         parser_info_ = other.parser_info_;
