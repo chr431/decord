@@ -31,13 +31,16 @@ static const int REWIND_RETRY_MAX = std::stoi(runtime::GetEnvironmentVariableOrD
 static const int EOF_RETRY_MAX = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_EOF_RETRY_MAX", "10240"));
 // (corrupted video only): The warning threshold(0.0 - 1.0) when multiple frames are unavailable and fallbacked to cached frames
 static const float DUPLICATE_WARNING_THRESHOLD = std::stof(runtime::GetEnvironmentVariableOrDefault("DECORD_DUPLICATE_WARNING_THRESHOLD", "0.25"));
-// Number of FFmpeg decode threads.  0 = auto (let FFmpeg choose based on
-// CPU core count).  The frame_queue_ backpressure (DECORD_CPU_FRAME_QUEUE_SIZE)
-// prevents unbounded memory growth regardless of thread count.  FFmpeg 8
-// benchmarks show 3-4x CPU throughput with thread_count=0 vs 2, while RAM
-// stays under 500 MB peak.
-// Set DECORD_FFMPEG_THREAD_COUNT to override (e.g. =1 to minimise latency).
-static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "0"));
+// Number of FFmpeg decode threads.  Default 2: with auto (=0, all cores)
+// the decoder competes with the ONNX CPU inference threads for cores in
+// a decode/OCR pipeline, which slows both down badly (measured 27s -> 20.5s
+// on a 16-core machine for a 600-frame run).  Two decode threads keep the
+// decoder fast enough while leaving cores to the OCR side.  The
+// frame_queue_ backpressure (DECORD_CPU_FRAME_QUEUE_SIZE) prevents
+// unbounded memory growth regardless of thread count.
+// Set DECORD_FFMPEG_THREAD_COUNT to override (e.g. =0 for full-core decode
+// when the reader is used without OCR, =1 to minimise latency).
+static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "2"));
 
 VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol)
      : ctx_(ctx), key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
@@ -357,10 +360,15 @@ bool VideoReader::SeekAccurate(int64_t pos) {
     if (key_pos != curr_key_pos || pos < curr_frame_) {
         // need to seek to keyframes first
         // std::cout << "need to seek to keyframe " << key_pos << " first " << std::endl;
-        // Seek directly to the target keyframe.  Modern containers (MP4/MKV)
-        // carry frame indexes so av_seek_frame lands exactly; the rewind to 0
-        // below used to double the I/O of every random access.
-        bool ret = Seek(key_pos);
+        // Rewind to 0 first for seek accuracy (upstream behaviour).  Direct
+        // keyframe seeks (previous perf commit) land on the wrong frame with
+        // the CPU decoder: after Seek(key_pos) the first next() returns a
+        // duplicate of an earlier frame and the stream drifts by 1-2 frames.
+        // The rewind costs one extra I/O pass per random access; the pipeline
+        // seeks once per video so the cost is negligible.
+        bool ret = Seek(0);
+        if (!ret) return false;
+        ret = Seek(key_pos);
         if (!ret) return false;
         // double check if keyframe was jumpped correctly
         if(CheckKeyFrame()){
@@ -727,14 +735,16 @@ void VideoReader::SkipFramesImpl(int64_t num)
     num = std::min(GetFrameCount() - curr_frame_, num);
     if (num < 1) return;
 
+    // Skip by plain decode-and-drop count.  The previous implementation
+    // asked the decoder thread to drop frames by PTS (SuggestDiscardPTS);
+    // the decoded frame's best_effort_timestamp often does not match the
+    // container PTS computed by FramesToPTS, so frames were not dropped
+    // and the stream drifted (duplicate frames, 1-2 frame offset after
+    // seek).  Counting decoded frames is exact.  Skipping costs the
+    // decode of the skipped frames, which happens once per seek.
     NDArray frame;
     decoder_->Start();
     bool ret = false;
-    std::vector<int64_t> frame_pos(num);
-    std::iota(frame_pos.begin(), frame_pos.end(), curr_frame_);
-    auto pts = FramesToPTS(frame_pos);
-    decoder_->SuggestDiscardPTS(pts);
-
     while (num > 0) {
         PushNext();
         ret = decoder_->Pop(&frame);
@@ -743,7 +753,6 @@ void VideoReader::SkipFramesImpl(int64_t num)
         // LOG(INFO) << "skip: " << num;
         --num;
     }
-    decoder_->ClearDiscardPTS();
 }
 
 NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf) {

@@ -40,8 +40,11 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx)
 	// AVBufferSinkParams *buffersink_params;
 
 	filter_graph_.reset(avfilter_graph_alloc());
-	/* set threads to 1, details see https://github.com/dmlc/decord/pull/63 */
-	//LOG(INFO) << "Original GraphFilter nb_threads: " << filter_graph_->nb_threads;
+	/* nb_threads: 0 = auto.  Auto is faster for standalone decode (878fps
+	 * vs 1-thread), but in a decode/OCR pipeline it competes with the ONNX
+	 * inference threads for cores and ends up slower overall (measured
+	 * 133fps -> 87fps in-pipeline).  Single-threaded scale is the safer
+	 * choice for the pipeline case (dmlc/decord PR #63 rationale). */
 	filter_graph_->nb_threads = 1;
     /* buffer video source: the decoded frames from the decoder will be inserted here. */
 	std::snprintf(args, sizeof(args),

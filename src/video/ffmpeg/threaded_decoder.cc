@@ -59,20 +59,28 @@ void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, 
     dec_ctx_.reset(dec_ctx);
     // LOG(INFO) << dec_ctx->width << " x " << dec_ctx->height << " : " << dec_ctx->time_base.num << " , " << dec_ctx->time_base.den;
     // std::string descr = "scale=320:240";
-    char descr[128];
+    // Force BT.601 (limited) color conversion: the CUDA decode path uses a
+    // fixed BT.601 matrix (improc.cu), while FFmpeg's swscale honours the
+    // stream's color metadata (most racing videos are tagged bt709).  The
+    // two decoders then produce visibly different RGB for the same frame,
+    // which breaks OCR on the CPU path (measured 28/30 recognition fails
+    // and a systematic +7.5 G-channel offset).  setparams rewrites the
+    // frame metadata so swscale picks the BT.601 matrix; the outputs then
+    // match the GPU path within rounding (<=1-2 per pixel).
+    char descr[160];
     switch(rotation) {
         case 90:
-            std::snprintf(descr, sizeof(descr), "transpose=1,scale=%d:%d,format=rgb24", width, height);
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,scale=%d:%d,format=rgb24", width, height);
             break;
         case 180:
-            std::snprintf(descr, sizeof(descr), "transpose=1,transpose=1,scale=%d:%d,format=rgb24", width, height);
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,transpose=1,scale=%d:%d,format=rgb24", width, height);
             break;
         case 270:
-            std::snprintf(descr, sizeof(descr), "transpose=2,scale=%d:%d,format=rgb24", width, height);
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=2,scale=%d:%d,format=rgb24", width, height);
             break;
         case 0:
         default:
-            std::snprintf(descr, sizeof(descr), "scale=%d:%d,format=rgb24", width, height);
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,scale=%d:%d,format=rgb24", width, height);
     }
     filter_graph_ = FFMPEGFilterGraphPtr(new FFMPEGFilterGraph(descr, dec_ctx_.get()));
     if (running) {
