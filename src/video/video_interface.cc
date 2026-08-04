@@ -54,6 +54,15 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderNextFrame")
     *rv = arr;
   });
 
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderNextFrameRoi")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    int x1 = args[1], y1 = args[2], x2 = args[3], y2 = args[4];
+    NDArray arr = static_cast<VideoReaderInterface*>(handle)
+        ->NextFrameRoi(x1, y1, x2, y2);
+    *rv = arr;
+  });
+
 DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetFrameCount")
 .set_body([] (DECORDArgs args, DECORDRetValue* rv) {
     VideoReaderInterfaceHandle handle = args[0];

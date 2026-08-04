@@ -48,6 +48,10 @@ class VideoReaderInterface {
     virtual int64_t GetCurrentPosition() const = 0;
     /*! \brief read the next frame, return NDArray */
     virtual runtime::NDArray NextFrame() = 0;
+    /*! \brief read the next frame and return only the ROI rectangle
+     *  (half-open [x1,x2) x [y1,y2)); GPU path copies only the ROI to host,
+     *  CPU / invalid ROI falls back to the full frame */
+    virtual runtime::NDArray NextFrameRoi(int x1, int y1, int x2, int y2) = 0;
     /*! \brief retrieve keyframe indices */
     virtual runtime::NDArray GetKeyIndices() = 0;
     /*! \brief retrieve playback seconds by frame indices */

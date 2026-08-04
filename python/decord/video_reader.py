@@ -119,6 +119,34 @@ class VideoReader(object):
             raise StopIteration()
         return bridge_out(arr)
 
+    def next_roi(self, x1, y1, x2, y2):
+        """Grab the next frame, returning only the ROI rectangle.
+
+        The ROI is half-open ``[x1, x2) x [y1, y2)`` (numpy slice semantics)
+        in full-frame pixel coordinates; the result is a host-side uint8
+        array of shape ``(y2 - y1, x2 - x1, 3)`` in the same RGB channel
+        order as ``next()``.  On the GPU path only the ROI is copied from
+        device memory, avoiding a full-frame D2H copy.  CPU builds and
+        invalid/empty ROIs return the full frame instead.
+
+        Parameters
+        ----------
+        x1, y1, x2, y2 : int
+            Half-open ROI bounds in the full frame.
+
+        Returns
+        -------
+        ndarray
+            ROI crop, shape (y2 - y1, x2 - x1, 3).
+
+        """
+        assert self._handle is not None
+        arr = _CAPI_VideoReaderNextFrameRoi(
+            self._handle, int(x1), int(y1), int(x2), int(y2))
+        if not arr.shape:
+            raise StopIteration()
+        return bridge_out(arr)
+
     def _validate_indices(self, indices):
         """Validate int64 integers and convert negative integers to positive by backward search"""
         assert self._handle is not None
