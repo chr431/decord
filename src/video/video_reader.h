@@ -43,6 +43,15 @@ class VideoReader : public VideoReaderInterface {
         int64_t GetFrameCount() const;
         int64_t GetCurrentPosition() const;
         NDArray NextFrame();
+        /*!
+         * \brief Grab the next frame and return only the ROI rectangle.
+         * \param x1,y1,x2,y2 Half-open ROI [x1,x2) x [y1,y2).  On the GPU path
+         *        only the ROI rectangle is copied to host memory (the caller
+         *        would otherwise receive the full frame and crop it, wasting
+         *        a full-frame D2H copy).  CPU builds and invalid ROIs fall
+         *        back to the full frame (caller crops).
+         */
+        NDArray NextFrameRoi(int x1, int y1, int x2, int y2);
         NDArray GetBatch(std::vector<int64_t> indices, NDArray buf);
         void SkipFrames(int64_t num = 1);
         bool Seek(int64_t pos);

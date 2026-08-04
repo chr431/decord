@@ -106,6 +106,10 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         std::mutex error_mutex_;
         std::atomic<bool> error_status_;
         std::string error_message_;
+        // packet-queue backpressure: Push() waits on this cv instead of
+        // busy-polling with a 1ns sleep when the queue exceeds the limit
+        std::mutex pkt_room_mutex_;
+        std::condition_variable pkt_room_cv_;
 
     DISALLOW_COPY_AND_ASSIGN(CUThreadedDecoder);
 };

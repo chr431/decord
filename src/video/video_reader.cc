@@ -9,6 +9,7 @@
 #include "../runtime/str_util.h"
 #if DECORD_USE_CUDA
 #include "nvcodec/cuda_threaded_decoder.h"
+#include <cuda_runtime_api.h>
 #endif
 #include <algorithm>
 #include <decord/runtime/ndarray.h>
@@ -225,10 +226,12 @@ void VideoReader::SetVideoStream(int stream_nb) {
     }
 
     if (ctx_.device_type == kDLCUDA) {
-        // pool up to 20 GPU output buffers (matching kMaxOutputSurfaces);
-        // recycling them removes a cudaMalloc/cudaFree per frame, which
+        // pool up to 22 GPU output buffers: 20 matching kMaxOutputSurfaces
+        // plus 1 held by cached_frame_ (CacheFrame now keeps a reference to
+        // the popped buffer for zero-copy fault tolerance) plus 1 margin.
+        // Recycling buffers removes a cudaMalloc/cudaFree per frame, which
         // measures ~+59% GPU sequential decode on HEVC with no memory cost
-        ndarray_pool_.Reset(20, {height_, width_, 3}, kUInt8, ctx_);
+        ndarray_pool_.Reset(22, {height_, width_, 3}, kUInt8, ctx_);
     }
 
     decoder_->SetCodecContext(dec_ctx, width_, height_, rotation);
@@ -490,6 +493,46 @@ NDArray VideoReader::NextFrameImpl() {
 NDArray VideoReader::NextFrame() {
     if (!fmt_ctx_) return NDArray();
     return NextFrameImpl();
+}
+
+NDArray VideoReader::NextFrameRoi(int x1, int y1, int x2, int y2) {
+    if (!fmt_ctx_) return NDArray();
+    if (ctx_.device_type != kDLCUDA) {
+        // CPU build: no device frame to copy from, return full frame
+        return NextFrameImpl();
+    }
+    // clamp to the frame bounds; empty ROI falls back to the full frame
+    x1 = std::max(0, std::min(x1, width_));
+    y1 = std::max(0, std::min(y1, height_));
+    x2 = std::max(0, std::min(x2, width_));
+    y2 = std::max(0, std::min(y2, height_));
+    if (x2 <= x1 || y2 <= y1) {
+        return NextFrameImpl();
+    }
+    // reuse NextFrameImpl() so fault tolerance / EOF / rewind handling is
+    // inherited verbatim; on the GPU path the popped frame is a pool buffer
+    NDArray frame = NextFrameImpl();
+    if (!frame.defined() || frame.Size() <= 1) {
+        // EOF marker / drain sentinel: pass through untouched
+        return frame;
+    }
+    NDArray roi = NDArray::Empty({y2 - y1, x2 - x1, 3}, kUInt8, kCPU);
+#if DECORD_USE_CUDA
+    // the display callback already synchronized the decode stream, so the
+    // frame content is complete; a single 2D copy fetches only the ROI
+    cudaError_t err = cudaMemcpy2D(
+        roi->data,                                   // dst
+        static_cast<size_t>(x2 - x1) * 3,            // dst pitch (bytes)
+        static_cast<const char *>(frame->data)
+            + static_cast<int64_t>(y1) * width_ * 3
+            + static_cast<int64_t>(x1) * 3,          // src + row/col offset
+        static_cast<size_t>(width_) * 3,             // src pitch (bytes)
+        static_cast<size_t>(x2 - x1) * 3,            // bytes per row
+        static_cast<size_t>(y2 - y1),                // rows
+        cudaMemcpyDeviceToHost);
+    CHECK_EQ(err, cudaSuccess) << "cudaMemcpy2D failed in NextFrameRoi";
+#endif
+    return roi;
 }
 
 void VideoReader::IndexKeyframes() {
@@ -757,12 +800,13 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf) {
 
 void VideoReader::CacheFrame(NDArray frame) {
     if (!use_cached_frame_) return;
-    if (!cached_frame_.defined()) {
-        cached_frame_ = NDArray::Empty({height_, width_, 3}, kUInt8, ctx_);
-    }
     if (!frame.defined()) return;
-    if (cached_frame_.Size() != frame.Size()) return;
-    cached_frame_.CopyFrom(frame);
+    // Hold a reference to the popped buffer instead of deep-copying it.
+    // NDArray is refcounted, so the pool buffer stays alive (and out of
+    // the pool) until the next frame replaces this reference — exactly
+    // what the fault-tolerance path needs. This removes a full-frame
+    // synchronous D2D copy from every next() call.
+    cached_frame_ = frame;
 }
 
 bool VideoReader::FetchCachedFrame(NDArray &frame, int64_t pos) {

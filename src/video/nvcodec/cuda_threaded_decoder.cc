@@ -162,6 +162,7 @@ void CUThreadedDecoder::Stop() {
         frame_queue_->SignalForKill();
         reorder_queue_->SignalForKill();
     }
+    pkt_room_cv_.notify_all();  // wake any Push() blocked on backpressure
     if (launcher_t_.joinable()) {
         launcher_t_.join();
     }
@@ -300,9 +301,14 @@ void CUThreadedDecoder::Push(AVPacketPtr pkt, NDArray buf) {
     }
     if (!pkt) draining_.store(true);
 
-    while (pkt_queue_->Size() > kMaxOutputSurfaces) {
-        // too many in queue to be processed, wait here
-        std::this_thread::sleep_for(std::chrono::nanoseconds(1));
+    {
+        // Backpressure: wait until the queue drains below the surface
+        // limit. The decoder thread notifies after every Pop; the old
+        // 1ns busy-poll burned a full core while the decoder saturated.
+        std::unique_lock<std::mutex> lock(pkt_room_mutex_);
+        pkt_room_cv_.wait(lock, [this]() {
+            return !run_.load() || pkt_queue_->Size() <= kMaxOutputSurfaces;
+        });
     }
 
     pkt_queue_->Push(pkt);
@@ -347,6 +353,8 @@ void CUThreadedDecoder::LaunchThreadImpl() {
         AVPacketPtr avpkt = nullptr;
         ret = pkt_queue_->Pop(&avpkt);
         if (!ret) return;
+        // a slot freed: wake any Push() waiting on backpressure
+        pkt_room_cv_.notify_one();
 
         if (avpkt && avpkt->size) {
             // Strip side data before BSF: the hardware decoder only needs raw
