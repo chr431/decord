@@ -60,6 +60,8 @@ class VideoReaderInterface {
     virtual double GetAverageFPS() const = 0;
     /*! \brief get rotation */
     virtual double GetRotation() const = 0;
+    /*! \brief get video codec name (e.g. h264, hevc) */
+    virtual std::string GetCodec() const = 0;
     /*! \brief destructor */
     virtual ~VideoReaderInterface() = default;
 

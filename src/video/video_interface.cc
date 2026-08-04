@@ -122,6 +122,13 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetAverageFPS")
     *rv = fps;
   });
 
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetCodec")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    std::string codec = static_cast<VideoReaderInterface*>(handle)->GetCodec();
+    *rv = codec;
+  });
+
 DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderFree")
 .set_body([] (DECORDArgs args, DECORDRetValue* rv) {
     VideoReaderInterfaceHandle handle = args[0];

@@ -188,6 +188,17 @@ class VideoReader(object):
             self._key_indices = _CAPI_VideoReaderGetKeyIndices(self._handle).asnumpy().tolist()
         return self._key_indices
 
+    def get_codec(self):
+        """Get video codec name (e.g. h264, hevc).
+
+        Returns
+        -------
+        str
+            Codec name, or empty string if unavailable.
+
+        """
+        return _CAPI_VideoReaderGetCodec(self._handle)
+
     def get_avg_fps(self):
         """Get average FPS(frame per second).
 

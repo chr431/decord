@@ -572,6 +572,14 @@ double VideoReader::GetAverageFPS() const {
     return static_cast<double>(active_st->avg_frame_rate.num) / active_st->avg_frame_rate.den;
 }
 
+std::string VideoReader::GetCodec() const {
+    if (!fmt_ctx_ || fmt_ctx_->nb_streams == 0) return "";
+    AVStream *st = fmt_ctx_->streams[0];
+    if (!st || !st->codecpar) return "";
+    const char *name = avcodec_get_name(st->codecpar->codec_id);
+    return name ? std::string(name) : "";
+}
+
 double VideoReader::GetRotation() const {
     if (!fmt_ctx_) return 0.0;
     CHECK(actv_stm_idx_ >= 0);
