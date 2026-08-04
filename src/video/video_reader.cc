@@ -12,6 +12,7 @@
 #include <cuda_runtime_api.h>
 #endif
 #include <algorithm>
+#include <cstring>
 #include <decord/runtime/ndarray.h>
 #include <decord/runtime/c_runtime_api.h>
 
@@ -31,16 +32,17 @@ static const int REWIND_RETRY_MAX = std::stoi(runtime::GetEnvironmentVariableOrD
 static const int EOF_RETRY_MAX = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_EOF_RETRY_MAX", "10240"));
 // (corrupted video only): The warning threshold(0.0 - 1.0) when multiple frames are unavailable and fallbacked to cached frames
 static const float DUPLICATE_WARNING_THRESHOLD = std::stof(runtime::GetEnvironmentVariableOrDefault("DECORD_DUPLICATE_WARNING_THRESHOLD", "0.25"));
-// Number of FFmpeg decode threads.  Default 2: with auto (=0, all cores)
-// the decoder competes with the ONNX CPU inference threads for cores in
-// a decode/OCR pipeline, which slows both down badly (measured 27s -> 20.5s
-// on a 16-core machine for a 600-frame run).  Two decode threads keep the
-// decoder fast enough while leaving cores to the OCR side.  The
-// frame_queue_ backpressure (DECORD_CPU_FRAME_QUEUE_SIZE) prevents
-// unbounded memory growth regardless of thread count.
+// Number of FFmpeg decode threads.  Default 4: measured on a 16-core
+// machine (7945HX) with test5 (7223 frames) in the CPU decode + ONNX CPU
+// inference pipeline — 2 threads: decode 18.1s (399fps) / total 23.6s;
+// 4 threads: decode 11.6s (621fps) / total 16.9s; 6 threads: no further
+// decode gain (616fps) and inference slows.  Auto (=0, all cores) competes
+// with the ONNX threads and slows both down badly.  The frame_queue_
+// backpressure (DECORD_CPU_FRAME_QUEUE_SIZE) prevents unbounded memory
+// growth regardless of thread count.
 // Set DECORD_FFMPEG_THREAD_COUNT to override (e.g. =0 for full-core decode
 // when the reader is used without OCR, =1 to minimise latency).
-static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "2"));
+static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "4"));
 
 VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol)
      : ctx_(ctx), key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
@@ -505,10 +507,6 @@ NDArray VideoReader::NextFrame() {
 
 NDArray VideoReader::NextFrameRoi(int x1, int y1, int x2, int y2) {
     if (!fmt_ctx_) return NDArray();
-    if (ctx_.device_type != kDLCUDA) {
-        // CPU build: no device frame to copy from, return full frame
-        return NextFrameImpl();
-    }
     // clamp to the frame bounds; empty ROI falls back to the full frame
     x1 = std::max(0, std::min(x1, width_));
     y1 = std::max(0, std::min(y1, height_));
@@ -525,21 +523,39 @@ NDArray VideoReader::NextFrameRoi(int x1, int y1, int x2, int y2) {
         return frame;
     }
     NDArray roi = NDArray::Empty({y2 - y1, x2 - x1, 3}, kUInt8, kCPU);
+    if (ctx_.device_type == kDLCUDA) {
 #if DECORD_USE_CUDA
-    // the display callback already synchronized the decode stream, so the
-    // frame content is complete; a single 2D copy fetches only the ROI
-    cudaError_t err = cudaMemcpy2D(
-        roi->data,                                   // dst
-        static_cast<size_t>(x2 - x1) * 3,            // dst pitch (bytes)
-        static_cast<const char *>(frame->data)
-            + static_cast<int64_t>(y1) * width_ * 3
-            + static_cast<int64_t>(x1) * 3,          // src + row/col offset
-        static_cast<size_t>(width_) * 3,             // src pitch (bytes)
-        static_cast<size_t>(x2 - x1) * 3,            // bytes per row
-        static_cast<size_t>(y2 - y1),                // rows
-        cudaMemcpyDeviceToHost);
-    CHECK_EQ(err, cudaSuccess) << "cudaMemcpy2D failed in NextFrameRoi";
+        // the display callback already synchronized the decode stream, so the
+        // frame content is complete; a single 2D copy fetches only the ROI
+        cudaError_t err = cudaMemcpy2D(
+            roi->data,                                   // dst
+            static_cast<size_t>(x2 - x1) * 3,            // dst pitch (bytes)
+            static_cast<const char *>(frame->data)
+                + static_cast<int64_t>(y1) * width_ * 3
+                + static_cast<int64_t>(x1) * 3,          // src + row/col offset
+            static_cast<size_t>(width_) * 3,             // src pitch (bytes)
+            static_cast<size_t>(x2 - x1) * 3,            // bytes per row
+            static_cast<size_t>(y2 - y1),                // rows
+            cudaMemcpyDeviceToHost);
+        CHECK_EQ(err, cudaSuccess) << "cudaMemcpy2D failed in NextFrameRoi";
 #endif
+    } else {
+        // CPU build: row-stride copy of only the ROI rectangle (e.g. 10KB at
+        // 106x33) instead of handing out the full 6.2MB 1080p frame — the
+        // caller's asnumpy() would otherwise copy the whole frame per call
+        // (measured ~0.6ms/frame, ~37% of the 4-thread decode budget).
+        const char *src = static_cast<const char *>(frame->data)
+            + static_cast<int64_t>(y1) * width_ * 3
+            + static_cast<int64_t>(x1) * 3;
+        char *dst = static_cast<char *>(roi->data);
+        size_t src_pitch = static_cast<size_t>(width_) * 3;
+        size_t row_bytes = static_cast<size_t>(x2 - x1) * 3;
+        for (int y = 0; y < y2 - y1; ++y) {
+            std::memcpy(dst + static_cast<int64_t>(y) * row_bytes,
+                        src + static_cast<int64_t>(y) * src_pitch,
+                        row_bytes);
+        }
+    }
     return roi;
 }
 
