@@ -268,7 +268,7 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
                                             ScaleMethod_Linear,
                                             ChromaUpMethod_Linear,
                                             decoder_.BitDepth());
-    ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_, input_width, input_height, width_, height_);
+    ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_, input_width, input_height, width_, height_, decoder_.BitDepth());
     if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
         LOG(FATAL) << "Error synchronize cuda stream";
         return 0;

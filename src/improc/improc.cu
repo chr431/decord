@@ -102,10 +102,14 @@ int DivUp(int total, int grain) {
 
 void ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
     uint8_t* dst, cudaStream_t stream, uint16_t input_width, uint16_t input_height,
-    int output_width, int output_height) {
+    int output_width, int output_height, int bit_depth) {
     // resize factor
     auto fx = static_cast<float>(input_width) / output_width;
     auto fy = static_cast<float>(input_height) / output_height;
+    // 位深语义：P016/P012 的 10/12-bit 数据在 16-bit 字中左对齐存储，
+    // normalized float 采样 texel/65535 即等于 value/2^bit_depth —— 与
+    // 8-bit 的 texel/255 语义天然一致，无需额外缩放（实测左对齐假设）。
+    (void)bit_depth;
 
     dim3 block(32, 8);
     dim3 grid(DivUp(output_width, block.x), DivUp(output_height, block.y));
