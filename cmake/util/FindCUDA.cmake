@@ -89,6 +89,13 @@ macro(find_cuda use_cuda)
       endif()
     endforeach()
 
+    # Fallback: repo-bundled NVCUVID headers (src/video/nvcodec/nvcuvid/).
+    # The Video Codec SDK is a separate install; on CI it does not exist, so
+    # the bundled stable-ABI interface header (also used by the Linux build)
+    # makes the Windows GPU build self-contained.  SDK headers, when present,
+    # take priority because they are appended earlier.
+    list(APPEND CUDA_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/src/video/nvcodec/nvcuvid")
+
     if(MSVC)
       find_library(CUDA_CUDA_LIBRARY cuda
         ${CUDA_TOOLKIT_ROOT_DIR}/lib/x64
