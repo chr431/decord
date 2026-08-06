@@ -53,6 +53,7 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 0  # 全历史：发布 notes 需要自上一 tag 的 commit 列表
           token: ${{ github.token }}
+          submodules: recursive  # 3rdparty/dlpack + dmlc-core：缺了 dlpack.h / logging.h 编不过
 
       - name: Validate version
         shell: pwsh
