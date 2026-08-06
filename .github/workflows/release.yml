@@ -40,7 +40,11 @@ concurrency:
 
 jobs:
   release:
-    runs-on: windows-latest
+    # windows-2022（VS 2022）而非 windows-latest（VS 18 2026）：
+    # CUDA 12.6 的 VS 集成只支持到 VS 2022 —— windows-latest 上 CMake VS 生成器
+    # 报 "No CUDA toolset found"（CMake 的 CUDA 语言支持依赖 NVIDIA 的 MSBuild toolset）。
+    # decord.dll 运行时动态加载 CUDA（nv_gpu_dyn），工具链版本不影响产物。
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
