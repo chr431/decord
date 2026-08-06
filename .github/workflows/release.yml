@@ -1,0 +1,166 @@
+# decord fork 发布工作流 — 一键构建 Windows GPU 版并发布 GitHub Release
+#
+# 手动触发（Actions → Release → Run workflow），输入版本号即完成：
+#   1. 校验版本格式 + 确认 tag 不存在
+#   2. 安装 CUDA Toolkit + 下载 FFmpeg 8.1（BtbN shared build）
+#   3. CMake GPU 构建 decord.dll（USE_CUDA=ON）
+#   4. 若 libinfo.py 版本 != 输入版本：升版本 → commit → push 到目标分支
+#   5. 打 tag v<版本> 并 push
+#   6. 打包 zip（布局 = RaceVideoToLog 的 _decord_build/，解压即用）：
+#        decord.dll + FFmpeg 8.1 DLLs + ffprobe.exe + python/decord/
+#   7. 创建 GitHub Release（notes = 自上一 tag 的 commit 列表）+ 上传 zip
+#
+# 只监听 workflow_dispatch（push/tag 不会二次触发）。构建失败时不会产生
+# 任何 commit / tag / release（commit+tag 在构建成功后才执行）。
+#
+# 注意：CUDA 路径必须用正斜杠传 -DUSE_CUDA —— CMake 会把反斜杠当转义
+# 序列（"Invalid character escape '\P'"）。FindCUDA.cmake 与本地验证过。
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.7.0). Creates tag v<version>.'
+        required: true
+        type: string
+      ref:
+        description: 'Branch to release from'
+        required: false
+        default: 'feat/perf-deep'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0  # 全历史：发布 notes 需要自上一 tag 的 commit 列表
+          token: ${{ github.token }}
+
+      - name: Validate version
+        shell: pwsh
+        run: |
+          if ("${{ inputs.version }}" -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "版本必须是纯 X.Y.Z（当前: ${{ inputs.version }}）"
+            exit 1
+          }
+          if (git tag -l "v${{ inputs.version }}" | Select-String -Quiet "v${{ inputs.version }}") {
+            Write-Error "tag v${{ inputs.version }} 已存在，先删 tag 或换版本号"
+            exit 1
+          }
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        # v0.2.19 的 Windows network 可用版本最高 12.6.2（SemVer 校验，12.9 不在列表）。
+        # fork 用 CUDA_STANDARD 11，NVDEC/NVML 运行时动态加载，工具链版本不影响产物。
+        with:
+          cuda: '12.6.2'
+          method: 'network'
+
+      - name: Download FFmpeg 8.1 (shared)
+        shell: pwsh
+        run: |
+          $ffmpegZip = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+          curl -L -o ffmpeg.zip $ffmpegZip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg
+          Get-ChildItem ffmpeg
+
+      - name: Build decord (GPU)
+        shell: pwsh
+        run: |
+          # CUDA 路径必须正斜杠（CMake 反斜杠转义坑，本地验证过）
+          $cudaFwd = "$env:CUDA_PATH".Replace('\', '/')
+          $ffmpegDir = (Resolve-Path "ffmpeg/ffmpeg-n8.1-latest-win64-gpl-shared-8.1").Path
+          Write-Host "CUDA:   $cudaFwd"
+          Write-Host "FFMPEG: $ffmpegDir"
+          cmake -S . -B build -DUSE_CUDA="$cudaFwd" -DFFMPEG_DIR="$ffmpegDir" -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "build/Release/decord.dll")) {
+            Write-Error "decord.dll 未生成（构建失败）"
+            exit 1
+          }
+
+      - name: Bump version + tag
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.version }}"
+          $libinfo = "python/decord/_ffi/libinfo.py"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          $content = [System.IO.File]::ReadAllText((Resolve-Path $libinfo))
+          $cur = [regex]::Match($content, '__version__ = "(\d+\.\d+\.\d+)"').Groups[1].Value
+          Write-Host "当前 libinfo.py 版本: $cur"
+          if ($cur -ne $ver) {
+            $content = $content -replace '__version__ = "\d+\.\d+\.\d+"', "__version__ = `"$ver`""
+            # UTF-8 无 BOM（PowerShell 5.1 的 utf8 会带 BOM，pwsh 7 不会，这里显式保证）
+            [System.IO.File]::WriteAllText((Resolve-Path $libinfo), $content, (New-Object System.Text.UTF8Encoding($false)))
+            git add $libinfo
+            git commit -m "release: v$ver"
+            git push origin "HEAD:${{ inputs.ref }}"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "libinfo.py 已是 $ver，无需 bump commit"
+          }
+          git tag "v$ver"
+          git push origin "v$ver"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Generate release notes
+        id: notes
+        shell: pwsh
+        run: |
+          # tag 已创建：HEAD 即 bump commit；取 HEAD~1 之前的上一个 tag
+          $prev = git describe --tags --abbrev=0 "HEAD~1" 2>$null
+          if ($prev) { $prev = $prev.Trim() }  # git 输出带尾随换行，必须 Trim
+          if ($prev) {
+            $log = git log --oneline --no-merges "$prev..HEAD"
+          } else {
+            $log = git log --oneline --no-merges -50
+          }
+          $sha = "$env:GITHUB_SHA".Substring(0, 7)
+          $body = "decord fork v${{ inputs.version }}（GPU NVDEC + CPU 解码，FFmpeg 8.1）`n`n" +
+                  "构建源: ${{ inputs.ref }} @ $sha`n`n## Commits`n$log"
+          [System.IO.File]::WriteAllText("notes.md", $body, (New-Object System.Text.UTF8Encoding($false)))
+
+      - name: Package release artifact
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.version }}"
+          $ffmpegBin = "ffmpeg/ffmpeg-n8.1-latest-win64-gpl-shared-8.1/bin"
+          # 布局 = RaceVideoToLog 的 _decord_build/（setup_venv.bat 直接解压拷贝）
+          $stage = "_decord_build"
+          New-Item -ItemType Directory -Path "$stage/python" -Force | Out-Null
+          Copy-Item "build/Release/decord.dll" $stage/
+          Copy-Item "$ffmpegBin/*.dll" $stage/
+          Copy-Item "$ffmpegBin/ffprobe.exe" $stage/
+          Copy-Item -Recurse "python/decord" "$stage/python/decord"
+          Compress-Archive -Path $stage -DestinationPath "decord-$ver-win64-gpu.zip"
+          Write-Host "zip contents:"
+          Get-ChildItem -Recurse $stage | ForEach-Object { $_.FullName.Replace("$PWD\", "") }
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ inputs.version }}" "decord-${{ inputs.version }}-win64-gpu.zip" `
+            --title "decord v${{ inputs.version }}" `
+            --notes-file notes.md
