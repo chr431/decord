@@ -86,5 +86,7 @@ def find_lib_path(name=None, search_path=None, optional=False):
 # current version
 # We use the version of the incoming release for code
 # that is under development.
-# The following line is set by decord/python/update_version.py
-__version__ = "0.6.0"
+# The following line is the single source of truth for this fork's version.
+# Bump it as part of the release process (see README "Releases" section);
+# python/setup.py and python/decord/__init__.py both derive from here.
+__version__ = "0.7.0"

@@ -156,6 +156,42 @@ somewhere else.  Useful build options: `-DUSE_CUDA=ON|OFF` (NVDEC),
 `-DFFMPEG_DIR=...` (custom FFmpeg), `-DDECORD_INSTALL_LIBDIR=...`
 (install destination for `cmake --install`).
 
+### Releases（本 fork）
+
+本 fork 是 RaceVideoToLog 的硬依赖（next_roi / get_codec / GPU 动态加载 /
+CPU 内存修复），**不依赖 PyPI decord**。版本与发布遵循：
+
+- **版本号**：SemVer `X.Y.Z`，单一事实源为
+  `python/decord/_ffi/libinfo.py` 的 `__version__`。`python/setup.py` 与
+  `python/decord/__init__.py` 都从这里派生，改版本只动这一处。
+- **tag 约定**：`v<X.Y.Z>`（如 `v0.7.0`）。
+- **发布产物**：GitHub Release 的 `decord-<ver>-win64-gpu.zip`，内含
+  `_decord_build/` 布局 —— `decord.dll` + FFmpeg 8.1 DLLs + `ffprobe.exe`
+  + `python/decord/`。解压即得 RaceVideoToLog 的 `_decord_build/` 目录，
+  `setup_venv.bat` 直接拷贝。
+
+#### 发布流程（一键）
+
+在 GitHub Actions → **Release** → Run workflow：
+
+1. `version`：要发布的版本号（如 `0.7.0`），会自动打 tag `v0.7.0`
+2. `ref`：默认 `feat/perf-deep`（可改为其它分支）
+
+workflow 会依次：校验版本格式 + tag 不重复 → 安装 CUDA Toolkit +
+下载 BtbN FFmpeg 8.1 → CMake GPU 构建 → 若 `libinfo.py` 版本不符则升版本并
+commit+push → 打 tag → 打包 zip → 创建 Release（notes = 自上一 tag 的
+commit 列表）并上传 zip。**构建失败不会产生任何 commit/tag/release**。
+
+#### 手动构建（无 GitHub 时）
+
+```bash
+# CUDA 路径必须用正斜杠（反斜杠会被 CMake 当转义序列）
+cmake -S . -B build -DUSE_CUDA="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" \
+      -DFFMPEG_DIR="D:/path/to/ffmpeg-8.1" -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+# 产物: build/Release/decord.dll（FFmpeg DLLs 需与 decord.dll 同目录）
+```
+
 #### Mac OS
 
 Installation on macOS is similar to Linux. But macOS users need to install building tools like clang, GNU Make, cmake first.
