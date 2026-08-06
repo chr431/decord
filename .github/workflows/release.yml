@@ -40,10 +40,11 @@ concurrency:
 
 jobs:
   release:
-    # windows-2022（VS 2022）而非 windows-latest（VS 18 2026）：
-    # CUDA 12.6 的 VS 集成只支持到 VS 2022 —— windows-latest 上 CMake VS 生成器
-    # 报 "No CUDA toolset found"（CMake 的 CUDA 语言支持依赖 NVIDIA 的 MSBuild toolset）。
-    # decord.dll 运行时动态加载 CUDA（nv_gpu_dyn），工具链版本不影响产物。
+    # windows-2022（VS 2022）而非 windows-latest：锁定镜像避免 runner VS 版本漂移。
+    # CUDA 13.3 的 VS 集成同时支持 VS 2022 与 VS 18 2026（本地已用 VS 18 2026 验证过
+    # CMake 构建，windows-latest 也能过），但发布流水线用固定镜像更可复现。
+    # decord.dll 的 CUDA（cudart/NVDEC/NVML/驱动 API）全部运行时动态加载（nv_gpu_dyn），
+    # 构建工具链版本不影响产物 —— 导入表只有 FFmpeg + VC 运行库。
     runs-on: windows-2022
     steps:
       - name: Checkout
@@ -66,11 +67,13 @@ jobs:
           }
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.19
-        # v0.2.19 的 Windows network 可用版本最高 12.6.2（SemVer 校验，12.9 不在列表）。
-        # fork 用 CUDA_STANDARD 11，NVDEC/NVML 运行时动态加载，工具链版本不影响产物。
+        uses: Jimver/cuda-toolkit@v0.2.36
+        # v0.2.36 的 Windows network 列表含 CUDA 13.x（含 13.3.1，本地 13.3 已验证构建）。
+        # 与 RaceVideoToLog 的 tensorrt_cu13_bindings 保持一致：全栈统一 CUDA 13，避免
+        # 最终用户需同时装 12.x + 13.x 两套 Toolkit 才能同时满足 TRT 与 decord。
+        # decord.dll 运行时动态加载 CUDA（nv_gpu_dyn），工具链版本不影响产物。
         with:
-          cuda: '12.6.2'
+          cuda: '13.3.1'
           method: 'network'
 
       - name: Download FFmpeg 8.1 (shared)
