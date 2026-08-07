@@ -8,6 +8,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <windows.h>
 
 namespace nv {
@@ -76,15 +77,13 @@ NV_CU_FUNCS(NV_DECL_PTR)
 NV_NVML_FUNCS(NV_DECL_PTR)
 #undef NV_DECL_PTR
 
+std::once_flag g_load_once;
 bool g_loaded = false;
-bool g_attempted = false;
 
 }  // namespace
 
 bool gpu_loaded() {
-  if (g_attempted) return g_loaded;
-  g_attempted = true;
-
+  std::call_once(g_load_once, []() {
   /* Test hook: DECORD_FORCE_NO_GPU=1 simulates a machine without the NVIDIA
      driver (skips loading nvcuda/nvcuvid/nvml). Same effect as the real
      driver-less case: wrappers return error codes -> GPU init fails ->
@@ -92,7 +91,7 @@ bool gpu_loaded() {
   const char* force_no_gpu = std::getenv("DECORD_FORCE_NO_GPU");
   if (force_no_gpu && std::strcmp(force_no_gpu, "1") == 0) {
     g_loaded = false;
-    return false;
+    return;
   }
 
   HMODULE nvcuda = LoadLibraryA("nvcuda.dll");
@@ -118,6 +117,7 @@ bool gpu_loaded() {
 
   /* usable when cuInit + all cuvid are ready (NVML is probe-only) */
   g_loaded = p_cuInit != nullptr && p_cuvidCreateDecoder != nullptr;
+  });
   return g_loaded;
 }
 

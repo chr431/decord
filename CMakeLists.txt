@@ -103,6 +103,18 @@ include(cmake/modules/CUDA.cmake)
 
 add_library(decord SHARED ${DECORD_CORE_SRCS} ${DECORD_FFMPEG_SRCS} ${NVDEC_SRCS} ${RUNTIME_CUDA_SRCS} ${NVDEC_CUDA_SRCS})
 
+# Windows: copy the FFmpeg runtime DLLs next to the built decord.dll so the
+# development build runs out of the box (libinfo.py loads decord.dll from
+# build/Release, whose directory must contain the FFmpeg dependencies).
+if(WIN32 AND FFMPEG_DIR)
+  file(GLOB DECORD_FFMPEG_RUNTIME_DLLS "${FFMPEG_DIR}/bin/*.dll")
+  if(DECORD_FFMPEG_RUNTIME_DLLS)
+    add_custom_command(TARGET decord POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              ${DECORD_FFMPEG_RUNTIME_DLLS} $<TARGET_FILE_DIR:decord>)
+  endif()
+endif()
+
 # target_compile_features(decord PUBLIC cxx_std_11)
 
 target_link_libraries(decord ${DECORD_LINKER_LIBS} ${DECORD_RUNTIME_LINKER_LIBS})

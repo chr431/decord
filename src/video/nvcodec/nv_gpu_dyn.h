@@ -56,8 +56,10 @@ CUresult CUDAAPI cuvidMapVideoFrame64(CUvideodecoder hDecoder, int nPicIdx,
                               CUVIDPROCPARAMS* pVPP);
 CUresult CUDAAPI cuvidUnmapVideoFrame64(CUvideodecoder hDecoder, unsigned long long DevPtr);
 
-/* -- NVML (nvml.dll, driver version probe only; absence does not block GPU) -- */
-nvmlReturn_t CUDAAPI nvmlInit(void);
-nvmlReturn_t CUDAAPI nvmlSystemGetDriverVersion(char* version, unsigned int length);
+/* -- NVML (nvml.dll, driver version probe only; absence does not block GPU) --
+   nvml.h declares these DECLDIR (__cdecl), not __stdcall/CUDAAPI.  On x64 the
+   calling conventions are identical, but match the real prototypes anyway. */
+nvmlReturn_t nvmlInit(void);
+nvmlReturn_t nvmlSystemGetDriverVersion(char* version, unsigned int length);
 
 }  // namespace nv
