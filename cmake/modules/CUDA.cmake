@@ -38,10 +38,11 @@ if(USE_CUDA)
   file(GLOB NVDEC_SRCS src/video/nvcodec/*.cc)
   file(GLOB NVDEC_CUDA_SRCS src/improc/*.cu)
 
-  list(APPEND DECORD_LINKER_LIBS ${CUDA_NVRTC_LIBRARY})
+  # No NVRTC: the driver API, NVCUVID and NVML are all loaded at runtime
+  # (nv_gpu_dyn.cc); nothing references NVRTC symbols, and linking its
+  # import library would add a dead nvrtc64_*.dll dependency.
   list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_CUDART_LIBRARY})
   list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_CUDA_LIBRARY})
-  list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_NVRTC_LIBRARY})
 
 else(USE_CUDA)
   message(STATUS "CUDA disabled, no nvdec capabilities will be enabled...")

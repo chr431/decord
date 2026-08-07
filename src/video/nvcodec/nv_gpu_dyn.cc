@@ -9,11 +9,27 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 namespace nv {
 
 namespace {
+
+/* Shared-library handle + load/symbol helpers (Windows vs dlopen) */
+#if defined(_WIN32)
+using nv_lib_t = HMODULE;
+#define NV_LOAD_LIB(name) LoadLibraryA(name)
+#define NV_GET_SYM(handle, name) GetProcAddress((handle), (name))
+#else
+using nv_lib_t = void*;
+#define NV_LOAD_LIB(name) dlopen((name), RTLD_LAZY)
+#define NV_GET_SYM(handle, name) dlsym((handle), (name))
+#endif
 
 /* Function list macro: X(ret, default_err, name, params, call_args) */
 #define NV_CU_FUNCS(X)                                                          \
@@ -94,24 +110,30 @@ bool gpu_loaded() {
     return;
   }
 
-  HMODULE nvcuda = LoadLibraryA("nvcuda.dll");
-  HMODULE nvcuvid = LoadLibraryA("nvcuvid.dll");
-  HMODULE nvml = LoadLibraryA("nvml.dll");
+#if defined(_WIN32)
+  nv_lib_t nvcuda = NV_LOAD_LIB("nvcuda.dll");
+  nv_lib_t nvcuvid = NV_LOAD_LIB("nvcuvid.dll");
+  nv_lib_t nvml = NV_LOAD_LIB("nvml.dll");
+#else
+  nv_lib_t nvcuda = NV_LOAD_LIB("libcuda.so.1");
+  nv_lib_t nvcuvid = NV_LOAD_LIB("libnvcuvid.so");
+  nv_lib_t nvml = NV_LOAD_LIB("libnvidia-ml.so.1");
+#endif
 
   /* cu* and cuvid*: try nvcuda.dll first, then nvcuvid.dll
      (old drivers lack nvcuda.dll; driver API forwarded via nvcuvid.dll) */
 #define NV_LOAD_SYM(ret, err, name, args, callargs)          \
   p_##name = reinterpret_cast<decltype(p_##name)>(           \
-      GetProcAddress(nvcuda, #name));                        \
+      NV_GET_SYM(nvcuda, #name));                            \
   if (!p_##name && nvcuvid)                                  \
     p_##name = reinterpret_cast<decltype(p_##name)>(         \
-        GetProcAddress(nvcuvid, #name));
+        NV_GET_SYM(nvcuvid, #name));
   NV_CU_FUNCS(NV_LOAD_SYM)
 #undef NV_LOAD_SYM
 
 #define NV_LOAD_SYM_NVML(ret, err, name, args, callargs)     \
   p_##name = reinterpret_cast<decltype(p_##name)>(           \
-      GetProcAddress(nvml, #name));
+      NV_GET_SYM(nvml, #name));
   NV_NVML_FUNCS(NV_LOAD_SYM_NVML)
 #undef NV_LOAD_SYM_NVML
 
