@@ -104,17 +104,31 @@ class VideoReader(object):
         self.seek_accurate(idx)
         return self.next()
 
-    def next(self):
+    def next(self, roi=None):
         """Grab the next frame.
+
+        Parameters
+        ----------
+        roi : tuple of 4 ints or None
+            Optional half-open ROI ``(x1, y1, x2, y2)`` in full-frame pixel
+            coordinates.  When given, only the ROI rectangle is returned
+            (shape ``(y2 - y1, x2 - x1, 3)``; on the GPU path only the ROI
+            is copied from device memory, avoiding a full-frame D2H copy).
+            ``None`` (default) returns the full frame.
 
         Returns
         -------
         ndarray
-            Frame with shape HxWx3.
+            Frame with shape HxWx3 (full) or (y2-y1) x (x2-x1) x 3 (ROI).
 
         """
         assert self._handle is not None
-        arr = _CAPI_VideoReaderNextFrame(self._handle)
+        if roi is not None:
+            x1, y1, x2, y2 = (int(v) for v in roi)
+            arr = _CAPI_VideoReaderNextFrameRoi(
+                self._handle, x1, y1, x2, y2)
+        else:
+            arr = _CAPI_VideoReaderNextFrame(self._handle)
         if not arr.shape:
             raise StopIteration()
         return bridge_out(arr)
@@ -182,7 +196,7 @@ class VideoReader(object):
         return self._frame_pts[idx, :]
 
 
-    def get_batch(self, indices):
+    def get_batch(self, indices, roi=None):
         """Get entire batch of images. `get_batch` is optimized to handle seeking internally.
         Duplicate frame indices will be optmized by copying existing frames rather than decode
         from video again.
@@ -191,16 +205,27 @@ class VideoReader(object):
         ----------
         indices : list of integers
             A list of frame indices. If negative indices detected, the indices will be indexed from backward
+        roi : tuple of 4 ints or None
+            Optional half-open ROI ``(x1, y1, x2, y2)``; every frame is
+            cropped to the rectangle before the batch copy (batch shape
+            ``(N, y2-y1, x2-x1, 3)``).  ``None`` (default) returns full
+            frames, shape ``(N, H, W, 3)``.
 
         Returns
         -------
         ndarray
-            An entire batch of image frames with shape NxHxWx3, where N is the length of `indices`.
+            An entire batch of image frames with shape NxHxWx3 (or
+            Nx(y2-y1)x(x2-x1)x3 with roi), where N is the length of `indices`.
 
         """
         assert self._handle is not None
         indices = _nd.array(self._validate_indices(indices))
-        arr = _CAPI_VideoReaderGetBatch(self._handle, indices)
+        if roi is not None:
+            x1, y1, x2, y2 = (int(v) for v in roi)
+            arr = _CAPI_VideoReaderGetBatchRoi(
+                self._handle, indices, x1, y1, x2, y2)
+        else:
+            arr = _CAPI_VideoReaderGetBatch(self._handle, indices)
         return bridge_out(arr)
 
     def get_key_indices(self):

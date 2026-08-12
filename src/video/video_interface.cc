@@ -101,6 +101,18 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetBatch")
     *rv = ret;
   });
 
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetBatchRoi")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    NDArray indices = args[1];
+    int x1 = args[2], y1 = args[3], x2 = args[4], y2 = args[5];
+    std::vector<int64_t> int_indices;
+    indices.CopyTo(int_indices);
+    NDArray ret = static_cast<VideoReaderInterface*>(handle)
+        ->GetBatch(int_indices, NDArray(), x1, y1, x2, y2);
+    *rv = ret;
+  });
+
 DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderSeek")
 .set_body([] (DECORDArgs args, DECORDRetValue* rv) {
     VideoReaderInterfaceHandle handle = args[0];

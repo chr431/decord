@@ -44,8 +44,23 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx)
 	 * vs 1-thread), but in a decode/OCR pipeline it competes with the ONNX
 	 * inference threads for cores and ends up slower overall (measured
 	 * 133fps -> 87fps in-pipeline).  Single-threaded scale is the safer
-	 * choice for the pipeline case (dmlc/decord PR #63 rationale). */
-	filter_graph_->nb_threads = 1;
+	 * choice for the pipeline case (dmlc/decord PR #63 rationale).
+	 *
+	 * 2026-08: the old in-pipeline measurement predates the pipelined
+	 * send/receive loop; with prefetch + non-blocking receive the scale
+	 * (sws_scale YUV->RGB) became the serial per-frame cost (~0.8ms @1080p
+	 * on one thread).  DECORD_FILTER_THREADS overrides (0 = auto = all
+	 * cores; 4 = four slice threads; 1 = historical single-thread). */
+	int filter_threads = 4;
+	const char *env_ft = getenv("DECORD_FILTER_THREADS");
+	if (env_ft != nullptr && *env_ft != '\0') {
+		try {
+			filter_threads = std::stoi(env_ft);
+		} catch (const std::exception &) {
+			filter_threads = 4;
+		}
+	}
+	filter_graph_->nb_threads = filter_threads;
     /* buffer video source: the decoded frames from the decoder will be inserted here. */
 	std::snprintf(args, sizeof(args),
             "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",

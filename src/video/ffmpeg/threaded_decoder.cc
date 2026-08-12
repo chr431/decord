@@ -272,11 +272,25 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
                 ProcessFrame(frame, out_buf);
             }
         } else {
-            // normal mode, push in valid packets and retrieve frames
+            // normal mode: keep the decoder's frame threads busy by
+            // accumulating packets before taking frames out.
+            //
+            // The old rhythm (send one packet, then block on receive until
+            // that frame decodes, pushing an empty marker on EAGAIN) left
+            // exactly one packet inside avcodec at a time — the FFmpeg
+            // frame threads (thread_count=4) were idle and per-frame
+            // latency was the single-frame decode time (~1.26ms on CPU
+            // soft decode, measured latency-bound: raising thread_count to
+            // 8/auto gave zero gain).  With prefetch feeding the packet
+            // queue, we now send as many packets as avcodec accepts
+            // (EAGAIN only when its internal queue is full) and take out
+            // whatever frames are ready, skipping EAGAIN instead of
+            // stalling: 4 frame threads decode in parallel, frames come
+            // out ~every 0.25ms instead of every 1.26ms.
             int send_ret;
-            // FFmpeg 8+ may return EAGAIN when the codec internal queue is
-            // full. Drain every available output frame (possibly several)
-            // before retrying the send; only sleep when nothing is ready.
+            // EAGAIN on send = internal queue full.  Drain every available
+            // output frame (possibly several) before retrying the send;
+            // only sleep when nothing is ready.
             while ((send_ret = avcodec_send_packet(dec_ctx_.get(),
                                                    pkt.get())) == AVERROR(EAGAIN)) {
                 // Drain every output frame that is ready before sleeping:
@@ -307,13 +321,22 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
             }
             CHECK_GE(send_ret, 0) << "Thread worker: Error sending packet: "
                                   << send_ret;
+            // Non-blocking receive: take the frame if the frame threads
+            // already finished it, otherwise skip — the next packet keeps
+            // the frame threads busy and the frame shows up later.  No
+            // empty marker is pushed (that would force the consumer into a
+            // retry spin and re-introduce latency binding).
             got_picture = avcodec_receive_frame(dec_ctx_.get(), frame.get());
             if (got_picture == 0) {
                 NDArray out_buf;
                 bool get_buf = buffer_queue_->Pop(&out_buf);
                 if (!get_buf) return;
                 ProcessFrame(frame, out_buf);
-            } else if (AVERROR(EAGAIN) == got_picture || AVERROR_EOF == got_picture) {
+            } else if (AVERROR(EAGAIN) == got_picture) {
+                // frame threads still decoding — continue accumulating
+            } else if (AVERROR_EOF == got_picture) {
+                // Unexpected mid-stream EOF; keep the historical empty
+                // marker so the consumer's EOF path handles it.
                 frame_queue_->Push(NDArray());
                 ++frame_count_;
             } else {

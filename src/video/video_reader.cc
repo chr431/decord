@@ -44,6 +44,20 @@ static const float DUPLICATE_WARNING_THRESHOLD = std::stof(runtime::GetEnvironme
 // when the reader is used without OCR, =1 to minimise latency).
 static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "4"));
 
+// Prefetch depth: number of packets kept in-flight in the decoder queue.
+// The naive implementation pushes one packet per Pop, so the decoder
+// threads/GPU surfaces are idle most of the time and per-frame latency is
+// the decode time itself (measured ~1.26ms/frame on 16-core CPU soft
+// decode; FFmpeg thread count 4→8/auto gave zero gain — latency-bound).
+// Keeping kPrefetchDepth-1 packets ahead turns the synchronous
+// Push/Pop into a pipelined batch decode.  Measured on 16-core (7945HX)
+// test5: 792fps → ~1500fps CPU soft decode, pipeline total -20%.
+// GPU: each in-flight packet holds one ndarray_pool_ buffer (pool = 22),
+// so 8 is safe (7 in flight + 1 cached + decoder internals).
+// Set DECORD_PREFETCH_DEPTH to override (0 = disable prefetch).
+static const int DECORD_PREFETCH_DEPTH = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_PREFETCH_DEPTH", "8"));
+
+
 VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol)
      : ctx_(ctx), key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
      actv_stm_idx_(-1), fmt_ctx_(nullptr), decoder_(nullptr), curr_frame_(0),
@@ -329,6 +343,10 @@ bool VideoReader::Seek(int64_t pos) {
     decoder_->Clear();
     cached_frame_ = NDArray();
     eof_ = false;
+    // The decoder queue (and any prefetched packets) is gone — reset the
+    // in-flight accounting so prefetch restarts from the seek position.
+    pkts_pushed_ = 0;
+    frames_popped_ = 0;
 
     int64_t ts = FrameToPTS(pos);
     int flag = curr_frame_ > pos ? AVSEEK_FLAG_BACKWARD : 0;
@@ -452,11 +470,28 @@ NDArray VideoReader::NextFrameImpl() {
     }
     NDArray frame;
     decoder_->Start();
+    // ── Prefetch: keep the decoder queue K-1 packets ahead ──
+    // The naive loop below pushes one packet per Pop, so the decoder is
+    // latency-bound (frame threads / GPU surfaces idle).  Top up the queue
+    // before the per-frame Push/Pop so K-1 frames are already decoding in
+    // parallel while the current one is being returned.  Accounting is
+    // packet-based: a packet that yields no frame (skip) makes the estimate
+    // conservative (fewer prefetch packets), which only costs throughput,
+    // never correctness.  Seek() clears the decoder queue and resets both
+    // counters; SkipFramesImpl/CheckKeyFrame push/pop without accounting,
+    // which likewise only under-prefetches afterwards.
+    while (!eof_ && pkts_pushed_ - frames_popped_ < DECORD_PREFETCH_DEPTH - 1) {
+        PushNext();
+        if (!eof_) {
+            ++pkts_pushed_;  // real packet; PushNext sets eof_ when it pushed the flush
+        }
+    }
     bool ret = false;
     int rewind_offset = 0;
     int retry = 0;
     while (!ret) {
         PushNext();
+        ++pkts_pushed_;  // prefetch accounting: every pushed packet counts
         if (curr_frame_ >= GetFrameCount()) {
             return NDArray::Empty({}, kUInt8, ctx_);
         }
@@ -501,6 +536,7 @@ NDArray VideoReader::NextFrameImpl() {
     }
     if (frame.defined()) {
         ++curr_frame_;
+        ++frames_popped_;  // prefetch in-flight accounting
         CacheFrame(frame);
     }
     return frame;
@@ -511,19 +547,15 @@ NDArray VideoReader::NextFrame() {
     return NextFrameImpl();
 }
 
-NDArray VideoReader::NextFrameRoi(int x1, int y1, int x2, int y2) {
-    if (!fmt_ctx_) return NDArray();
+NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
     // clamp to the frame bounds; empty ROI falls back to the full frame
     x1 = std::max(0, std::min(x1, width_));
     y1 = std::max(0, std::min(y1, height_));
     x2 = std::max(0, std::min(x2, width_));
     y2 = std::max(0, std::min(y2, height_));
     if (x2 <= x1 || y2 <= y1) {
-        return NextFrameImpl();
+        return frame;
     }
-    // reuse NextFrameImpl() so fault tolerance / EOF / rewind handling is
-    // inherited verbatim; on the GPU path the popped frame is a pool buffer
-    NDArray frame = NextFrameImpl();
     if (!frame.defined() || frame.Size() <= 1) {
         // EOF marker / drain sentinel: pass through untouched
         return frame;
@@ -549,7 +581,7 @@ NDArray VideoReader::NextFrameRoi(int x1, int y1, int x2, int y2) {
                 static_cast<size_t>(y2 - y1),                // rows
                 cudaMemcpyDeviceToHost);
         }
-        CHECK_EQ(err, cudaSuccess) << "cudaMemcpy2D failed in NextFrameRoi";
+        CHECK_EQ(err, cudaSuccess) << "cudaMemcpy2D failed in CropRoi";
 #endif
     } else {
         // CPU build: row-stride copy of only the ROI rectangle (e.g. 10KB at
@@ -569,6 +601,14 @@ NDArray VideoReader::NextFrameRoi(int x1, int y1, int x2, int y2) {
         }
     }
     return roi;
+}
+
+NDArray VideoReader::NextFrameRoi(int x1, int y1, int x2, int y2) {
+    if (!fmt_ctx_) return NDArray();
+    // reuse NextFrameImpl() so fault tolerance / EOF / rewind handling is
+    // inherited verbatim; on the GPU path the popped frame is a pool buffer
+    NDArray frame = NextFrameImpl();
+    return CropRoi(frame, x1, y1, x2, y2);
 }
 
 void VideoReader::IndexKeyframes() {
@@ -784,7 +824,8 @@ void VideoReader::SkipFramesImpl(int64_t num)
     }
 }
 
-NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf) {
+NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
+                              int x1, int y1, int x2, int y2) {
     if (!fmt_ctx_) return NDArray();
     std::size_t bs = indices.size();
     // find the first occurance of each index to avoid duplicate access
@@ -797,13 +838,22 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf) {
             unique_indices[value] = i;
         }
     }
+    // Optional ROI: any coordinate < 0 means full frames (historical
+    // behaviour); a valid rectangle crops every frame before the batch copy.
+    x1 = std::max(0, std::min(x1, width_));
+    y1 = std::max(0, std::min(y1, height_));
+    x2 = std::max(0, std::min(x2, width_));
+    y2 = std::max(0, std::min(y2, height_));
+    bool use_roi = x2 > x1 && y2 > y1;
+    int64_t fh = use_roi ? y2 - y1 : height_;
+    int64_t fw = use_roi ? x2 - x1 : width_;
     if (!buf.defined()) {
-        buf = NDArray::Empty({static_cast<int64_t>(bs), height_, width_, 3}, kUInt8, ctx_);
+        buf = NDArray::Empty({static_cast<int64_t>(bs), fh, fw, 3}, kUInt8, ctx_);
     }
     // LOG(INFO) << height_ << " "  << width_ << " Buf size: " << bs << " total: " << bs * height_ * width_ * 3;
     int64_t frame_count = GetFrameCount();
     uint64_t offset = 0;
-    std::vector<int64_t> frame_shape = {height_, width_, 3};
+    std::vector<int64_t> frame_shape = {fh, fw, 3};
     for (std::size_t i = 0; i < indices.size(); ++i) {
         int64_t pos = indices[i];
         auto it = unique_indices.find(pos);
@@ -823,6 +873,9 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf) {
                 SeekAccurate(pos);
             }
             NDArray frame = NextFrameImpl();
+            if (use_roi) {
+                frame = CropRoi(frame, x1, y1, x2, y2);
+            }
 
             if (frame.Size() < 1 && eof_) {
                 LOG(FATAL) << "Error getting frame at: " << pos << " with total frames: " << frame_count;
