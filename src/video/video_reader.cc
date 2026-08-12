@@ -5,6 +5,7 @@
  */
 
 #include "video_reader.h"
+#include <thread>
 #include "ffmpeg/threaded_decoder.h"
 #include "../runtime/str_util.h"
 #if DECORD_USE_CUDA
@@ -42,7 +43,20 @@ static const float DUPLICATE_WARNING_THRESHOLD = std::stof(runtime::GetEnvironme
 // growth regardless of thread count.
 // Set DECORD_FFMPEG_THREAD_COUNT to override (e.g. =0 for full-core decode
 // when the reader is used without OCR, =1 to minimise latency).
-static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_FFMPEG_THREAD_COUNT", "4"));
+//
+// Default scales with the logical CPU count (batch decode measured on
+// 16-core/32-thread: 8 threads = best; 4-core machines get 2, 8-core get
+// 4, 32-core caps at 8): ffmpeg frame threads parallelise batch decoding
+// but must leave cores for the OCR inference threads on the same machine.
+static int DefaultFFmpegThreads() {
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 8;
+    int n = static_cast<int>(hw) / 4;   // ≈ half the physical cores
+    return std::max(2, std::min(n, 8));
+}
+static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(
+    runtime::GetEnvironmentVariableOrDefault(
+        "DECORD_FFMPEG_THREAD_COUNT", std::to_string(DefaultFFmpegThreads())));
 
 // Prefetch depth: number of packets kept in-flight in the decoder queue.
 // The naive implementation pushes one packet per Pop, so the decoder

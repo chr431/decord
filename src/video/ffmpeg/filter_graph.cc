@@ -5,6 +5,7 @@
  */
 
 #include "filter_graph.h"
+#include <thread>
 
 #include <dmlc/logging.h>
 
@@ -49,9 +50,18 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx)
 	 * 2026-08: the old in-pipeline measurement predates the pipelined
 	 * send/receive loop; with prefetch + non-blocking receive the scale
 	 * (sws_scale YUV->RGB) became the serial per-frame cost (~0.8ms @1080p
-	 * on one thread).  DECORD_FILTER_THREADS overrides (0 = auto = all
-	 * cores; 4 = four slice threads; 1 = historical single-thread). */
-	int filter_threads = 4;
+	 * on one thread).  Default scales with the logical CPU count
+	 * (clamp(hw/16, 1, 4)): 16-core machines stay at 1 slice thread (the
+	 * decode/OCR pipeline optimum; 4 threads measured slower in-pipeline),
+	 * machines with spare cores get a little sws parallelism.
+	 * DECORD_FILTER_THREADS overrides (0 = auto = all cores; 4 = four
+	 * slice threads; 1 = historical single-thread). */
+	int filter_threads = []() {
+		unsigned hw = std::thread::hardware_concurrency();
+		if (hw == 0) hw = 8;
+		int n = static_cast<int>(hw) / 16;
+		return std::max(1, std::min(n, 4));
+	}();
 	const char *env_ft = getenv("DECORD_FILTER_THREADS");
 	if (env_ft != nullptr && *env_ft != '\0') {
 		try {
