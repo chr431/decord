@@ -104,7 +104,9 @@ void CUThreadedDecoder::InitBitStreamFilter(AVCodecParameters *codecpar, const A
     bsf_ctx_.reset(bsf_ctx);
 }
 
-void CUThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int height, int rotation) {
+void CUThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int height, int rotation, int output_format) {
+    // GPU (NVDEC) path always outputs RGB via improc; gray is CPU-only.
+    (void)output_format;
     CHECK(dec_ctx);
     width_ = width;
     height_ = height;

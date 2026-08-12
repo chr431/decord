@@ -46,7 +46,7 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
 
     public:
         CUThreadedDecoder(int device_id, AVCodecParameters *codecpar, const AVInputFormat *iformat);
-        void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1, int rotation = 0);
+        void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1, int rotation = 0, int output_format = 0);
         bool Initialized() const;
         void Start();
         void Stop();

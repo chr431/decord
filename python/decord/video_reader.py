@@ -41,7 +41,11 @@ class VideoReader(object):
 
 
     """
-    def __init__(self, uri, ctx=cpu(0), width=-1, height=-1, num_threads=0, fault_tol=-1):
+    def __init__(self, uri, ctx=cpu(0), width=-1, height=-1, num_threads=0, fault_tol=-1,
+                 output_format='rgb'):
+        if output_format not in ('rgb', 'gray'):
+            raise ValueError("output_format must be 'rgb' or 'gray'")
+        self._output_format = 1 if output_format == 'gray' else 0
         self._handle = None
         assert isinstance(ctx, DECORDContext)
         fault_tol = str(fault_tol)
@@ -49,10 +53,12 @@ class VideoReader(object):
             ba = bytearray(uri.read())
             uri = '{} bytes'.format(len(ba))
             self._handle = _CAPI_VideoReaderGetVideoReader(
-                ba, ctx.device_type, ctx.device_id, width, height, num_threads, 2, fault_tol)
+                ba, ctx.device_type, ctx.device_id, width, height, num_threads, 2, fault_tol,
+                self._output_format)
         else:
             self._handle = _CAPI_VideoReaderGetVideoReader(
-                uri, ctx.device_type, ctx.device_id, width, height, num_threads, 0, fault_tol)
+                uri, ctx.device_type, ctx.device_id, width, height, num_threads, 0, fault_tol,
+                self._output_format)
         if self._handle is None:
             raise RuntimeError("Error reading " + uri + "...")
         self._num_frame = _CAPI_VideoReaderGetFrameCount(self._handle)

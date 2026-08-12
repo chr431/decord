@@ -35,7 +35,8 @@ class VideoReader : public VideoReaderInterface {
     using NDArray = runtime::NDArray;
     public:
         VideoReader(std::string fn, DLDevice ctx, int width=-1, int height=-1,
-                    int nb_thread=0, int io_type=kNormal, std::string fault_tol="-1");
+                    int nb_thread=0, int io_type=kNormal, std::string fault_tol="-1",
+                    int output_format = 0);
         /*! \brief Destructor, note that FFMPEG resources has to be managed manually to avoid resource leak */
         ~VideoReader();
         void SetVideoStream(int stream_nb = -1);
@@ -106,6 +107,8 @@ class VideoReader : public VideoReaderInterface {
         int64_t nb_thread_decoding_;  // number of threads for decoding
         int width_;   // output video width
         int height_;  // output video height
+        int output_format_;  // 0 = RGB24, 1 = GRAY8 (1 channel)
+        int Channels() const { return output_format_ ? 1 : 3; }
         bool eof_;  // end of file indicator
         /*! \brief decoder queue in-flight depth accounting.  NextFrameImpl
          *  keeps pkts_pushed_ - frames_popped_ near kPrefetchDepth so the

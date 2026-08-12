@@ -72,10 +72,11 @@ static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(
 static const int DECORD_PREFETCH_DEPTH = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_PREFETCH_DEPTH", "8"));
 
 
-VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol)
+VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol, int output_format)
      : ctx_(ctx), key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
      actv_stm_idx_(-1), fmt_ctx_(nullptr), decoder_(nullptr), curr_frame_(0),
      nb_thread_decoding_(nb_thread), width_(width), height_(height), eof_(false), io_ctx_(),
+     output_format_(output_format),
      use_cached_frame_(true), fault_tol_thresh_(-1.0), fault_warn_emit_(false) {
     // av_register_all deprecated in latest versions
     #if ( LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(58,9,100) )
@@ -270,10 +271,10 @@ void VideoReader::SetVideoStream(int stream_nb) {
         // the popped buffer for zero-copy fault tolerance) plus 1 margin.
         // Recycling buffers removes a cudaMalloc/cudaFree per frame, which
         // measures ~+59% GPU sequential decode on HEVC with no memory cost
-        ndarray_pool_.Reset(22, {height_, width_, 3}, kUInt8, ctx_);
+        ndarray_pool_.Reset(22, {height_, width_, Channels()}, kUInt8, ctx_);
     }
 
-    decoder_->SetCodecContext(dec_ctx, width_, height_, rotation);
+    decoder_->SetCodecContext(dec_ctx, width_, height_, rotation, output_format_);
     IndexKeyframes();
 }
 
@@ -574,7 +575,7 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
         // EOF marker / drain sentinel: pass through untouched
         return frame;
     }
-    NDArray roi = NDArray::Empty({y2 - y1, x2 - x1, 3}, kUInt8, kCPU);
+    NDArray roi = NDArray::Empty({y2 - y1, x2 - x1, Channels()}, kUInt8, kCPU);
     if (ctx_.device_type == kDLCUDA) {
 #if DECORD_USE_CUDA
         // the display callback already synchronized the decode stream, so the
@@ -586,12 +587,12 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
         if (err == cudaSuccess) {
             err = cudaMemcpy2D(
                 roi->data,                                   // dst
-                static_cast<size_t>(x2 - x1) * 3,            // dst pitch (bytes)
+                static_cast<size_t>(x2 - x1) * Channels(),   // dst pitch (bytes)
                 static_cast<const char *>(frame->data)
-                    + static_cast<int64_t>(y1) * width_ * 3
-                    + static_cast<int64_t>(x1) * 3,          // src + row/col offset
-                static_cast<size_t>(width_) * 3,             // src pitch (bytes)
-                static_cast<size_t>(x2 - x1) * 3,            // bytes per row
+                    + static_cast<int64_t>(y1) * width_ * Channels()
+                    + static_cast<int64_t>(x1) * Channels(), // src + row/col offset
+                static_cast<size_t>(width_) * Channels(),    // src pitch (bytes)
+                static_cast<size_t>(x2 - x1) * Channels(),   // bytes per row
                 static_cast<size_t>(y2 - y1),                // rows
                 cudaMemcpyDeviceToHost);
         }
@@ -603,11 +604,11 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
         // caller's asnumpy() would otherwise copy the whole frame per call
         // (measured ~0.6ms/frame, ~37% of the 4-thread decode budget).
         const char *src = static_cast<const char *>(frame->data)
-            + static_cast<int64_t>(y1) * width_ * 3
-            + static_cast<int64_t>(x1) * 3;
+            + static_cast<int64_t>(y1) * width_ * Channels()
+            + static_cast<int64_t>(x1) * Channels();
         char *dst = static_cast<char *>(roi->data);
-        size_t src_pitch = static_cast<size_t>(width_) * 3;
-        size_t row_bytes = static_cast<size_t>(x2 - x1) * 3;
+        size_t src_pitch = static_cast<size_t>(width_) * Channels();
+        size_t row_bytes = static_cast<size_t>(x2 - x1) * Channels();
         for (int y = 0; y < y2 - y1; ++y) {
             std::memcpy(dst + static_cast<int64_t>(y) * row_bytes,
                         src + static_cast<int64_t>(y) * src_pitch,
@@ -862,12 +863,12 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
     int64_t fh = use_roi ? y2 - y1 : height_;
     int64_t fw = use_roi ? x2 - x1 : width_;
     if (!buf.defined()) {
-        buf = NDArray::Empty({static_cast<int64_t>(bs), fh, fw, 3}, kUInt8, ctx_);
+        buf = NDArray::Empty({static_cast<int64_t>(bs), fh, fw, Channels()}, kUInt8, ctx_);
     }
     // LOG(INFO) << height_ << " "  << width_ << " Buf size: " << bs << " total: " << bs * height_ * width_ * 3;
     int64_t frame_count = GetFrameCount();
     uint64_t offset = 0;
-    std::vector<int64_t> frame_shape = {fh, fw, 3};
+    std::vector<int64_t> frame_shape = {fh, fw, Channels()};
     for (std::size_t i = 0; i < indices.size(); ++i) {
         int64_t pos = indices[i];
         auto it = unique_indices.find(pos);
@@ -918,7 +919,7 @@ bool VideoReader::FetchCachedFrame(NDArray &frame, int64_t pos) {
   if (!use_cached_frame_) return false;
   if (cached_frame_.Size() <= 1) return false;
   if (!frame.defined() || frame.Size() != cached_frame_.Size()) {
-      frame = NDArray::Empty({height_, width_, 3}, kUInt8, ctx_);
+      frame = NDArray::Empty({height_, width_, Channels()}, kUInt8, ctx_);
   }
   frame.CopyFrom(cached_frame_);
   failed_idx_.insert(pos);

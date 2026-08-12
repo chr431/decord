@@ -35,10 +35,14 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetVideoReader")
     int num_thread = args[5];
     int io_type = args[6];
     std::string fault_tol = args[7];
+    // output_format: 0 = RGB (default), 1 = GRAY8 (1 channel, CPU path)
+    int output_format = 0;
+    try { output_format = args[8]; } catch (...) { output_format = 0; }
     DLDevice ctx;
     ctx.device_type = static_cast<DLDeviceType>(device_type);
     ctx.device_id = device_id;
-    auto reader = new VideoReader(fn, ctx, width, height, num_thread, io_type, fault_tol);
+    auto reader = new VideoReader(fn, ctx, width, height, num_thread, io_type,
+                                  fault_tol, output_format);
     if (reader->GetFrameCount() <= 0) {
       *rv = nullptr;
       return;

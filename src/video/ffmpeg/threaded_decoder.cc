@@ -10,6 +10,20 @@
 #include <thread>
 #include <chrono>
 #include "../../runtime/str_util.h"
+#include <iostream>
+// TEMP PROFILE
+static const bool DECORD_PROFILE = std::stoi(
+    decord::runtime::GetEnvironmentVariableOrDefault("DECORD_PROFILE", "0")) != 0;
+struct _PfAcc2 {
+    std::chrono::steady_clock::time_point t0; double acc = 0.0; long long n = 0;
+    void start() { if (DECORD_PROFILE) t0 = std::chrono::steady_clock::now(); }
+    void stop() { if (!DECORD_PROFILE) return;
+        acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); ++n; }
+};
+static _PfAcc2 pf_d_send, pf_d_recv, pf_d_push, pf_f_pop, pf_f_filter, pf_f_push;
+#include <iostream>
+
+
 
 namespace decord {
 namespace ffmpeg {
@@ -53,7 +67,7 @@ FFMPEGThreadedDecoder::FFMPEGThreadedDecoder()
       max_queue_frames_(DECORD_CPU_FRAME_QUEUE_SIZE) {
 }
 
-void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int height, int rotation) {
+void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int height, int rotation, int output_format) {
     bool running = run_.load();
     Clear();
     dec_ctx_.reset(dec_ctx);
@@ -68,19 +82,20 @@ void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, 
     // frame metadata so swscale picks the BT.601 matrix; the outputs then
     // match the GPU path within rounding (<=1-2 per pixel).
     char descr[160];
+    const char *fmt = output_format ? "gray" : "rgb24";
     switch(rotation) {
         case 90:
-            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,scale=%d:%d,format=rgb24", width, height);
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,scale=%d:%d,format=%s", width, height, fmt);
             break;
         case 180:
-            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,transpose=1,scale=%d:%d,format=rgb24", width, height);
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,transpose=1,scale=%d:%d,format=%s", width, height, fmt);
             break;
         case 270:
-            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=2,scale=%d:%d,format=rgb24", width, height);
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=2,scale=%d:%d,format=%s", width, height, fmt);
             break;
         case 0:
         default:
-            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,scale=%d:%d,format=rgb24", width, height);
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,scale=%d:%d,format=%s", width, height, fmt);
     }
     filter_graph_ = FFMPEGFilterGraphPtr(new FFMPEGFilterGraph(descr, dec_ctx_.get()));
     if (running) {
@@ -92,11 +107,14 @@ void FFMPEGThreadedDecoder::Start() {
     CheckErrorStatus();
     if (!run_.load()) {
         pkt_queue_.reset(new PacketQueue());
+        raw_queue_.reset(new RawFrameQueue());
         frame_queue_.reset(new FrameQueue());
         buffer_queue_.reset(new BufferQueue());
         run_.store(true);
         auto t = std::thread(&FFMPEGThreadedDecoder::WorkerThread, this);
         std::swap(t_, t);
+        auto ft = std::thread(&FFMPEGThreadedDecoder::FilterWorkerThread, this);
+        std::swap(filter_t_, ft);
     }
 }
 
@@ -104,6 +122,9 @@ void FFMPEGThreadedDecoder::Stop() {
     if (run_.load()) {
         if (pkt_queue_) {
             pkt_queue_->SignalForKill();
+        }
+        if (raw_queue_) {
+            raw_queue_->SignalForKill();
         }
         if (buffer_queue_) {
             buffer_queue_->SignalForKill();
@@ -116,6 +137,9 @@ void FFMPEGThreadedDecoder::Stop() {
     if (t_.joinable()) {
         // LOG(INFO) << "joining";
         t_.join();
+    }
+    if (filter_t_.joinable()) {
+        filter_t_.join();
     }
 }
 
@@ -185,21 +209,9 @@ FFMPEGThreadedDecoder::~FFMPEGThreadedDecoder() {
 }
 
 void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
-    frame->pts = frame->best_effort_timestamp;
-    bool skip = false;
-    {
-      std::lock_guard<std::mutex> lock(pts_mutex_);
-      skip = discard_pts_.find(frame->pts) != discard_pts_.end();
-    }
-    if (skip) {
-        // skip resize/filtering
-        NDArray empty = NDArray::Empty({1}, kUInt8, kCPU);
-        empty.pts = frame->pts;
-        frame_queue_->Push(empty);
-        ++frame_count_;
-        return;
-    }
-    // filter image frame (format conversion, scaling...)
+    // filter image frame (format conversion, scaling...) — runs on the
+    // filter worker thread, concurrent with the decode worker.
+    pf_f_filter.start();
     filter_graph_->Push(frame.get());
     AVFramePtr out_frame = AVFramePool::Get()->Acquire();
     AVFrame *out_frame_p = out_frame.get();
@@ -217,6 +229,8 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
         }
     }
     if (!run_.load()) return;
+    pf_f_filter.stop();
+    pf_f_push.start();
     if (out_buf.defined()) {
         CHECK(out_buf.Size() == tmp.Size());
         out_buf.CopyFrom(tmp);
@@ -225,6 +239,88 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
     } else {
         frame_queue_->Push(tmp);
         ++frame_count_;
+    }
+    pf_f_push.stop();
+    if (DECORD_PROFILE && pf_f_filter.n % 3000 == 2999) {
+        std::cerr << "[P2] d_send=" << pf_d_send.acc / pf_d_send.n
+            << " d_recv=" << pf_d_recv.acc / pf_d_recv.n
+            << " d_push=" << pf_d_push.acc / pf_d_push.n
+            << " f_pop=" << pf_f_pop.acc / pf_f_pop.n
+            << " f_filter=" << pf_f_filter.acc / pf_f_filter.n
+            << " f_push=" << pf_f_push.acc / pf_f_push.n << std::endl;
+    }
+}
+
+// Decode-side enqueue: discard-pts check happens here (the filter thread
+// must not touch discard_pts_); the frame object ownership moves to the
+// raw queue, so every decoded frame needs its own AVFramePtr.
+void FFMPEGThreadedDecoder::EnqueueRawFrame(AVFramePtr frame) {
+    frame->pts = frame->best_effort_timestamp;
+    bool skip = false;
+    {
+      std::lock_guard<std::mutex> lock(pts_mutex_);
+      skip = discard_pts_.find(frame->pts) != discard_pts_.end();
+    }
+    RawItem item;
+    item.frame = frame;
+    item.pts = frame->pts;
+    item.kind = skip ? RawKind::Skip : RawKind::Frame;
+    raw_queue_->Push(item);
+}
+
+void FFMPEGThreadedDecoder::FilterWorkerThread() {
+    try {
+        FilterWorkerThreadImpl();
+    } catch (dmlc::Error error) {
+        RecordInternalError(error.what());
+        run_.store(false);
+        frame_queue_->SignalForKill(); // Unblock all consumers
+    }
+}
+
+void FFMPEGThreadedDecoder::FilterWorkerThreadImpl() {
+    while (run_.load()) {
+        if (!filter_graph_) return;
+        RawItem item;
+        pf_f_pop.start();
+        if (!raw_queue_->Pop(&item)) {
+            return;
+        }
+        pf_f_pop.stop();
+        switch (item.kind) {
+        case RawKind::Skip: {
+            // keep the historical empty marker so NextFrameImpl's retry
+            // loop skips the frame
+            NDArray empty = NDArray::Empty({1}, kUInt8, kCPU);
+            empty.pts = item.pts;
+            frame_queue_->Push(empty);
+            ++frame_count_;
+            break;
+        }
+        case RawKind::Eof: {
+            // mid-stream EOF marker (historical behaviour)
+            frame_queue_->Push(NDArray());
+            ++frame_count_;
+            break;
+        }
+        case RawKind::DrainEnd: {
+            // EOF drain finished on the decode side: emit the drain
+            // markers the consumer recognises (kInt64 size-1 arrays)
+            for (int cnt = 0; cnt < ThreadedDecoderInterface::kDrainMarkerCount; ++cnt) {
+                frame_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
+                ++frame_count_;
+            }
+            draining_.store(false);
+            break;
+        }
+        case RawKind::Frame: {
+            NDArray out_buf;
+            bool get_buf = buffer_queue_->Pop(&out_buf);
+            if (!get_buf) return;
+            ProcessFrame(item.frame, out_buf);
+            break;
+        }
+        }
     }
 }
 
@@ -235,6 +331,7 @@ void FFMPEGThreadedDecoder::WorkerThread() {
         RecordInternalError(error.what());
         run_.store(false);
         frame_queue_->SignalForKill(); // Unblock all consumers
+        raw_queue_->SignalForKill();
     }
 }
 
@@ -249,63 +346,49 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
         if (!ret) {
             return;
         }
-        AVFramePtr frame = AVFramePool::Get()->Acquire();
         if (!pkt) {
-            // LOG(INFO) << "Draining mode start...";
-            // draining mode, pulling buffered frames out
+            // ── draining mode: pull buffered frames out of avcodec ──
             CHECK_GE(avcodec_send_packet(dec_ctx_.get(), NULL), 0) << "Thread worker: Error entering draining mode.";
             while (true) {
+                AVFramePtr frame = AVFramePool::Get()->Acquire();
                 got_picture = ReceiveFrame(dec_ctx_.get(), frame.get());
                 if (got_picture == AVERROR_EOF) {
-                    // LOG(INFO) << "stop draining";
+                    // signal the filter thread to emit drain markers
                     for (int cnt = 0; cnt < ThreadedDecoderInterface::kDrainMarkerCount; ++cnt) {
-                        // special signal
-                        frame_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
-                        ++frame_count_;
+                        raw_queue_->Push(RawItem{AVFramePtr(), RawKind::DrainEnd, 0});
                     }
-                    draining_.store(false);
                     break;
                 }
-                NDArray out_buf;
-                bool get_buf = buffer_queue_->Pop(&out_buf);
-                if (!get_buf) return;
-                ProcessFrame(frame, out_buf);
+                EnqueueRawFrame(frame);
             }
         } else {
-            // normal mode: keep the decoder's frame threads busy by
-            // accumulating packets before taking frames out.
+            // ── normal mode: drain-then-send rhythm ──
+            // Receive every finished frame before the next send.  Frame
+            // threading decodes several frames in parallel; receiving one
+            // per loop made send hit EAGAIN (internal queue full) almost
+            // every iteration and the 1ms EAGAIN sleep dominated (measured
+            // d_send 0.72ms of a 0.71ms frame budget).  Draining first
+            // keeps the frame-thread queue empty so send succeeds
+            // immediately.
             //
-            // The old rhythm (send one packet, then block on receive until
-            // that frame decodes, pushing an empty marker on EAGAIN) left
-            // exactly one packet inside avcodec at a time — the FFmpeg
-            // frame threads (thread_count=4) were idle and per-frame
-            // latency was the single-frame decode time (~1.26ms on CPU
-            // soft decode, measured latency-bound: raising thread_count to
-            // 8/auto gave zero gain).  With prefetch feeding the packet
-            // queue, we now send as many packets as avcodec accepts
-            // (EAGAIN only when its internal queue is full) and take out
-            // whatever frames are ready, skipping EAGAIN instead of
-            // stalling: 4 frame threads decode in parallel, frames come
-            // out ~every 0.25ms instead of every 1.26ms.
+            // NOTE: a fully batched "send N then receive N" loop was tried
+            // and reverted — it produced h264 "reference picture missing"
+            // warnings and pixel mismatches (frame-thread B-frame
+            // dependency handling breaks when packets are accumulated
+            // faster than frames are pulled).  The drain-first rhythm is
+            // the fastest correct shape.
             int send_ret;
-            // EAGAIN on send = internal queue full.  Drain every available
-            // output frame (possibly several) before retrying the send;
-            // only sleep when nothing is ready.
+            pf_d_send.start();
             while ((send_ret = avcodec_send_packet(dec_ctx_.get(),
                                                    pkt.get())) == AVERROR(EAGAIN)) {
                 // Drain every output frame that is ready before sleeping:
                 // with frame threading, several frames can be pending, and
                 // sleeping per frame would cap throughput at ~1 frame/ms.
                 while (true) {
-                    // a fresh frame per iteration: ProcessFrame wraps the
-                    // frame in a shared_ptr that outlives this loop
                     AVFramePtr drain_frame = AVFramePool::Get()->Acquire();
                     got_picture = ReceiveFrame(dec_ctx_.get(), drain_frame.get());
                     if (got_picture == 0) {
-                        NDArray out_buf;
-                        bool get_buf = buffer_queue_->Pop(&out_buf);
-                        if (!get_buf) return;
-                        ProcessFrame(drain_frame, out_buf);
+                        EnqueueRawFrame(drain_frame);
                     } else if (got_picture == AVERROR(EAGAIN) ||
                                got_picture == AVERROR_EOF) {
                         break;
@@ -321,27 +404,32 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
             }
             CHECK_GE(send_ret, 0) << "Thread worker: Error sending packet: "
                                   << send_ret;
-            // Non-blocking receive: take the frame if the frame threads
-            // already finished it, otherwise skip — the next packet keeps
-            // the frame threads busy and the frame shows up later.  No
-            // empty marker is pushed (that would force the consumer into a
-            // retry spin and re-introduce latency binding).
-            got_picture = avcodec_receive_frame(dec_ctx_.get(), frame.get());
-            if (got_picture == 0) {
-                NDArray out_buf;
-                bool get_buf = buffer_queue_->Pop(&out_buf);
-                if (!get_buf) return;
-                ProcessFrame(frame, out_buf);
-            } else if (AVERROR(EAGAIN) == got_picture) {
-                // frame threads still decoding — continue accumulating
-            } else if (AVERROR_EOF == got_picture) {
-                // Unexpected mid-stream EOF; keep the historical empty
-                // marker so the consumer's EOF path handles it.
-                frame_queue_->Push(NDArray());
-                ++frame_count_;
-            } else {
-                LOG(FATAL) << "Thread worker: Error decoding frame: " << got_picture;
+            pf_d_send.stop();
+            // Drain every finished frame before the next send.
+            pf_d_recv.start();
+            while (run_.load()) {
+                AVFramePtr f = AVFramePool::Get()->Acquire();
+                got_picture = avcodec_receive_frame(dec_ctx_.get(), f.get());
+                if (got_picture == 0) {
+                    pf_d_recv.stop();
+                    pf_d_push.start();
+                    EnqueueRawFrame(f);
+                    pf_d_push.stop();
+                    pf_d_recv.start();
+                    continue;
+                }
+                if (got_picture == AVERROR(EAGAIN)) {
+                    // frame threads still decoding — fine, next loop drains
+                } else if (got_picture == AVERROR_EOF) {
+                    // Unexpected mid-stream EOF; keep the historical empty
+                    // marker so the consumer's EOF path handles it.
+                    raw_queue_->Push(RawItem{AVFramePtr(), RawKind::Eof, 0});
+                } else {
+                    LOG(FATAL) << "Thread worker: Error decoding frame: " << got_picture;
+                }
+                break;
             }
+            pf_d_recv.stop();
         }
         // free raw memories allocated with ffmpeg
         // av_packet_unref(pkt);
