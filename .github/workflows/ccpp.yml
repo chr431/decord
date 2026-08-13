@@ -28,8 +28,10 @@ jobs:
         cmake --build /tmp/gtest -j$(nproc)
     - name: compile C++ tests (build only, exercises the C++ API surface)
       run: |
-        GTEST_LIB=/tmp/gtest/lib cmake -S . -B build
-        cmake --build build --target cpptest -j$(nproc)
+        # dedicated dir: scikit-build-core's own build tree lives in a
+        # temporary directory, so configure a fresh one for the cpp tests
+        GTEST_LIB=/tmp/gtest/lib cmake -S . -B build-cpp -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release
+        cmake --build build-cpp --target cpptest -j$(nproc)
 
   build-windows:
     runs-on: windows-2022
