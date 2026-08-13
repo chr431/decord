@@ -32,8 +32,14 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
     enum class RawKind { Frame, Skip, DrainEnd, Eof };
     struct RawItem {
         AVFramePtr frame;
-        RawKind kind = RawKind::Frame;
-        int64_t pts = 0;
+        RawKind kind;
+        int64_t pts;
+        // explicit ctors: NSDMI + brace-init would make this a non-aggregate
+        // under C++11 (aggregate NSDMI needs C++14); MSVC accepts it as an
+        // extension but GCC/clang reject RawItem{...} — keep C++11 portable.
+        RawItem() : frame(nullptr), kind(RawKind::Frame), pts(0) {}
+        RawItem(AVFramePtr f, RawKind k, int64_t p)
+            : frame(std::move(f)), kind(k), pts(p) {}
     };
     using RawFrameQueue = dmlc::ConcurrentBlockingQueue<RawItem>;
     using RawFrameQueuePtr = std::unique_ptr<RawFrameQueue>;
