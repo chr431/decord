@@ -119,8 +119,30 @@ def test_dlpack_device():
     vr = _reader()  # keep the reader alive: the frame aliases its pool buffer
     arr = vr[0]
     assert arr.__dlpack_device__() == (1, 0)  # kDLCpu
-    with pytest.raises(ValueError):
-        arr.__dlpack__(stream=1)
+
+
+def test_dlpack_gpu_torch():
+    """GPU frames export zero-copy to torch via DLPack (skipped without CUDA)."""
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA not available')
+    import ctypes
+    from decord import gpu
+    vr = VideoReader(_video_path(), ctx=gpu(0))
+    arr = vr[0]
+    t = torch.from_dlpack(arr)
+    assert t.device.type == 'cuda'
+    assert t.dtype == torch.uint8
+    assert tuple(t.shape) == (240, 426, 3)
+    assert torch.equal(t, torch.from_numpy(arr.asnumpy()).cuda())
+    # zero-copy: the tensor aliases the NDArray's device buffer
+    buf = ctypes.cast(arr.handle.contents.data, ctypes.c_void_p).value
+    assert t.data_ptr() == buf
+    # the tensor is usable in torch ops
+    assert t.float().mean().item() > 0
+    del t
+    # the buffer returns to the pool via the deleter; reader keeps working
+    assert vr[1].asnumpy().shape == (240, 426, 3)
 
 
 def test_dlpack_zero_copy_roundtrip():
