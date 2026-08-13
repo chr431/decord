@@ -8,12 +8,22 @@
 #include <thread>
 #include "ffmpeg/threaded_decoder.h"
 #include "../runtime/str_util.h"
+#include "../runtime/file_util.h"
 #if DECORD_USE_CUDA
 #include "nvcodec/cuda_threaded_decoder.h"
 #include <cuda_runtime_api.h>
 #endif
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
+#include <fstream>
+#ifdef _WIN32
+#include <direct.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#else
+#include <sys/stat.h>
+#endif
 #include <decord/runtime/ndarray.h>
 #include <decord/runtime/c_runtime_api.h>
 
@@ -275,7 +285,14 @@ void VideoReader::SetVideoStream(int stream_nb) {
     }
 
     decoder_->SetCodecContext(dec_ctx, width_, height_, rotation, output_format_);
-    IndexKeyframes();
+    // Frame/keyframe index: reuse a fresh on-disk cache entry (keyed by file
+    // size + mtime) when available, otherwise scan and persist.  Training
+    // workloads reopen the same files every epoch — the scan is a full-file
+    // demux walk that this avoids on every open after the first.
+    if (!LoadCachedIndex()) {
+        IndexKeyframes();
+        SaveCachedIndex();
+    }
 }
 
 unsigned int VideoReader::QueryStreams() const {
@@ -624,6 +641,154 @@ NDArray VideoReader::NextFrameRoi(int x1, int y1, int x2, int y2) {
     // inherited verbatim; on the GPU path the popped frame is a pool buffer
     NDArray frame = NextFrameImpl();
     return CropRoi(frame, x1, y1, x2, y2);
+}
+
+namespace {
+// On-disk index cache: avoids the full-file demux walk on repeated opens of
+// the same video (training workloads reopen identical files every epoch).
+// Entries are validated against the video's size + mtime; anything that
+// does not match (or fails to parse) silently falls back to a full scan.
+// Disable with DECORD_DISABLE_INDEX_CACHE=1.
+constexpr uint64_t kIndexCacheMagic = 0x4443524449445831ULL;  // "DCRDIDX1"
+constexpr uint32_t kIndexCacheVersion = 1;
+const char* kIndexCacheDisabledEnv = "DECORD_DISABLE_INDEX_CACHE";
+
+struct FileStamp {
+    int64_t size = 0;
+    int64_t mtime = 0;
+    bool ok = false;
+};
+
+FileStamp GetFileStamp(const std::string& path) {
+    FileStamp stamp;
+#ifdef _WIN32
+    struct _stat64 s;
+    if (_stat64(path.c_str(), &s) == 0) {
+        stamp.size = s.st_size;
+        stamp.mtime = s.st_mtime;
+        stamp.ok = true;
+    }
+#else
+    struct stat s;
+    if (stat(path.c_str(), &s) == 0) {
+        stamp.size = s.st_size;
+        stamp.mtime = s.st_mtime;
+        stamp.ok = true;
+    }
+#endif
+    return stamp;
+}
+
+bool MkdirIfMissing(const std::string& path) {
+#ifdef _WIN32
+    return _mkdir(path.c_str()) == 0 || errno == EEXIST;
+#else
+    return mkdir(path.c_str(), 0777) == 0 || errno == EEXIST;
+#endif
+}
+
+std::string HashString(const std::string& s) {
+    // FNV-1a 64
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+    return std::string(buf);
+}
+}  // namespace
+
+std::string VideoReader::IndexCachePath() const {
+    if (filename_.empty() || io_ctx_) return "";
+    return runtime::GetCacheDir() + "/index/" + HashString(filename_) + ".idx";
+}
+
+bool VideoReader::LoadCachedIndex() {
+    if (getenv(kIndexCacheDisabledEnv)) return false;
+    const std::string cache_path = IndexCachePath();
+    if (cache_path.empty()) return false;
+    FileStamp stamp = GetFileStamp(filename_);
+    if (!stamp.ok) return false;
+    std::ifstream in(cache_path, std::ios::binary);
+    if (!in) return false;
+    uint64_t magic = 0;
+    uint32_t version = 0;
+    int64_t fsize = 0, mtime = 0, nframes = 0, nkeys = 0;
+    in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    in.read(reinterpret_cast<char*>(&fsize), sizeof(fsize));
+    in.read(reinterpret_cast<char*>(&mtime), sizeof(mtime));
+    in.read(reinterpret_cast<char*>(&nframes), sizeof(nframes));
+    in.read(reinterpret_cast<char*>(&nkeys), sizeof(nkeys));
+    if (!in || magic != kIndexCacheMagic || version != kIndexCacheVersion
+        || fsize != stamp.size || mtime != stamp.mtime
+        || nframes < 1 || nframes > (1LL << 40) || nkeys < 0 || nkeys > nframes) {
+        return false;
+    }
+    key_indices_.clear();
+    frame_ts_.clear();
+    key_indices_.resize(static_cast<size_t>(nkeys));
+    frame_ts_.resize(static_cast<size_t>(nframes));
+    if (nkeys > 0) {
+        in.read(reinterpret_cast<char*>(key_indices_.data()),
+                static_cast<std::streamsize>(nkeys * sizeof(int64_t)));
+    }
+    for (int64_t i = 0; i < nframes; ++i) {
+        AVFrameTime& t = frame_ts_[static_cast<size_t>(i)];
+        in.read(reinterpret_cast<char*>(&t.pts), sizeof(t.pts));
+        in.read(reinterpret_cast<char*>(&t.dts), sizeof(t.dts));
+        in.read(reinterpret_cast<char*>(&t.start), sizeof(t.start));
+        in.read(reinterpret_cast<char*>(&t.stop), sizeof(t.stop));
+    }
+    if (!in.good()) {
+        key_indices_.clear();
+        frame_ts_.clear();
+        return false;
+    }
+    return true;
+}
+
+void VideoReader::SaveCachedIndex() const {
+    if (getenv(kIndexCacheDisabledEnv)) return;
+    const std::string cache_path = IndexCachePath();
+    if (cache_path.empty() || frame_ts_.empty()) return;
+    FileStamp stamp = GetFileStamp(filename_);
+    if (!stamp.ok) return;
+    const std::string dir = cache_path.substr(0, cache_path.find_last_of("/\\"));
+    MkdirIfMissing(runtime::GetCacheDir());
+    MkdirIfMissing(dir);
+    // write to a temp file then rename: concurrent training workers may
+    // write the same entry simultaneously — a torn .idx must never be
+    // visible as a valid cache file (readers validate on load anyway)
+    const std::string tmp_path = cache_path + ".tmp";
+    std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+    const uint64_t magic = kIndexCacheMagic;
+    const uint32_t version = kIndexCacheVersion;
+    const int64_t nframes = static_cast<int64_t>(frame_ts_.size());
+    const int64_t nkeys = static_cast<int64_t>(key_indices_.size());
+    out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    out.write(reinterpret_cast<const char*>(&stamp.size), sizeof(stamp.size));
+    out.write(reinterpret_cast<const char*>(&stamp.mtime), sizeof(stamp.mtime));
+    out.write(reinterpret_cast<const char*>(&nframes), sizeof(nframes));
+    out.write(reinterpret_cast<const char*>(&nkeys), sizeof(nkeys));
+    if (nkeys > 0) {
+        out.write(reinterpret_cast<const char*>(key_indices_.data()),
+                  static_cast<std::streamsize>(nkeys * sizeof(int64_t)));
+    }
+    for (const AVFrameTime& t : frame_ts_) {
+        out.write(reinterpret_cast<const char*>(&t.pts), sizeof(t.pts));
+        out.write(reinterpret_cast<const char*>(&t.dts), sizeof(t.dts));
+        out.write(reinterpret_cast<const char*>(&t.start), sizeof(t.start));
+        out.write(reinterpret_cast<const char*>(&t.stop), sizeof(t.stop));
+    }
+    out.close();
+    if (!out) return;
+    std::remove(cache_path.c_str());
+    std::rename(tmp_path.c_str(), cache_path.c_str());
 }
 
 void VideoReader::IndexKeyframes() {

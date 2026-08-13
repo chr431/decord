@@ -76,6 +76,14 @@ class VideoReader : public VideoReaderInterface {
         std::vector<int64_t> GetKeyIndicesVector() const;
     private:
         void IndexKeyframes();
+        /*! \brief Try to load the frame/keyframe index from the on-disk
+         *  index cache (keyed by file size + mtime).  Returns true on a
+         *  fresh hit; the caller falls back to IndexKeyframes(). */
+        bool LoadCachedIndex();
+        /*! \brief Persist the freshly built index to the on-disk cache. */
+        void SaveCachedIndex() const;
+        /*! \brief Cache file path for this video (empty if uncacheable). */
+        std::string IndexCachePath() const;
         void PushNext();
         int64_t LocateKeyframe(int64_t pos);
         void SkipFramesImpl(int64_t num = 1);

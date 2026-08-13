@@ -137,6 +137,32 @@ def test_dlpack_zero_copy_roundtrip():
     assert view.ctypes.data == buf_addr
 
 
+def test_index_cache_reopen():
+    """Repeated opens reuse the on-disk frame index cache and must produce
+    frame metadata identical to a fresh full scan."""
+    import decord
+    # prime the cache
+    vr = _reader()
+    n = len(vr)
+    keys = vr.get_key_indices()
+    ts = vr.get_frame_timestamp(range(10))
+    # fresh scan (cache disabled) must agree with the cached open
+    import os
+    os.environ['DECORD_DISABLE_INDEX_CACHE'] = '1'
+    try:
+        vr_fresh = _reader()
+        assert len(vr_fresh) == n
+        assert vr_fresh.get_key_indices() == keys
+        assert np.array_equal(vr_fresh.get_frame_timestamp(range(10)), ts)
+    finally:
+        del os.environ['DECORD_DISABLE_INDEX_CACHE']
+    # and the cached open itself (second open in the same process)
+    vr_cached = _reader()
+    assert len(vr_cached) == n
+    assert vr_cached.get_key_indices() == keys
+    assert np.array_equal(vr_cached.get_frame_timestamp(range(10)), ts)
+
+
 def test_pipeline_sequential_and_seek_interleaved():
     # exercises the two-stage decode pipeline (decode worker + filter worker)
     vr = _reader()
