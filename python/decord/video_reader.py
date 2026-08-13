@@ -43,10 +43,10 @@ class VideoReader(object):
     """
     def __init__(self, uri, ctx=cpu(0), width=-1, height=-1, num_threads=0, fault_tol=-1,
                  output_format='rgb'):
+        self._handle = None
         if output_format not in ('rgb', 'gray'):
             raise ValueError("output_format must be 'rgb' or 'gray'")
         self._output_format = 1 if output_format == 'gray' else 0
-        self._handle = None
         assert isinstance(ctx, DECORDContext)
         fault_tol = str(fault_tol)
         if hasattr(uri, 'read'):
