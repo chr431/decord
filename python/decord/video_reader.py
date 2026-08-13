@@ -38,6 +38,8 @@ class VideoReader(object):
         If `fault_tol` < 0, nothing will happen.
         If 0 < `fault_tol` < 1.0, if N > `fault_tol * len(video)`, raise `DECORDLimitReachedError`.
         If 1 < `fault_tol`, if N > `fault_tol`, raise `DECORDLimitReachedError`.
+    output_format : str, default is 'rgb'
+        Output pixel format: ``'rgb'`` (3 channels) or ``'gray'`` (1 channel).
 
 
     """

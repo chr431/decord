@@ -1,8 +1,6 @@
 # Decord
 
-![CI Build](https://github.com/dmlc/decord/workflows/C/C++%20CI/badge.svg?branch=master)
-[![PyPI](https://img.shields.io/pypi/v/decord.svg)](https://pypi.python.org/pypi/decord)
-[![Downloads](http://pepy.tech/badge/decord)](http://pepy.tech/project/decord)
+![CI Build](https://github.com/chr431/decord/workflows/C/C++%20CI/badge.svg?branch=dev)
 
 ![symbol](docs/symbol.png)
 
@@ -10,7 +8,6 @@
 
 -   FFMPEG/LibAV(Done)
 -   Nvidia Codecs(Done)
--   Intel Codecs
 
 `Decord` was designed to handle awkward video shuffling experience in order to provide smooth experiences similar to random image loader for deep learning.
 
@@ -34,19 +31,15 @@ Decord is good at handling random access patterns, which is rather common during
 
 ### Install via pip
 
-Simply use
-
-```bash
-pip install decord
-```
+PyPI 上的 `decord` 是上游 0.6.0（CPU 版）；本 fork 不依赖它，通过 GitHub
+Release 分发预编译包（见下方「Releases（本 fork）」），解压即用、无需 pip。
+从源码安装（含 pip 安装）见下一节。
 
 Supported platforms:
 
 - [x] Linux
 - [x] Mac OS >= 10.12, python>=3.5
 - [x] Windows
-
-**Note that only CPU versions are provided with PYPI now. Please build from source to enable GPU acclerator.**
 
 
 ### Install from source
@@ -68,7 +61,7 @@ sudo apt-get install -y ffmpeg libavcodec-dev libavfilter-dev libavformat-dev li
 Clone the repo recursively(important)
 
 ```bash
-git clone --recursive https://github.com/dmlc/decord
+git clone --recursive https://github.com/chr431/decord
 ```
 
 Install:
@@ -176,7 +169,7 @@ CPU 内存修复），**不依赖 PyPI decord**。版本与发布遵循：
 在 GitHub Actions → **Release** → Run workflow：
 
 1. `version`：要发布的版本号（如 `0.7.0`），会自动打 tag `v0.7.0`
-2. `ref`：默认 `feat/perf-deep`（可改为其它分支）
+2. `ref`：默认 `master`（可改为其它分支）
 
 workflow 会依次：校验版本格式 + tag 不重复 → 安装 CUDA Toolkit +
 下载 BtbN FFmpeg 8.1 → CMake GPU 构建 → 若 `libinfo.py` / `pyproject.toml`
@@ -216,7 +209,7 @@ brew install cmake ffmpeg
 Clone the repo recursively(important)
 
 ```bash
-git clone --recursive https://github.com/dmlc/decord
+git clone --recursive https://github.com/chr431/decord
 ```
 
 Then go to root directory build shared library:
