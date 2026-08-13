@@ -28,11 +28,20 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
     using BufferQueue = dmlc::ConcurrentBlockingQueue<NDArray>;
     using BufferQueuePtr = std::unique_ptr<BufferQueue>;
     using FFMPEGFilterGraphPtr = std::shared_ptr<FFMPEGFilterGraph>;
+    /*! \brief kind of an item on the raw (pre-filter) frame queue. */
+    enum class RawKind { Frame, Skip, DrainEnd, Eof };
+    struct RawItem {
+        AVFramePtr frame;
+        RawKind kind = RawKind::Frame;
+        int64_t pts = 0;
+    };
+    using RawFrameQueue = dmlc::ConcurrentBlockingQueue<RawItem>;
+    using RawFrameQueuePtr = std::unique_ptr<RawFrameQueue>;
 
     public:
         FFMPEGThreadedDecoder();
         void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1,
-                             int rotation = 0);
+                             int rotation = 0, int output_format = 0);
         void Start();
         void Stop();
         void Clear();
@@ -44,20 +53,27 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
     private:
         void WorkerThread();
         void WorkerThreadImpl();
+        void FilterWorkerThread();
+        void FilterWorkerThreadImpl();
+        void EnqueueRawFrame(AVFramePtr frame);
         void RecordInternalError(std::string message);
         void CheckErrorStatus();
         void ProcessFrame(AVFramePtr p, NDArray out_buf);
         NDArray CopyToNDArray(AVFramePtr p);
         NDArray AsNDArray(AVFramePtr p);
-        // void FetcherThread(std::condition_variable& cv, FrameQueuePtr frame_queue);
         PacketQueuePtr pkt_queue_;
+        /*! \brief decoded (pre-filter) frames, consumed by the filter thread.
+         *  Two-stage pipeline: the decode thread only drives avcodec (frame
+         *  threads stay busy), the filter thread runs sws_scale conversion
+         *  concurrently — the old single worker serialised them and the
+         *  filter cost (~0.54ms @1080p) starved the frame threads. */
+        RawFrameQueuePtr raw_queue_;
         FrameQueuePtr frame_queue_;
         BufferQueuePtr buffer_queue_;
         std::atomic<int> frame_count_;
         std::atomic<bool> draining_;
-        std::thread t_;
-        // std::thread fetcher_;
-        // std::condition_variable cv_;
+        std::thread t_;          // decode worker
+        std::thread filter_t_;   // filter worker
         std::atomic<bool> run_;
         FFMPEGFilterGraphPtr filter_graph_;
         AVCodecContextPtr dec_ctx_;
@@ -66,6 +82,7 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         std::mutex error_mutex_;
         std::atomic<bool> error_status_;
         std::string error_message_;
+        int max_queue_frames_;
 
     DISALLOW_COPY_AND_ASSIGN(FFMPEGThreadedDecoder);
 };

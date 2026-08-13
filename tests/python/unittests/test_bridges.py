@@ -65,7 +65,7 @@ def test_threaded_bridge():
     from multiprocessing.dummy import Pool as ThreadPool
 
     video_paths = [
-      os.path.expanduser('~/Dev/decord/examples/flipping_a_pancake.mkv'), #list of paths to video
+      os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'examples', 'flipping_a_pancake.mkv')), #list of paths to video
       ]
 
     def process_path(path):
@@ -78,5 +78,4 @@ def test_threaded_bridge():
     pool.map(process_path, video_paths)
 
 if __name__ == '__main__':
-    import nose
-    nose.runmodule()
+    raise SystemExit(pytest.main([__file__]))

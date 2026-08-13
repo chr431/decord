@@ -141,7 +141,7 @@ class NDArray {
    * \param ctx The target context.
    * \return The array under another context.
    */
-  inline NDArray CopyTo(const DLContext& ctx) const;
+  inline NDArray CopyTo(const DLDevice& ctx) const;
   /*!
    * \brief Load NDArray from stream
    * \param stream The input data stream
@@ -185,7 +185,7 @@ class NDArray {
    */
   DECORD_DLL static NDArray Empty(std::vector<int64_t> shape,
                                DLDataType dtype,
-                               DLContext ctx);
+                               DLDevice ctx);
   /*!
    * \brief Create a NDArray backed by a dlpack tensor.
    *
@@ -344,10 +344,10 @@ inline DLTensor CreateDLTensorView(std::vector<T>& other, std::vector<int64_t>& 
   // Create view as DLTensor
   DLTensor dlt;
   dlt.data = dmlc::BeginPtr(other);
-  DLContext cpu_ctx;
+  DLDevice cpu_ctx;
   cpu_ctx.device_type = kDLCPU;
   cpu_ctx.device_id = 0;
-  dlt.ctx = cpu_ctx;
+  dlt.device = cpu_ctx;
   DLDataType dtype;
   dtype.bits = 8U * sizeof(T);
   if (std::is_floating_point<T>::value) {
@@ -410,7 +410,7 @@ inline void NDArray::CopyTo(std::vector<T>& other) const {
   CopyFromTo(&(data_->dl_tensor), &dlt);
 }
 
-inline NDArray NDArray::CopyTo(const DLContext& ctx) const {
+inline NDArray NDArray::CopyTo(const DLDevice& ctx) const {
   CHECK(data_ != nullptr);
   const DLTensor* dptr = operator->();
   NDArray ret = Empty(std::vector<int64_t>(dptr->shape, dptr->shape + dptr->ndim),
@@ -453,7 +453,7 @@ inline bool SaveDLTensor(dmlc::Stream* strm,
   //
   // We can always do array.CopyTo(target_ctx) to get a corresponding
   // array in the target context.
-  DLContext cpu_ctx;
+  DLDevice cpu_ctx;
   cpu_ctx.device_type = kDLCPU;
   cpu_ctx.device_id = 0;
   strm->Write(cpu_ctx);
@@ -470,7 +470,7 @@ inline bool SaveDLTensor(dmlc::Stream* strm,
   strm->Write(data_byte_size);
 
   if (DMLC_IO_NO_ENDIAN_SWAP &&
-      tensor->ctx.device_type == kDLCPU &&
+      tensor->device.device_type == kDLCPU &&
       tensor->strides == nullptr &&
       tensor->byte_offset == 0) {
     // quick path
@@ -500,7 +500,7 @@ inline bool NDArray::Load(dmlc::Stream* strm) {
       << "Invalid DLTensor file format";
   CHECK(header == kDECORDNDArrayMagic)
       << "Invalid DLTensor file format";
-  DLContext ctx;
+  DLDevice ctx;
   int ndim;
   DLDataType dtype;
   CHECK(strm->Read(&ctx))

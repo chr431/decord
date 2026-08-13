@@ -34,8 +34,9 @@ class VideoReader : public VideoReaderInterface {
     using ThreadedDecoderPtr = std::unique_ptr<ThreadedDecoderInterface>;
     using NDArray = runtime::NDArray;
     public:
-        VideoReader(std::string fn, DLContext ctx, int width=-1, int height=-1,
-                    int nb_thread=0, int io_type=kNormal, std::string fault_tol="-1");
+        VideoReader(std::string fn, DLDevice ctx, int width=-1, int height=-1,
+                    int nb_thread=0, int io_type=kNormal, std::string fault_tol="-1",
+                    int output_format = 0);
         /*! \brief Destructor, note that FFMPEG resources has to be managed manually to avoid resource leak */
         ~VideoReader();
         void SetVideoStream(int stream_nb = -1);
@@ -43,7 +44,25 @@ class VideoReader : public VideoReaderInterface {
         int64_t GetFrameCount() const;
         int64_t GetCurrentPosition() const;
         NDArray NextFrame();
-        NDArray GetBatch(std::vector<int64_t> indices, NDArray buf);
+        /*!
+         * \brief Grab the next frame and return only the ROI rectangle.
+         * \param x1,y1,x2,y2 Half-open ROI [x1,x2) x [y1,y2).  On the GPU path
+         *        only the ROI rectangle is copied to host memory (the caller
+         *        would otherwise receive the full frame and crop it, wasting
+         *        a full-frame D2H copy).  CPU builds and invalid ROIs fall
+         *        back to the full frame (caller crops).
+         */
+        NDArray NextFrameRoi(int x1, int y1, int x2, int y2);
+        /*!
+         * \brief Grab a batch of frames; an optional ROI rectangle crops
+         *        every frame to [x1,x2) x [y1,y2) before writing into the
+         *        batch buffer (half-open, same semantics as NextFrameRoi).
+         *        ROI < 0 (any coordinate) returns full frames, keeping the
+         *        historical behaviour.  Batch shape becomes
+         *        [N, y2-y1, x2-x1, 3] when a valid ROI is given.
+         */
+        NDArray GetBatch(std::vector<int64_t> indices, NDArray buf,
+                         int x1 = -1, int y1 = -1, int x2 = -1, int y2 = -1);
         void SkipFrames(int64_t num = 1);
         bool Seek(int64_t pos);
         bool SeekAccurate(int64_t pos);
@@ -51,6 +70,7 @@ class VideoReader : public VideoReaderInterface {
         NDArray GetFramePTS() const;
         double GetAverageFPS() const;
         double GetRotation() const;
+        std::string GetCodec() const;
     protected:
         friend class VideoLoader;
         std::vector<int64_t> GetKeyIndicesVector() const;
@@ -65,8 +85,11 @@ class VideoReader : public VideoReaderInterface {
         std::vector<int64_t> FramesToPTS(const std::vector<int64_t>& positions);
         void CacheFrame(NDArray frame);
         bool FetchCachedFrame(NDArray &frame, int64_t pos);
+        /*! \brief Row-stride copy of a frame's ROI rectangle (CPU memcpy or
+         *  GPU cudaMemcpy2D).  Shared by NextFrameRoi and GetBatch(roi). */
+        NDArray CropRoi(NDArray frame, int x1, int y1, int x2, int y2);
 
-        DLContext ctx_;
+        DLDevice ctx_;
         std::vector<int64_t> key_indices_;
         std::map<int64_t, int64_t> pts_frame_map_;
         NDArray tmp_key_frame_;
@@ -84,7 +107,16 @@ class VideoReader : public VideoReaderInterface {
         int64_t nb_thread_decoding_;  // number of threads for decoding
         int width_;   // output video width
         int height_;  // output video height
+        int output_format_;  // 0 = RGB24, 1 = GRAY8 (1 channel)
+        int Channels() const { return output_format_ ? 1 : 3; }
         bool eof_;  // end of file indicator
+        /*! \brief decoder queue in-flight depth accounting.  NextFrameImpl
+         *  keeps pkts_pushed_ - frames_popped_ near kPrefetchDepth so the
+         *  decoder threads / GPU surfaces stay busy instead of being
+         *  latency-bound on one packet at a time.  Reset on Seek (the
+         *  decoder queue is cleared there). */
+        int64_t pkts_pushed_ = 0;
+        int64_t frames_popped_ = 0;
         NDArrayPool ndarray_pool_;
         std::unique_ptr<ffmpeg::AVIOBytesContext> io_ctx_;  // avio context for raw memory access
         std::string filename_;  // file name if from file directly, can be empty if from bytes

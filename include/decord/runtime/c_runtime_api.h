@@ -43,7 +43,7 @@
 #endif
 
 // DECORD version
-#define DECORD_VERSION "0.6.0"
+#define DECORD_VERSION "0.7.1"
 
 
 // DECORD Runtime is DLPack compatible.
@@ -112,7 +112,7 @@ typedef DLDataType DECORDType;
 /*!
  * \brief The Device information, abstract away common device types.
  */
-typedef DLContext DECORDContext;
+typedef DLDevice DECORDContext;
 
 /*!
  * \brief The tensor array stucture to DECORD API.
@@ -145,7 +145,6 @@ typedef struct {
 } DECORDByteArray;
 
 /*! \brief Handle to DECORD runtime modules. */
-typedef void* DECORDModuleHandle;
 /*! \brief Handle to packed function handle. */
 typedef void* DECORDFunctionHandle;
 /*! \brief Handle to hold return value. */
@@ -175,46 +174,6 @@ DECORD_DLL void DECORDAPISetLastError(const char* msg);
 DECORD_DLL const char *DECORDGetLastError(void);
 /*!
  * \brief Load module from file.
- * \param file_name The file name to load the module from.
- * \param format The format of the module.
- * \param out The result module
- *
- * \return 0 when success, -1 when failure happens
- * \note The resulting module do not contain import relation.
- *  It can be reconstructed by DECORDModImport.
- */
-DECORD_DLL int DECORDModLoadFromFile(const char* file_name,
-                               const char* format,
-                               DECORDModuleHandle* out);
-
-/*!
- * \brief Add dep to mod's dependency.
- *  This allows functions in this module to use modules.
- *
- * \param mod The module handle.
- * \param dep The dependent module to be imported.
- * \return 0 when success, -1 when failure happens
- */
-DECORD_DLL int DECORDModImport(DECORDModuleHandle mod,
-                         DECORDModuleHandle dep);
-
-/*!
- * \brief Get function from the module.
- * \param mod The module handle.
- * \param func_name The name of the function.
- * \param query_imports Whether to query imported modules
- * \param out The result function, can be NULL if it is not available.
- * \return 0 when no error is thrown, -1 when failure happens
- */
-DECORD_DLL int DECORDModGetFunction(DECORDModuleHandle mod,
-                              const char* func_name,
-                              int query_imports,
-                              DECORDFunctionHandle *out);
-
-/*!
- * \brief Free front-end extension type resource.
- * \param handle The extension handle.
- * \param type_code The type of of the extension type.
  * \return 0 when success, -1 when failure happens
  */
 DECORD_DLL int DECORDExtTypeFree(void* handle, int type_code);
@@ -224,17 +183,6 @@ DECORD_DLL int DECORDExtTypeFree(void* handle, int type_code);
  * \param mod The module to be freed.
  *
  * \note This may not free up the module's resources.
- *  If there is active DECORDFunctionHandle uses the module
- *  Or if this module is imported by another active module.
- *
- *  The all functions remains valid until DECORDFuncFree is called.
- * \return 0 when success, -1 when failure happens
- */
-DECORD_DLL int DECORDModFree(DECORDModuleHandle mod);
-
-/*!
- * \brief Free the function when it is no longer needed.
- * \param func The function handle
  * \return 0 when success, -1 when failure happens
  */
 DECORD_DLL int DECORDFuncFree(DECORDFunctionHandle func);

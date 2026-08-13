@@ -187,7 +187,7 @@ constexpr int kRPCSessMask = 128;
 inline const char* DeviceName(int type) {
   switch (type) {
     case kDLCPU: return "cpu";
-    case kDLGPU: return "gpu";
+    case kDLCUDA: return "gpu";
     case kDLOpenCL: return "opencl";
     case kDLSDAccel: return "sdaccel";
     case kDLAOCL: return "aocl";
@@ -202,7 +202,7 @@ inline const char* DeviceName(int type) {
 }
 
 #ifndef _LIBCPP_SGX_NO_IOSTREAMS
-inline std::ostream& operator<<(std::ostream& os, DLContext ctx) {  // NOLINT(*)
+inline std::ostream& operator<<(std::ostream& os, DLDevice ctx) {  // NOLINT(*)
   int device_type = static_cast<int>(ctx.device_type);
   if (device_type > kRPCSessMask) {
     os << "remote[" << (device_type / kRPCSessMask) << "]-";

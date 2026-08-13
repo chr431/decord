@@ -7,7 +7,6 @@
 #define DECORD_RUNTIME_FILE_UTIL_H_
 
 #include <string>
-#include "meta_data.h"
 
 namespace decord {
 namespace runtime {
@@ -53,24 +52,6 @@ void LoadBinaryFromFile(const std::string& file_name,
  */
 void SaveBinaryToFile(const std::string& file_name,
                       const std::string& data);
-
-/*!
- * \brief Save meta data to file.
- * \param file_name The name of the file.
- * \param fmap The function info map.
- */
-void SaveMetaDataToFile(
-    const std::string& file_name,
-    const std::unordered_map<std::string, FunctionInfo>& fmap);
-
-/*!
- * \brief Load meta data to file.
- * \param file_name The name of the file.
- * \param fmap The function info map.
- */
-void LoadMetaDataFromFile(
-    const std::string& file_name,
-    std::unordered_map<std::string, FunctionInfo>* fmap);
 
 /*!
  * \brief Remove (unlink) a file.

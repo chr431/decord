@@ -48,18 +48,28 @@ class VideoReaderInterface {
     virtual int64_t GetCurrentPosition() const = 0;
     /*! \brief read the next frame, return NDArray */
     virtual runtime::NDArray NextFrame() = 0;
+    /*! \brief read the next frame and return only the ROI rectangle
+     *  (half-open [x1,x2) x [y1,y2)); GPU path copies only the ROI to host,
+     *  CPU / invalid ROI falls back to the full frame */
+    virtual runtime::NDArray NextFrameRoi(int x1, int y1, int x2, int y2) = 0;
     /*! \brief retrieve keyframe indices */
     virtual runtime::NDArray GetKeyIndices() = 0;
     /*! \brief retrieve playback seconds by frame indices */
     virtual runtime::NDArray GetFramePTS() const = 0;
-    /*! \brief read bulk frames, defined by indices */
-    virtual runtime::NDArray GetBatch(std::vector<int64_t> indices, runtime::NDArray buf) = 0;
+    /*! \brief read bulk frames, defined by indices; optional ROI crops each
+     *  frame (x1<0 = full frames, historical behaviour) */
+    virtual runtime::NDArray GetBatch(std::vector<int64_t> indices,
+                                      runtime::NDArray buf,
+                                      int x1 = -1, int y1 = -1,
+                                      int x2 = -1, int y2 = -1) = 0;
     /*! \brief skip certain frames without decoding */
     virtual void SkipFrames(int64_t num = 1) = 0;
     /*! \brief get average fps */
     virtual double GetAverageFPS() const = 0;
     /*! \brief get rotation */
     virtual double GetRotation() const = 0;
+    /*! \brief get video codec name (e.g. h264, hevc) */
+    virtual std::string GetCodec() const = 0;
     /*! \brief destructor */
     virtual ~VideoReaderInterface() = default;
 
@@ -87,7 +97,7 @@ class VideoReaderInterface {
 };  // class VideoReader
 
 
-DECORD_DLL VideoReaderPtr GetVideoReader(std::string fname, DLContext ctx,
+DECORD_DLL VideoReaderPtr GetVideoReader(std::string fname, DLDevice ctx,
                                          int width=-1, int height=-1, int nb_thread=0,
                                          int io_type=kNormal);
 

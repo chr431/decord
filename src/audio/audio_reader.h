@@ -13,7 +13,7 @@ namespace decord {
 
     class AudioReader: public AudioReaderInterface {
     public:
-        AudioReader(std::string fn, int sampleRate, DLContext ctx, int io_type=kNormal, bool mono=true);
+        AudioReader(std::string fn, int sampleRate, DLDevice ctx, int io_type=kNormal, bool mono=true);
         ~AudioReader();
         NDArray GetNDArray();
         int GetNumPaddingSamples();
@@ -30,7 +30,7 @@ namespace decord {
         void ToNDArray();
         void SaveToVector(float** buffer, int numChannels, int numSamples);
 
-        DLContext ctx;
+        DLDevice ctx;
         std::unique_ptr<ffmpeg::AVIOBytesContext> io_ctx_;  // avio context for raw memory access
         AVFormatContext *pFormatContext;
         struct SwrContext* swr;

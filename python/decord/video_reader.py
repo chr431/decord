@@ -41,7 +41,11 @@ class VideoReader(object):
 
 
     """
-    def __init__(self, uri, ctx=cpu(0), width=-1, height=-1, num_threads=0, fault_tol=-1):
+    def __init__(self, uri, ctx=cpu(0), width=-1, height=-1, num_threads=0, fault_tol=-1,
+                 output_format='rgb'):
+        if output_format not in ('rgb', 'gray'):
+            raise ValueError("output_format must be 'rgb' or 'gray'")
+        self._output_format = 1 if output_format == 'gray' else 0
         self._handle = None
         assert isinstance(ctx, DECORDContext)
         fault_tol = str(fault_tol)
@@ -49,10 +53,12 @@ class VideoReader(object):
             ba = bytearray(uri.read())
             uri = '{} bytes'.format(len(ba))
             self._handle = _CAPI_VideoReaderGetVideoReader(
-                ba, ctx.device_type, ctx.device_id, width, height, num_threads, 2, fault_tol)
+                ba, ctx.device_type, ctx.device_id, width, height, num_threads, 2, fault_tol,
+                self._output_format)
         else:
             self._handle = _CAPI_VideoReaderGetVideoReader(
-                uri, ctx.device_type, ctx.device_id, width, height, num_threads, 0, fault_tol)
+                uri, ctx.device_type, ctx.device_id, width, height, num_threads, 0, fault_tol,
+                self._output_format)
         if self._handle is None:
             raise RuntimeError("Error reading " + uri + "...")
         self._num_frame = _CAPI_VideoReaderGetFrameCount(self._handle)
@@ -104,17 +110,59 @@ class VideoReader(object):
         self.seek_accurate(idx)
         return self.next()
 
-    def next(self):
+    def next(self, roi=None):
         """Grab the next frame.
+
+        Parameters
+        ----------
+        roi : tuple of 4 ints or None
+            Optional half-open ROI ``(x1, y1, x2, y2)`` in full-frame pixel
+            coordinates.  When given, only the ROI rectangle is returned
+            (shape ``(y2 - y1, x2 - x1, 3)``; on the GPU path only the ROI
+            is copied from device memory, avoiding a full-frame D2H copy).
+            ``None`` (default) returns the full frame.
 
         Returns
         -------
         ndarray
-            Frame with shape HxWx3.
+            Frame with shape HxWx3 (full) or (y2-y1) x (x2-x1) x 3 (ROI).
 
         """
         assert self._handle is not None
-        arr = _CAPI_VideoReaderNextFrame(self._handle)
+        if roi is not None:
+            x1, y1, x2, y2 = (int(v) for v in roi)
+            arr = _CAPI_VideoReaderNextFrameRoi(
+                self._handle, x1, y1, x2, y2)
+        else:
+            arr = _CAPI_VideoReaderNextFrame(self._handle)
+        if not arr.shape:
+            raise StopIteration()
+        return bridge_out(arr)
+
+    def next_roi(self, x1, y1, x2, y2):
+        """Grab the next frame, returning only the ROI rectangle.
+
+        The ROI is half-open ``[x1, x2) x [y1, y2)`` (numpy slice semantics)
+        in full-frame pixel coordinates; the result is a host-side uint8
+        array of shape ``(y2 - y1, x2 - x1, 3)`` in the same RGB channel
+        order as ``next()``.  On the GPU path only the ROI is copied from
+        device memory, avoiding a full-frame D2H copy.  CPU builds and
+        invalid/empty ROIs return the full frame instead.
+
+        Parameters
+        ----------
+        x1, y1, x2, y2 : int
+            Half-open ROI bounds in the full frame.
+
+        Returns
+        -------
+        ndarray
+            ROI crop, shape (y2 - y1, x2 - x1, 3).
+
+        """
+        assert self._handle is not None
+        arr = _CAPI_VideoReaderNextFrameRoi(
+            self._handle, int(x1), int(y1), int(x2), int(y2))
         if not arr.shape:
             raise StopIteration()
         return bridge_out(arr)
@@ -147,14 +195,14 @@ class VideoReader(object):
         """
         assert self._handle is not None
         if isinstance(idx, slice):
-            idx = self.get_batch(range(*idx.indices(len(self))))
+            idx = range(*idx.indices(len(self)))
         idx = self._validate_indices(idx)
         if self._frame_pts is None:
             self._frame_pts = _CAPI_VideoReaderGetFramePTS(self._handle).asnumpy()
         return self._frame_pts[idx, :]
 
 
-    def get_batch(self, indices):
+    def get_batch(self, indices, roi=None):
         """Get entire batch of images. `get_batch` is optimized to handle seeking internally.
         Duplicate frame indices will be optmized by copying existing frames rather than decode
         from video again.
@@ -163,16 +211,27 @@ class VideoReader(object):
         ----------
         indices : list of integers
             A list of frame indices. If negative indices detected, the indices will be indexed from backward
+        roi : tuple of 4 ints or None
+            Optional half-open ROI ``(x1, y1, x2, y2)``; every frame is
+            cropped to the rectangle before the batch copy (batch shape
+            ``(N, y2-y1, x2-x1, 3)``).  ``None`` (default) returns full
+            frames, shape ``(N, H, W, 3)``.
 
         Returns
         -------
         ndarray
-            An entire batch of image frames with shape NxHxWx3, where N is the length of `indices`.
+            An entire batch of image frames with shape NxHxWx3 (or
+            Nx(y2-y1)x(x2-x1)x3 with roi), where N is the length of `indices`.
 
         """
         assert self._handle is not None
         indices = _nd.array(self._validate_indices(indices))
-        arr = _CAPI_VideoReaderGetBatch(self._handle, indices)
+        if roi is not None:
+            x1, y1, x2, y2 = (int(v) for v in roi)
+            arr = _CAPI_VideoReaderGetBatchRoi(
+                self._handle, indices, x1, y1, x2, y2)
+        else:
+            arr = _CAPI_VideoReaderGetBatch(self._handle, indices)
         return bridge_out(arr)
 
     def get_key_indices(self):
@@ -187,6 +246,17 @@ class VideoReader(object):
         if self._key_indices is None:
             self._key_indices = _CAPI_VideoReaderGetKeyIndices(self._handle).asnumpy().tolist()
         return self._key_indices
+
+    def get_codec(self):
+        """Get video codec name (e.g. h264, hevc).
+
+        Returns
+        -------
+        str
+            Codec name, or empty string if unavailable.
+
+        """
+        return _CAPI_VideoReaderGetCodec(self._handle)
 
     def get_avg_fps(self):
         """Get average FPS(frame per second).

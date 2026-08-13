@@ -52,17 +52,18 @@ Supported platforms:
 
 ### Install from source
 
+The build is driven by a `pyproject.toml` (scikit-build-core): `pip install`
+compiles the shared library with CMake and bundles it into the wheel, so
+no separate build step is needed.
+
 #### Linux
 
 Install the system packages for building the shared library, for Debian/Ubuntu users, run:
 
 ```bash
-# official PPA comes with ffmpeg 2.8, which lacks tons of features, we use ffmpeg 4.0 here
-sudo add-apt-repository ppa:jonathonf/ffmpeg-4 # for ubuntu20.04 official PPA is already version 4.2, you may skip this step
 sudo apt-get update
-sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake
-sudo apt-get install -y ffmpeg libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev
-# note: make sure you have cmake 3.8 or later, you can install from cmake official website if it's too old
+sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake ninja-build
+sudo apt-get install -y ffmpeg libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libswresample-dev
 ```
 
 Clone the repo recursively(important)
@@ -71,36 +72,124 @@ Clone the repo recursively(important)
 git clone --recursive https://github.com/dmlc/decord
 ```
 
-Build the shared library in source root directory:
+Install:
 
 ```bash
 cd decord
-mkdir build && cd build
-cmake .. -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release
-make
+pip install .
 ```
 
-you can specify `-DUSE_CUDA=ON` or `-DUSE_CUDA=/path/to/cuda` or `-DUSE_CUDA=ON` `-DCMAKE_CUDA_COMPILER=/path/to/cuda/nvcc` to enable NVDEC hardware accelerated decoding:
+If your FFmpeg is not found automatically, point CMake at it:
 
 ```bash
-cmake .. -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+FFMPEG_DIR=/path/to/ffmpeg pip install .
+```
+
+#### GPU (NVDEC) builds
+
+Enable CUDA at build time. CUDA and the NVIDIA Video Codec SDK are required:
+
+```bash
+# CPU-only:
+pip install . --config-settings='cmake.args=-DUSE_CUDA=0'
+
+# GPU (requires CUDA toolkit + Video Codec SDK; libnvcuvid must be found):
+pip install . --config-settings='cmake.args=-DUSE_CUDA=ON'
 ```
 
 Note that if you encountered the an issue with `libnvcuvid.so` (e.g., see [#102](https://github.com/dmlc/decord/issues/102)), it's probably due to the missing link for
 `libnvcuvid.so`, you can manually find it (`ldconfig -p | grep libnvcuvid`) and link the library to `CUDA_TOOLKIT_ROOT_DIR\lib64` to allow `decord` smoothly detect and link the correct library.
 
-To specify a customized FFMPEG library path, use `-DFFMPEG_DIR=/path/to/ffmpeg".
+To specify a customized FFMPEG library path, pass `-DFFMPEG_DIR=/path/to/ffmpeg` (or set the `FFMPEG_DIR` environment variable).
 
-Install python bindings:
+Editable development install (rebuilds on import):
 
 ```bash
-cd ../python
-# option 1: add python path to $PYTHONPATH, you will need to install numpy separately
-pwd=$PWD
-echo "PYTHONPATH=$PYTHONPATH:$pwd" >> ~/.bashrc
-source ~/.bashrc
-# option 2: install with setuptools
-python3 setup.py install --user
+FFMPEG_DIR=/path/to/ffmpeg pip install -e .
+```
+
+#### Windows
+
+Install CMake, Visual Studio (with C++ toolchain) and an FFmpeg build
+(>= 5.0) such as the ones from <https://www.gyan.dev/ffmpeg/builds/>.
+Then:
+
+```powershell
+$env:FFMPEG_DIR = "D:\path\to\ffmpeg"   # folder containing include/ and lib/
+pip install .
+```
+
+At runtime the FFmpeg shared libraries (`avcodec-*.dll` etc.) must be
+findable — either on `PATH` or next to `decord.dll` (the FFmpeg bin
+folder on `PATH` is the usual setup). The GPU (NVDEC) build requires the
+CUDA toolkit and the NVIDIA Video Codec SDK:
+
+```powershell
+pip install . --config-settings="cmake.args=-DUSE_CUDA=ON;-DFFMPEG_DIR=D:\path\to\ffmpeg"
+```
+
+#### Development build (build/ + PYTHONPATH)
+
+For hacking on decord itself, build the shared library with CMake and run
+the python package in place — `decord/_ffi/libinfo.py` finds the library
+in `build/` (or `build/Release` on Windows):
+
+```bash
+# Linux / macOS
+cmake -S . -B build -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release -DFFMPEG_DIR=/path/to/ffmpeg
+cmake --build build -j$(nproc)
+
+# Windows (CUDA enabled; omit -DUSE_CUDA=ON for CPU-only)
+cmake -S . -B build -DUSE_CUDA=ON -DFFMPEG_DIR=D:/path/to/ffmpeg
+cmake --build build --config Release
+```
+
+Then run the python bindings against the freshly built library (no pip
+install needed):
+
+```bash
+PYTHONPATH=python python -c "from decord import VideoReader; print(len(VideoReader('examples/flipping_a_pancake.mkv')))"
+```
+
+Set `DECORD_LIBRARY_PATH` to point at the shared library if it lives
+somewhere else.  Useful build options: `-DUSE_CUDA=ON|OFF` (NVDEC),
+`-DFFMPEG_DIR=...` (custom FFmpeg), `-DDECORD_INSTALL_LIBDIR=...`
+(install destination for `cmake --install`).
+
+### Releases（本 fork）
+
+本 fork 是 RaceVideoToLog 的硬依赖（next_roi / get_codec / GPU 动态加载 /
+CPU 内存修复），**不依赖 PyPI decord**。版本与发布遵循：
+
+- **版本号**：SemVer `X.Y.Z`，单一事实源为
+  `python/decord/_ffi/libinfo.py` 的 `__version__`。`python/setup.py` 与
+  `python/decord/__init__.py` 都从这里派生，改版本只动这一处。
+- **tag 约定**：`v<X.Y.Z>`（如 `v0.7.0`）。
+- **发布产物**：GitHub Release 的 `decord-<ver>-win64-gpu.zip`，内含
+  `_decord_build/` 布局 —— `decord.dll` + FFmpeg 8.1 DLLs + `ffprobe.exe`
+  + `python/decord/`。解压即得 RaceVideoToLog 的 `_decord_build/` 目录，
+  `setup_venv.bat` 直接拷贝。
+
+#### 发布流程（一键）
+
+在 GitHub Actions → **Release** → Run workflow：
+
+1. `version`：要发布的版本号（如 `0.7.0`），会自动打 tag `v0.7.0`
+2. `ref`：默认 `feat/perf-deep`（可改为其它分支）
+
+workflow 会依次：校验版本格式 + tag 不重复 → 安装 CUDA Toolkit +
+下载 BtbN FFmpeg 8.1 → CMake GPU 构建 → 若 `libinfo.py` 版本不符则升版本并
+commit+push → 打 tag → 打包 zip → 创建 Release（notes = 自上一 tag 的
+commit 列表）并上传 zip。**构建失败不会产生任何 commit/tag/release**。
+
+#### 手动构建（无 GitHub 时）
+
+```bash
+# CUDA 路径必须用正斜杠（反斜杠会被 CMake 当转义序列）
+cmake -S . -B build -DUSE_CUDA="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" \
+      -DFFMPEG_DIR="D:/path/to/ffmpeg-8.1" -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+# 产物: build/Release/decord.dll（FFmpeg DLLs 需与 decord.dll 同目录）
 ```
 
 #### Mac OS
@@ -147,25 +236,6 @@ echo "PYTHONPATH=$PYTHONPATH:$pwd" >> ~/.bash_profile
 source ~/.bash_profile
 # option 2: install with setuptools
 python3 setup.py install --user
-```
-
-#### Windows
-
-For windows, you will need CMake and Visual Studio for C++ compilation.
-
--   First, install `git`, `cmake`, `ffmpeg` and `python`. You can use [Chocolatey](https://chocolatey.org/) to manage packages similar to Linux/Mac OS.
--   Second, install [`Visual Studio 2017 Community`](https://visualstudio.microsoft.com/), this my take some time.
-
-When dependencies are ready, open command line prompt:
-
-```bash
-cd your-workspace
-git clone --recursive https://github.com/dmlc/decord
-cd decord
-mkdir build
-cd build
-cmake -DCMAKE_CXX_FLAGS="/DDECORD_EXPORTS" -DCMAKE_CONFIGURATION_TYPES="Release" -G "Visual Studio 15 2017 Win64" ..
-# open `decord.sln` and build project
 ```
 
 ## Usage

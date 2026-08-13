@@ -57,17 +57,25 @@ if(MSVC)
     endforeach(flag_var)
   endif()
 else(MSVC)
-  include(CheckCXXCompilerFlag)
-  check_cxx_compiler_flag("-std=c++11"    SUPPORT_CXX11)
-  #set(CMAKE_CUDA_FLAGS "-std=c++11 ${CMAKE_CUDA_FLAGS}")
+  # Default to Release unless a build type was explicitly requested. With an
+  # empty build type the old code path below used to inject "-O0 -g" into the
+  # C++ flags, silently producing unoptimized binaries.
+  if(NOT CMAKE_BUILD_TYPE)
+    message(STATUS "No CMAKE_BUILD_TYPE specified, defaulting to Release")
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+  endif()
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
   if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
     message(STATUS "Build in Debug mode")
     set(CMAKE_C_FLAGS "-O0 -g -Wall -fPIC ${CMAKE_C_FLAGS}")
     set(CMAKE_CXX_FLAGS "-O0 -g -Wall -fPIC -std=c++11 ${CMAKE_CXX_FLAGS}")
   else()
-    set(CMAKE_C_FLAGS "-O2 -Wall -fPIC -fvisibility=hidden ${CMAKE_C_FLAGS}")
-    set(CMAKE_CXX_FLAGS "-O0 -g -Wall -fPIC -std=c++11 ${CMAKE_CXX_FLAGS}")
+    # No -O flag here on purpose: CMake appends the per-config flags
+    # (-O3 -DNDEBUG for Release) after these, which is where optimization
+    # belongs. Hardcoding -O0 in this branch silently disabled optimization
+    # for builds without a CMAKE_BUILD_TYPE.
+    set(CMAKE_C_FLAGS "-Wall -fPIC -fvisibility=hidden ${CMAKE_C_FLAGS}")
+    set(CMAKE_CXX_FLAGS "-Wall -fPIC -std=c++11 ${CMAKE_CXX_FLAGS}")
   endif ()
   if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
     set(CMAKE_CXX_FLAGS "-Wno-unknown-pragmas ${CMAKE_CXX_FLAGS}")
@@ -94,6 +102,18 @@ include(cmake/modules/CUDA.cmake)
 # Targets
 
 add_library(decord SHARED ${DECORD_CORE_SRCS} ${DECORD_FFMPEG_SRCS} ${NVDEC_SRCS} ${RUNTIME_CUDA_SRCS} ${NVDEC_CUDA_SRCS})
+
+# Windows: copy the FFmpeg runtime DLLs next to the built decord.dll so the
+# development build runs out of the box (libinfo.py loads decord.dll from
+# build/Release, whose directory must contain the FFmpeg dependencies).
+if(WIN32 AND FFMPEG_DIR)
+  file(GLOB DECORD_FFMPEG_RUNTIME_DLLS "${FFMPEG_DIR}/bin/*.dll")
+  if(DECORD_FFMPEG_RUNTIME_DLLS)
+    add_custom_command(TARGET decord POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              ${DECORD_FFMPEG_RUNTIME_DLLS} $<TARGET_FILE_DIR:decord>)
+  endif()
+endif()
 
 # target_compile_features(decord PUBLIC cxx_std_11)
 
@@ -132,4 +152,15 @@ if(GTEST_LIB)
 endif()
 
 # Installation rules
-install(TARGETS decord DESTINATION lib${LIB_SUFFIX})
+# The library installs into the python package directory by default so that
+# wheels built with scikit-build-core (see pyproject.toml) and plain
+# `cmake --install` both place libdecord next to the python code, where
+# decord/_ffi/libinfo.py searches for it.  Override the destination with
+# -DDECORD_INSTALL_LIBDIR=... if a plain library install is wanted.
+if(NOT DEFINED DECORD_INSTALL_LIBDIR)
+  set(DECORD_INSTALL_LIBDIR decord)
+endif()
+install(TARGETS decord
+  LIBRARY DESTINATION ${DECORD_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${DECORD_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${DECORD_INSTALL_LIBDIR})

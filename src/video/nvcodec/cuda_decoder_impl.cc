@@ -73,7 +73,7 @@ CUVideoDecoderImpl::CUVideoDecoderImpl(CUvideodecoder decoder)
 
 CUVideoDecoderImpl::~CUVideoDecoderImpl() {
     if (initialized_) {
-        CHECK_CUDA_CALL(cuvidDestroyDecoder(decoder_));
+        CHECK_CUDA_CALL(nv::cuvidDestroyDecoder(decoder_));
     }
 }
 
@@ -85,7 +85,7 @@ CUVideoDecoderImpl::CUVideoDecoderImpl(CUVideoDecoderImpl&& other)
 
 CUVideoDecoderImpl& CUVideoDecoderImpl::operator=(CUVideoDecoderImpl&& other) {
     if (initialized_) {
-        CHECK_CUDA_CALL(cuvidDestroyDecoder(decoder_));
+        CHECK_CUDA_CALL(nv::cuvidDestroyDecoder(decoder_));
     }
     decoder_ = other.decoder_;
     initialized_ = other.initialized_;
@@ -123,7 +123,7 @@ int CUVideoDecoderImpl::Initialize(CUVIDEOFORMAT* format) {
     caps.eCodecType = format->codec;
     caps.eChromaFormat = format->chroma_format;
     caps.nBitDepthMinus8 = format->bit_depth_luma_minus8;
-    if (CHECK_CUDA_CALL(cuvidGetDecoderCaps(&caps))) {
+    if (CHECK_CUDA_CALL(nv::cuvidGetDecoderCaps(&caps))) {
         if (!caps.bIsSupported) {
             std::stringstream ss;
             ss << "Unsupported Codec " << GetVideoCodecString(format->codec)
@@ -156,9 +156,17 @@ int CUVideoDecoderImpl::Initialize(CUVIDEOFORMAT* format) {
     decoder_info_.ulHeight = format->coded_height;
     decoder_info_.ulNumDecodeSurfaces = 20;
     decoder_info_.ChromaFormat = format->chroma_format;
-    decoder_info_.OutputFormat = cudaVideoSurfaceFormat_NV12;
+    // 8-bit content uses NV12; 10-bit and above needs the 16-bit P016
+    // surface format (the kernel and textures normalize both to [0, 1]).
+    decoder_info_.OutputFormat = format->bit_depth_luma_minus8 > 0
+        ? cudaVideoSurfaceFormat_P016
+        : cudaVideoSurfaceFormat_NV12;
     decoder_info_.bitDepthMinus8 = format->bit_depth_luma_minus8; // in ffmpeg but not sample
-    decoder_info_.DeinterlaceMode = cudaVideoDeinterlaceMode_Adaptive;
+    // Deinterlace: for progressive content, use Weave (passthrough) to
+    // avoid unnecessary processing overhead.
+    decoder_info_.DeinterlaceMode = format->progressive_sequence
+        ? cudaVideoDeinterlaceMode_Weave
+        : cudaVideoDeinterlaceMode_Adaptive;
     decoder_info_.ulTargetWidth = format->display_area.right - format->display_area.left;
     decoder_info_.ulTargetHeight = format->display_area.bottom - format->display_area.top;
 
@@ -173,7 +181,7 @@ int CUVideoDecoderImpl::Initialize(CUVIDEOFORMAT* format) {
     decoder_info_.ulCreationFlags = cudaVideoCreate_PreferCUVID;
     decoder_info_.vidLock = nullptr;
 
-    if (CHECK_CUDA_CALL(cuvidCreateDecoder(&decoder_, &decoder_info_))) {
+    if (CHECK_CUDA_CALL(nv::cuvidCreateDecoder(&decoder_, &decoder_info_))) {
         initialized_ = true;
     } else {
         LOG(FATAL) << "Problem creating video decoder";
@@ -195,6 +203,10 @@ uint16_t CUVideoDecoderImpl::Width() const {
 
 uint16_t CUVideoDecoderImpl::Height() const {
     return static_cast<uint16_t>(decoder_info_.ulTargetHeight);
+}
+
+int CUVideoDecoderImpl::BitDepth() const {
+    return decoder_info_.bitDepthMinus8 + 8;
 }
 
 }  // namespace cuda

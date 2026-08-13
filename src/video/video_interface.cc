@@ -17,7 +17,7 @@
 
 namespace decord {
 
-VideoReaderPtr GetVideoReader(std::string fn, DLContext ctx, int width, int height, int nb_thread,
+VideoReaderPtr GetVideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread,
                               int io_type, std::string fault_tol) {
     std::shared_ptr<VideoReaderInterface> ptr;
     ptr = std::make_shared<VideoReader>(fn, ctx, width, height, nb_thread, io_type, fault_tol);
@@ -35,10 +35,14 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetVideoReader")
     int num_thread = args[5];
     int io_type = args[6];
     std::string fault_tol = args[7];
-    DLContext ctx;
+    // output_format: 0 = RGB (default), 1 = GRAY8 (1 channel, CPU path)
+    int output_format = 0;
+    try { output_format = args[8]; } catch (...) { output_format = 0; }
+    DLDevice ctx;
     ctx.device_type = static_cast<DLDeviceType>(device_type);
     ctx.device_id = device_id;
-    auto reader = new VideoReader(fn, ctx, width, height, num_thread, io_type, fault_tol);
+    auto reader = new VideoReader(fn, ctx, width, height, num_thread, io_type,
+                                  fault_tol, output_format);
     if (reader->GetFrameCount() <= 0) {
       *rv = nullptr;
       return;
@@ -51,6 +55,15 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderNextFrame")
 .set_body([] (DECORDArgs args, DECORDRetValue* rv) {
     VideoReaderInterfaceHandle handle = args[0];
     NDArray arr = static_cast<VideoReaderInterface*>(handle)->NextFrame();
+    *rv = arr;
+  });
+
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderNextFrameRoi")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    int x1 = args[1], y1 = args[2], x2 = args[3], y2 = args[4];
+    NDArray arr = static_cast<VideoReaderInterface*>(handle)
+        ->NextFrameRoi(x1, y1, x2, y2);
     *rv = arr;
   });
 
@@ -92,6 +105,18 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetBatch")
     *rv = ret;
   });
 
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetBatchRoi")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    NDArray indices = args[1];
+    int x1 = args[2], y1 = args[3], x2 = args[4], y2 = args[5];
+    std::vector<int64_t> int_indices;
+    indices.CopyTo(int_indices);
+    NDArray ret = static_cast<VideoReaderInterface*>(handle)
+        ->GetBatch(int_indices, NDArray(), x1, y1, x2, y2);
+    *rv = ret;
+  });
+
 DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderSeek")
 .set_body([] (DECORDArgs args, DECORDRetValue* rv) {
     VideoReaderInterfaceHandle handle = args[0];
@@ -120,6 +145,13 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetAverageFPS")
     VideoReaderInterfaceHandle handle = args[0];
     double fps = static_cast<VideoReaderInterface*>(handle)->GetAverageFPS();
     *rv = fps;
+  });
+
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetCodec")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    std::string codec = static_cast<VideoReaderInterface*>(handle)->GetCodec();
+    *rv = codec;
   });
 
 DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderFree")
@@ -153,12 +185,12 @@ DECORD_REGISTER_GLOBAL("video_loader._CAPI_VideoLoaderGetVideoLoader")
     device_types.CopyTo(dev_types);
     std::vector<long int> dev_ids;
     device_ids.CopyTo(dev_ids);
-    std::vector<DLContext> ctxs;
+    std::vector<DLDevice> ctxs;
     ctxs.reserve(dev_ids.size());
     CHECK(dev_types.size() > 0);
     CHECK_EQ(dev_types.size(), dev_ids.size());
     for (std::size_t i = 0; i < dev_types.size(); ++i) {
-      DLContext ctx;
+      DLDevice ctx;
       ctx.device_type = static_cast<DLDeviceType>(dev_types[i]);
       ctx.device_id = static_cast<int>(dev_ids[i]);
       ctxs.emplace_back(ctx);

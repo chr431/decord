@@ -5,6 +5,7 @@
  */
 
 #include "filter_graph.h"
+#include <thread>
 
 #include <dmlc/logging.h>
 
@@ -40,9 +41,36 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx)
 	// AVBufferSinkParams *buffersink_params;
 
 	filter_graph_.reset(avfilter_graph_alloc());
-	/* set threads to 1, details see https://github.com/dmlc/decord/pull/63 */
-	//LOG(INFO) << "Original GraphFilter nb_threads: " << filter_graph_->nb_threads;
-	filter_graph_->nb_threads = 1;
+	/* nb_threads: 0 = auto.  Auto is faster for standalone decode (878fps
+	 * vs 1-thread), but in a decode/OCR pipeline it competes with the ONNX
+	 * inference threads for cores and ends up slower overall (measured
+	 * 133fps -> 87fps in-pipeline).  Single-threaded scale is the safer
+	 * choice for the pipeline case (dmlc/decord PR #63 rationale).
+	 *
+	 * 2026-08: the old in-pipeline measurement predates the pipelined
+	 * send/receive loop; with prefetch + non-blocking receive the scale
+	 * (sws_scale YUV->RGB) became the serial per-frame cost (~0.8ms @1080p
+	 * on one thread).  Default scales with the logical CPU count
+	 * (clamp(hw/16, 1, 4)): 16-core machines stay at 1 slice thread (the
+	 * decode/OCR pipeline optimum; 4 threads measured slower in-pipeline),
+	 * machines with spare cores get a little sws parallelism.
+	 * DECORD_FILTER_THREADS overrides (0 = auto = all cores; 4 = four
+	 * slice threads; 1 = historical single-thread). */
+	int filter_threads = []() {
+		unsigned hw = std::thread::hardware_concurrency();
+		if (hw == 0) hw = 8;
+		int n = static_cast<int>(hw) / 16;
+		return std::max(1, std::min(n, 4));
+	}();
+	const char *env_ft = getenv("DECORD_FILTER_THREADS");
+	if (env_ft != nullptr && *env_ft != '\0') {
+		try {
+			filter_threads = std::stoi(env_ft);
+		} catch (const std::exception &) {
+			filter_threads = 4;
+		}
+	}
+	filter_graph_->nb_threads = filter_threads;
     /* buffer video source: the decoded frames from the decoder will be inserted here. */
 	std::snprintf(args, sizeof(args),
             "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
@@ -70,7 +98,16 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx)
 	// av_free(buffersink_params);
     // LOG(INFO) << "create filter sink";
     // CHECK_GE(av_opt_set_bin(buffersink_ctx_, "pix_fmts", (uint8_t *)&pix_fmts, sizeof(AV_PIX_FMT_RGB24), AV_OPT_SEARCH_CHILDREN), 0) << "Set bin error";
-    CHECK_GE(av_opt_set_int_list(buffersink_ctx_, "pix_fmts", pix_fmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN), 0) << "Set output pixel format error.";
+#if LIBAVFILTER_VERSION_INT >= AV_VERSION_INT(11, 0, 0)
+    // FFmpeg 8+: pixel_formats option is AV_OPT_TYPE_PIXEL_FMT, not binary.
+    // Since our filter chain always outputs RGB24 via the scale filter,
+    // the buffersink will naturally receive RGB24 without explicit constraint.
+    (void)pix_fmts;
+#else
+    CHECK_GE(av_opt_set_int_list(buffersink_ctx_, "pix_fmts", pix_fmts,
+                                 AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN), 0)
+        << "Set output pixel format error.";
+#endif
 
     // LOG(INFO) << "create filter set opt";
     /* Endpoints for the filter graph. */

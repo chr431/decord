@@ -7,7 +7,7 @@
 #ifndef DECORD_VIDEO_NVCODEC_CUDA_CONTEXT_H
 #define DECORD_VIDEO_NVCODEC_CUDA_CONTEXT_H
 
-#include <cuda.h>
+#include "nv_gpu_dyn.h"
 
 namespace decord {
 namespace cuda {

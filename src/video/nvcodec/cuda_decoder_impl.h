@@ -7,7 +7,7 @@
 #ifndef DECORD_VIDEO_NVCODEC_CUDA_DECODER_IMPL_H_
 #define DECORD_VIDEO_NVCODEC_CUDA_DECODER_IMPL_H_
 
-#include "nvcuvid/nvcuvid.h"
+#include "nv_gpu_dyn.h"
 #include <stdint.h>
 
 namespace decord {
@@ -33,6 +33,8 @@ class CUVideoDecoderImpl {
 
     uint16_t Width() const;
     uint16_t Height() const;
+    /*! \brief Bit depth of the decoded output (8, 10, 12, ...). */
+    int BitDepth() const;
 
   private:
     CUvideodecoder decoder_;

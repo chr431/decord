@@ -132,6 +132,47 @@ def from_dlpack(dltensor):
     return _from_dlpack(dltensor)
 
 
+# ═══════════════ DLPack export support (see NDArrayBase.__dlpack__) ═══════════════
+
+class _DLPackHolder:
+    """Owns everything backing an exported DLManagedTensor.
+
+    The holder is registered in _DLPACK_HOLDERS under the address of its
+    DLManagedTensor; the deleter callback (invoked by numpy once the
+    produced array is garbage collected) removes it, dropping the reference
+    to the source NDArray and the DLManagedTensor memory.
+    """
+    __slots__ = ("ndarray", "dlm")
+
+
+class _DLManagedTensor(ctypes.Structure):
+    """DLPack DLManagedTensor (DLTensor + manager_ctx + deleter)."""
+    _fields_ = [
+        ("dl_tensor", DECORDArray),
+        ("manager_ctx", ctypes.c_void_p),
+        ("deleter", ctypes.c_void_p),
+    ]
+
+
+_DLPACK_HOLDERS: dict = {}
+
+
+def _dlpack_deleter(addr):
+    holder = _DLPACK_HOLDERS.pop(addr, None)
+    if holder is None:
+        return
+    holder.ndarray = None
+    holder.dlm = None
+
+
+_DLPACK_DELETER = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(_dlpack_deleter)
+# 64-bit pointer safety for the Python C API call below; restype py_object
+# so ctypes adopts the new reference returned by PyCapsule_New.
+ctypes.pythonapi.PyCapsule_New.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
+
+
 class NDArrayBase(_NDArrayBase):
     """A simple Device/CPU Array object in runtime."""
     @property
@@ -262,6 +303,61 @@ class NDArrayBase(_NDArrayBase):
         nbytes = ctypes.c_size_t(np_arr.size * np_arr.dtype.itemsize)
         check_call(_LIB.DECORDArrayCopyToBytes(self.handle, data, nbytes))
         return np_arr
+
+    # ═══════════════ DLPack zero-copy export (numpy 2.x protocol) ═══════════════
+    # np.from_dlpack(arr) → zero-copy view of the decord buffer.  The view
+    # references this NDArray (kept alive by _DLPACK_HOLDERS); when numpy
+    # releases it, the deleter drops the reference and the buffer returns to
+    # its pool / is freed.  CPU arrays only — GPU arrays must go through
+    # next_roi (D2H ROI copy), numpy has no CUDA support in from_dlpack.
+    def __dlpack_device__(self):
+        """DLPack device tuple (device_type, device_id), numpy protocol."""
+        ctx = self.ctx
+        return (int(ctx.device_type), int(ctx.device_id))
+
+    def __dlpack__(self, stream=None):
+        """Export as a DLManagedTensor capsule (numpy 2.x protocol).
+
+        Returns a PyCapsule named "dltensor" wrapping a DLManagedTensor that
+        aliases this array's buffer.  The capsule (and the produced numpy
+        view) keep the source NDArray alive until released.
+        """
+        if stream not in (None, 0):
+            raise ValueError("decord NDArray supports only stream=None")
+        ctx = self.ctx
+        if int(ctx.device_type) != 1:  # kDLCpu
+            raise RuntimeError(
+                "__dlpack__ supports CPU arrays only (got device type {}); "
+                "use next_roi() for GPU frames".format(ctx.device_type))
+        if self.handle is None or not self.handle.contents.data:
+            raise RuntimeError("cannot export an empty NDArray via __dlpack__")
+        t = DECORDType(self.dtype)
+        if t.lanes > 1:
+            raise RuntimeError("__dlpack__ does not support vector lanes")
+
+        # DLManagedTensor: DLTensor + manager_ctx + deleter.  The DLTensor is
+        # copied shallowly (pointers alias this array's buffers, which stay
+        # alive through the holder's reference to self).
+        dlm = _DLManagedTensor()
+        dlm.dl_tensor = self.handle.contents
+        dlm.manager_ctx = ctypes.c_void_p(0)
+        addr = ctypes.addressof(dlm)
+        holder = _DLPackHolder()
+        holder.ndarray = self
+        holder.dlm = dlm
+        _DLPACK_HOLDERS[addr] = holder
+        dlm.deleter = ctypes.cast(_DLPACK_DELETER, ctypes.c_void_p)
+        # Capsule destructor must be NULL: per the DLPack protocol the
+        # consumer (numpy) owns the release and calls dlmt->deleter when
+        # the produced array is GC'd.  A capsule destructor here would free
+        # the buffer while numpy still aliases it.
+        capsule = ctypes.pythonapi.PyCapsule_New(
+            ctypes.c_void_p(addr), ctypes.c_char_p(b"dltensor"),
+            ctypes.c_void_p())
+        if not capsule:
+            _DLPACK_HOLDERS.pop(addr, None)
+            raise RuntimeError("PyCapsule_New failed")
+        return capsule
 
     def copyto(self, target):
         """Copy array to target

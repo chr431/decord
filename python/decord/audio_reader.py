@@ -141,6 +141,20 @@ class AudioReader(object):
             self._num_padding = _CAPI_AudioReaderGetNumPaddingSamples(self._handle)
         return self._num_padding
 
+    @property
+    def _effective_sample_rate(self):
+        """Sample rate of the decoded samples.
+
+        When a target rate was requested it is used directly. Otherwise no
+        resampling happened, so the original track rate is derived from the
+        reported duration (seconds) and the decoded sample count.
+        """
+        if self.sample_rate != -1:
+            return float(self.sample_rate)
+        if self._duration > 0:
+            return float(self._num_samples_per_channel) / self._duration
+        return 1.0
+
     def add_padding(self):
         """Pad the audio samples so that it starts at time 0.
 
@@ -150,9 +164,10 @@ class AudioReader(object):
             Number of samples padded
 
         """
-        self._array = np.pad(self._array, ((0, 0), (self.__get_num_padding(), 0)), 'constant', constant_values=0)
-        self._duration += self.__get_num_padding() * self.sample_rate
-        return self.__get_num_padding()
+        num_padding = self.__get_num_padding()
+        self._array = np.pad(self._array, ((0, 0), (num_padding, 0)), 'constant', constant_values=0)
+        self._duration += num_padding / self._effective_sample_rate
+        return num_padding
 
     def get_info(self):
         """Log out the basic info about the audio stream."""
@@ -160,7 +175,7 @@ class AudioReader(object):
 
     def _time_to_sample(self, timestamp):
         """Convert time in seconds to sample index"""
-        return math.ceil(timestamp * self.sample_rate)
+        return math.ceil(timestamp * self._effective_sample_rate)
         
     def _times_to_samples(self, timestamps):
         """Convert times in seconds to sample indices"""

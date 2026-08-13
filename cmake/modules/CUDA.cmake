@@ -29,20 +29,20 @@ if(USE_CUDA)
   if(NOT CUDA_FOUND)
     message(FATAL_ERROR "Cannot find CUDA, USE_CUDA=" ${USE_CUDA})
   endif()
-  if(NOT CUDA_NVCUVID_LIBRARY)
-    message(FATAL_ERROR "Cannot find libnvcuvid, you may need to manually register and download at https://developer.nvidia.com/nvidia-video-codec-sdk. Then copy libnvcuvid to cuda_toolkit_root/lib64/" )
-  endif()
-  message(STATUS "Build with CUDA support")
+  # 不再链接 nvml.lib / nvcuvid.lib（Video Codec SDK）：
+  # CUDA 驱动 API / NVCUVID / NVML 全部改为运行时动态加载（nv_gpu_dyn.cc），
+  # decord.dll 导入表不再依赖驱动 DLL → 无 NVIDIA 驱动设备可正常加载并
+  # 回退 CPU 解码。nvcuvid.h 头文件由仓库自带（src/video/nvcodec/nvcuvid/）。
+  message(STATUS "Build with CUDA support (GPU APIs dynamically loaded)")
   file(GLOB RUNTIME_CUDA_SRCS src/runtime/cuda/*.cc)
   file(GLOB NVDEC_SRCS src/video/nvcodec/*.cc)
   file(GLOB NVDEC_CUDA_SRCS src/improc/*.cu)
 
-  list(APPEND DECORD_LINKER_LIBS ${CUDA_NVRTC_LIBRARY})
+  # No NVRTC: the driver API, NVCUVID and NVML are all loaded at runtime
+  # (nv_gpu_dyn.cc); nothing references NVRTC symbols, and linking its
+  # import library would add a dead nvrtc64_*.dll dependency.
   list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_CUDART_LIBRARY})
   list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_CUDA_LIBRARY})
-  list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_NVRTC_LIBRARY})
-  list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_NVIDIA_ML_LIBRARY})
-  list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_NVCUVID_LIBRARY})
 
 else(USE_CUDA)
   message(STATUS "CUDA disabled, no nvdec capabilities will be enabled...")

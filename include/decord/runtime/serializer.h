@@ -2,7 +2,7 @@
  *  Copyright (c) 2019 by Contributors if not otherwise specified
  * \file decord/runtime/serializer.h
  * \brief Serializer extension to support DECORD data types
- *  Include this file to enable serialization of DLDataType, DLContext
+ *  Include this file to enable serialization of DLDataType, DLDevice
  */
 #ifndef DECORD_RUNTIME_SERIALIZER_H_
 #define DECORD_RUNTIME_SERIALIZER_H_
@@ -31,13 +31,13 @@ struct Handler<DLDataType> {
 };
 
 template<>
-struct Handler<DLContext> {
-  inline static void Write(Stream *strm, const DLContext& ctx) {
+struct Handler<DLDevice> {
+  inline static void Write(Stream *strm, const DLDevice& ctx) {
     int32_t device_type = static_cast<int32_t>(ctx.device_type);
     Handler<int32_t>::Write(strm, device_type);
     Handler<int32_t>::Write(strm, ctx.device_id);
   }
-  inline static bool Read(Stream *strm, DLContext* ctx) {
+  inline static bool Read(Stream *strm, DLDevice* ctx) {
     int32_t device_type = 0;
     if (!Handler<int32_t>::Read(strm, &(device_type))) return false;
     ctx->device_type = static_cast<DLDeviceType>(device_type);

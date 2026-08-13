@@ -27,7 +27,6 @@ namespace decord {
 namespace cuda {
 
 class CUThreadedDecoder final : public ThreadedDecoderInterface {
-    constexpr static int kMaxOutputSurfaces = 20;
     using NDArray = runtime::NDArray;
     using AVPacketPtr = ffmpeg::AVPacketPtr;
     using AVCodecContextPtr = ffmpeg::AVCodecContextPtr;
@@ -46,8 +45,8 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
     using FrameOrderQueuePtr = std::unique_ptr<FrameOrderQueue>;
 
     public:
-        CUThreadedDecoder(int device_id, AVCodecParameters *codecpar, AVInputFormat *iformat);
-        void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1, int rotation = 0);
+        CUThreadedDecoder(int device_id, AVCodecParameters *codecpar, const AVInputFormat *iformat);
+        void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1, int rotation = 0, int output_format = 0);
         bool Initialized() const;
         void Start();
         void Stop();
@@ -70,7 +69,7 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         void LaunchThreadImpl();
         void RecordInternalError(std::string message);
         void CheckErrorStatus();
-        void InitBitStreamFilter(AVCodecParameters *codecpar, AVInputFormat *iformat);
+        void InitBitStreamFilter(AVCodecParameters *codecpar, const AVInputFormat *iformat);
 
         int device_id_;
         CUStream stream_;
@@ -107,6 +106,10 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         std::mutex error_mutex_;
         std::atomic<bool> error_status_;
         std::string error_message_;
+        // packet-queue backpressure: Push() waits on this cv instead of
+        // busy-polling with a 1ns sleep when the queue exceeds the limit
+        std::mutex pkt_room_mutex_;
+        std::condition_variable pkt_room_cv_;
 
     DISALLOW_COPY_AND_ASSIGN(CUThreadedDecoder);
 };

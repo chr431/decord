@@ -7,7 +7,7 @@
 #ifndef DECORD_VIDEO_NVCODEC_CUDA_TEXTURE_H_
 #define DECORD_VIDEO_NVCODEC_CUDA_TEXTURE_H_
 
-#include "nvcuvid/nvcuvid.h"
+#include "nv_gpu_dyn.h"
 #include "../../runtime/cuda/cuda_common.h"
 
 #include <unordered_map>
@@ -79,12 +79,14 @@ struct CUImageTexture {
  */
 class CUTextureRegistry {
     public:
-        // Here we assume that a data pointer, scale method, chroma_up_method uniquely defines a texture
-        using TexID = std::tuple<uint8_t*, ScaleMethod, ChromaUpMethod>;
+        // Here we assume that a data pointer, scale method, chroma_up_method,
+        // and bit depth uniquely define a texture
+        using TexID = std::tuple<uint8_t*, ScaleMethod, ChromaUpMethod, int>;
         CUTextureRegistry();
         const CUImageTexture& GetTexture(uint8_t* ptr, unsigned int input_pitch,
                                          uint16_t input_width, uint16_t input_height,
-                                         ScaleMethod scale_method, ChromaUpMethod chroma_up_method);
+                                         ScaleMethod scale_method, ChromaUpMethod chroma_up_method,
+                                         int bit_depth = 8);
 
     private:
         struct TexHash {

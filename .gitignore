@@ -1,6 +1,6 @@
 # Custom ignored
 .vscode
-build/*
+build*/
 docs/_build
 .DS_Store
 __pycache__
@@ -43,3 +43,7 @@ __pycache__
 python/build/
 python/*egg-info/
 python/dist/
+test_video_long/
+
+# local release verification artifacts
+release_check/
