@@ -2,13 +2,12 @@ name: C/C++ CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, dev ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, dev ]
 
 jobs:
-  build:
-
+  build-linux:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,10 +15,43 @@ jobs:
       with:
         submodules: recursive
     - name: install dependencies
-      run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake ffmpeg libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libswresample-dev
+      run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake ninja-build ffmpeg libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libswresample-dev libgtest-dev
     - name: install test dependencies
       run: pip3 install pytest
     - name: install (scikit-build-core builds libdecord)
       run: pip3 install -e .
     - name: unit tests
       run: python3 -m pytest tests/python/unittests/ -v
+    - name: build gtest (C++ API compile check)
+      run: |
+        cmake -S /usr/src/googletest -B /tmp/gtest -DCMAKE_BUILD_TYPE=Release
+        cmake --build /tmp/gtest -j$(nproc)
+    - name: compile C++ tests (build only, exercises the C++ API surface)
+      run: |
+        GTEST_LIB=/tmp/gtest/lib cmake -S . -B build
+        cmake --build build --target cpptest -j$(nproc)
+
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Download FFmpeg 8.1 (shared, BtbN)
+      shell: pwsh
+      run: |
+        curl -L -o ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip
+        Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg
+        $ffdir = (Resolve-Path "ffmpeg/ffmpeg-n8.1-latest-win64-gpl-shared-8.1").Path
+        echo "FFMPEG_DIR=$ffdir" >> $env:GITHUB_ENV
+        echo "$ffdir/bin" >> $env:GITHUB_PATH
+    - name: install test dependencies
+      run: pip install pytest
+    - name: install (CPU build via scikit-build-core)
+      run: pip install . --config-settings='cmake.args=-DUSE_CUDA=0'
+    - name: unit tests
+      run: python -m pytest tests/python/unittests/ -q
