@@ -87,6 +87,11 @@ class CUDAThreadEntry {
  public:
   /*! \brief The cuda stream */
   cudaStream_t stream{nullptr};
+  /*! \brief dedicated non-blocking stream for CPU<->GPU copies; a
+   *  synchronous cudaMemcpy on the legacy default stream acts as a global
+   *  barrier with the decode stream, serialising each D2H with the decode
+   *  of subsequent frames */
+  cudaStream_t copy_stream{nullptr};
   /*! \brief thread local pool*/
   WorkspacePool pool;
   /*! \brief constructor */
