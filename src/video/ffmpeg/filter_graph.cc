@@ -12,9 +12,9 @@
 namespace decord {
 namespace ffmpeg {
 
-FFMPEGFilterGraph::FFMPEGFilterGraph(std::string filters_descr, AVCodecContext *dec_ctx)
+FFMPEGFilterGraph::FFMPEGFilterGraph(std::string filters_descr, AVCodecContext *dec_ctx, int output_format)
     : buffersink_ctx_(nullptr), buffersrc_ctx_(nullptr), filter_graph_(nullptr), count_(0) {
-    Init(filters_descr, dec_ctx);
+    Init(filters_descr, dec_ctx, output_format);
 }
 
 FFMPEGFilterGraph::~FFMPEGFilterGraph() {
@@ -23,7 +23,7 @@ FFMPEGFilterGraph::~FFMPEGFilterGraph() {
     // avfilter_graph_free(&filter_graph_);
 }
 
-void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx) {
+void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx, int output_format) {
     char args[512];
     #if LIBAVFILTER_VERSION_INT < AV_VERSION_INT(7,14,100)
     avfilter_register_all();
@@ -37,7 +37,7 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx)
     CHECK(buffersink) << "Error: no buffersink";
     AVFilterInOut *outputs = avfilter_inout_alloc();
 	AVFilterInOut *inputs  = avfilter_inout_alloc();
-	enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_RGB24 , AV_PIX_FMT_NONE };
+	enum AVPixelFormat pix_fmts[] = { output_format ? AV_PIX_FMT_GRAY8 : AV_PIX_FMT_RGB24, AV_PIX_FMT_NONE };
 	// AVBufferSinkParams *buffersink_params;
 
 	filter_graph_.reset(avfilter_graph_alloc());
@@ -100,8 +100,8 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx)
     // CHECK_GE(av_opt_set_bin(buffersink_ctx_, "pix_fmts", (uint8_t *)&pix_fmts, sizeof(AV_PIX_FMT_RGB24), AV_OPT_SEARCH_CHILDREN), 0) << "Set bin error";
 #if LIBAVFILTER_VERSION_INT >= AV_VERSION_INT(11, 0, 0)
     // FFmpeg 8+: pixel_formats option is AV_OPT_TYPE_PIXEL_FMT, not binary.
-    // Since our filter chain always outputs RGB24 via the scale filter,
-    // the buffersink will naturally receive RGB24 without explicit constraint.
+    // The format=... filter at the end of the chain controls the output
+    // there; the buffersink follows it without an explicit constraint.
     (void)pix_fmts;
 #else
     CHECK_GE(av_opt_set_int_list(buffersink_ctx_, "pix_fmts", pix_fmts,

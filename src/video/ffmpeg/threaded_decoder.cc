@@ -97,7 +97,7 @@ void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, 
         default:
             std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,scale=%d:%d,format=%s", width, height, fmt);
     }
-    filter_graph_ = FFMPEGFilterGraphPtr(new FFMPEGFilterGraph(descr, dec_ctx_.get()));
+    filter_graph_ = FFMPEGFilterGraphPtr(new FFMPEGFilterGraph(descr, dec_ctx_.get(), output_format));
     if (running) {
         Start();
     }
