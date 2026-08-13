@@ -28,7 +28,7 @@ on:
       ref:
         description: 'Branch to release from'
         required: false
-        default: 'feat/perf-deep'
+        default: 'master'
         type: string
 
 permissions:
