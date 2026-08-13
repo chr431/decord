@@ -4,7 +4,7 @@
 #   1. 校验版本格式 + 确认 tag 不存在
 #   2. 安装 CUDA Toolkit + 下载 FFmpeg 8.1（BtbN shared build）
 #   3. CMake GPU 构建 decord.dll（USE_CUDA=ON）
-#   4. 若 libinfo.py 版本 != 输入版本：升版本 → commit → push 到目标分支
+#   4. 若 libinfo.py / pyproject.toml 版本 != 输入版本：两文件同步升版本 → commit → push 到目标分支
 #   5. 打 tag v<版本> 并 push
 #   6. 打包 zip（布局 = RaceVideoToLog 的 _decord_build/，解压即用）：
 #        decord.dll + FFmpeg 8.1 DLLs + ffprobe.exe + python/decord/
@@ -111,8 +111,11 @@ jobs:
         run: |
           $ver = "${{ inputs.version }}"
           $libinfo = "python/decord/_ffi/libinfo.py"
+          $pyproject = "pyproject.toml"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          $changed = $false
+          # 版本事实源：libinfo.py（setup.py / __init__.py 从中派生）
           $content = [System.IO.File]::ReadAllText((Resolve-Path $libinfo))
           $cur = [regex]::Match($content, '__version__ = "(\d+\.\d+\.\d+)"').Groups[1].Value
           Write-Host "当前 libinfo.py 版本: $cur"
@@ -121,11 +124,28 @@ jobs:
             # UTF-8 无 BOM（PowerShell 5.1 的 utf8 会带 BOM，pwsh 7 不会，这里显式保证）
             [System.IO.File]::WriteAllText((Resolve-Path $libinfo), $content, (New-Object System.Text.UTF8Encoding($false)))
             git add $libinfo
+            $changed = $true
+          } else {
+            Write-Host "libinfo.py 已是 $ver，无需 bump"
+          }
+          # wheel 元数据：pyproject.toml 与 libinfo.py 必须同步（scikit-build-core 读 [project].version）
+          $pp = [System.IO.File]::ReadAllText((Resolve-Path $pyproject))
+          $ppCur = [regex]::Match($pp, '(?m)^version = "(\d+\.\d+\.\d+)"').Groups[1].Value
+          Write-Host "当前 pyproject.toml 版本: $ppCur"
+          if ($ppCur -ne $ver) {
+            $pp = $pp -replace '(?m)^version = "\d+\.\d+\.\d+"', "version = `"$ver`""
+            [System.IO.File]::WriteAllText((Resolve-Path $pyproject), $pp, (New-Object System.Text.UTF8Encoding($false)))
+            git add $pyproject
+            $changed = $true
+          } else {
+            Write-Host "pyproject.toml 已是 $ver，无需 bump"
+          }
+          if ($changed) {
             git commit -m "release: v$ver"
             git push origin "HEAD:${{ inputs.ref }}"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } else {
-            Write-Host "libinfo.py 已是 $ver，无需 bump commit"
+            Write-Host "版本文件已是 $ver，无需 bump commit"
           }
           git tag "v$ver"
           git push origin "v$ver"
