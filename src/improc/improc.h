@@ -16,7 +16,10 @@ namespace cuda {
 
 void ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
                   uint8_t* dst, cudaStream_t stream, uint16_t input_width, uint16_t input_height,
-                  int output_width, int output_height, int bit_depth = 8);
+                  int output_width, int output_height,
+                  int src_x0 = 0, int src_y0 = 0,
+                  float fx = 0.0f, float fy = 0.0f,
+                  int bit_depth = 8);
 #endif
 }  // namespace imp
 }  // namespace decord

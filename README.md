@@ -1,9 +1,6 @@
 # Decord
 
-![CI Build](https://github.com/dmlc/decord/workflows/C/C++%20CI/badge.svg?branch=master)
-![Release Build](https://github.com/dmlc/decord/workflows/Publish%20to%20PYPI/badge.svg?branch=master)
-[![PyPI](https://img.shields.io/pypi/v/decord.svg)](https://pypi.python.org/pypi/decord)
-[![Downloads](http://pepy.tech/badge/decord)](http://pepy.tech/project/decord)
+![CI Build](https://github.com/chr431/decord/workflows/C/C++%20CI/badge.svg?branch=dev)
 
 ![symbol](docs/symbol.png)
 
@@ -11,7 +8,6 @@
 
 -   FFMPEG/LibAV(Done)
 -   Nvidia Codecs(Done)
--   Intel Codecs
 
 `Decord` was designed to handle awkward video shuffling experience in order to provide smooth experiences similar to random image loader for deep learning.
 
@@ -35,19 +31,15 @@ Decord is good at handling random access patterns, which is rather common during
 
 ### Install via pip
 
-Simply use
-
-```bash
-pip install decord
-```
+PyPI 上的 `decord` 是上游 0.6.0（CPU 版）；本 fork 不依赖它，通过 GitHub
+Release 分发预编译包（见下方「Releases（本 fork）」），解压即用、无需 pip。
+从源码安装（含 pip 安装）见下一节。
 
 Supported platforms:
 
 - [x] Linux
 - [x] Mac OS >= 10.12, python>=3.5
 - [x] Windows
-
-**Note that only CPU versions are provided with PYPI now. Please build from source to enable GPU acclerator.**
 
 
 ### Install from source
@@ -69,7 +61,7 @@ sudo apt-get install -y ffmpeg libavcodec-dev libavfilter-dev libavformat-dev li
 Clone the repo recursively(important)
 
 ```bash
-git clone --recursive https://github.com/dmlc/decord
+git clone --recursive https://github.com/chr431/decord
 ```
 
 Install:
@@ -161,9 +153,11 @@ somewhere else.  Useful build options: `-DUSE_CUDA=ON|OFF` (NVDEC),
 本 fork 是 RaceVideoToLog 的硬依赖（next_roi / get_codec / GPU 动态加载 /
 CPU 内存修复），**不依赖 PyPI decord**。版本与发布遵循：
 
-- **版本号**：SemVer `X.Y.Z`，单一事实源为
-  `python/decord/_ffi/libinfo.py` 的 `__version__`。`python/setup.py` 与
-  `python/decord/__init__.py` 都从这里派生，改版本只动这一处。
+- **版本号**：SemVer `X.Y.Z`，事实源为
+  `python/decord/_ffi/libinfo.py` 的 `__version__`（`python/setup.py` 与
+  `python/decord/__init__.py` 从它派生）。`pyproject.toml`（wheel 元数据）
+  与其保持同步：统一跑 `python tools/update_version.py`（改脚本顶部
+  `__version__` 后执行），或由发布 workflow 的 bump 步骤同步更新两处。
 - **tag 约定**：`v<X.Y.Z>`（如 `v0.7.0`）。
 - **发布产物**：GitHub Release 的 `decord-<ver>-win64-gpu.zip`，内含
   `_decord_build/` 布局 —— `decord.dll` + FFmpeg 8.1 DLLs + `ffprobe.exe`
@@ -175,12 +169,13 @@ CPU 内存修复），**不依赖 PyPI decord**。版本与发布遵循：
 在 GitHub Actions → **Release** → Run workflow：
 
 1. `version`：要发布的版本号（如 `0.7.0`），会自动打 tag `v0.7.0`
-2. `ref`：默认 `feat/perf-deep`（可改为其它分支）
+2. `ref`：默认 `master`（可改为其它分支）
 
 workflow 会依次：校验版本格式 + tag 不重复 → 安装 CUDA Toolkit +
-下载 BtbN FFmpeg 8.1 → CMake GPU 构建 → 若 `libinfo.py` 版本不符则升版本并
-commit+push → 打 tag → 打包 zip → 创建 Release（notes = 自上一 tag 的
-commit 列表）并上传 zip。**构建失败不会产生任何 commit/tag/release**。
+下载 BtbN FFmpeg 8.1 → CMake GPU 构建 → 若 `libinfo.py` / `pyproject.toml`
+版本不符则同步升版本并 commit+push → 打 tag → 打包 zip → 创建 Release
+（notes = 自上一 tag 的 commit 列表）并上传 zip。**构建失败不会产生任何
+commit/tag/release**。
 
 #### 手动构建（无 GitHub 时）
 
@@ -214,7 +209,7 @@ brew install cmake ffmpeg
 Clone the repo recursively(important)
 
 ```bash
-git clone --recursive https://github.com/dmlc/decord
+git clone --recursive https://github.com/chr431/decord
 ```
 
 Then go to root directory build shared library:

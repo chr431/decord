@@ -8,12 +8,22 @@
 #include <thread>
 #include "ffmpeg/threaded_decoder.h"
 #include "../runtime/str_util.h"
+#include "../runtime/file_util.h"
 #if DECORD_USE_CUDA
 #include "nvcodec/cuda_threaded_decoder.h"
 #include <cuda_runtime_api.h>
 #endif
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
+#include <fstream>
+#ifdef _WIN32
+#include <direct.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#else
+#include <sys/stat.h>
+#endif
 #include <decord/runtime/ndarray.h>
 #include <decord/runtime/c_runtime_api.h>
 
@@ -275,7 +285,14 @@ void VideoReader::SetVideoStream(int stream_nb) {
     }
 
     decoder_->SetCodecContext(dec_ctx, width_, height_, rotation, output_format_);
-    IndexKeyframes();
+    // Frame/keyframe index: reuse a fresh on-disk cache entry (keyed by file
+    // size + mtime) when available, otherwise scan and persist.  Training
+    // workloads reopen the same files every epoch — the scan is a full-file
+    // demux walk that this avoids on every open after the first.
+    if (!LoadCachedIndex()) {
+        IndexKeyframes();
+        SaveCachedIndex();
+    }
 }
 
 unsigned int VideoReader::QueryStreams() const {
@@ -559,7 +576,69 @@ NDArray VideoReader::NextFrameImpl() {
 
 NDArray VideoReader::NextFrame() {
     if (!fmt_ctx_) return NDArray();
-    return NextFrameImpl();
+    NDArray frame = NextFrameImpl();
+    // ROI-first reader 契约：无 roi 参数的读帧也返回固定矩形。
+    // CPU gray / GPU 路径解码器已输出 ROI 帧（CropRoi 直通）；CPU RGB
+    // 走旧路径（此处按 reader ROI 裁剪）。
+    if (has_roi_) {
+        return CropRoi(frame, roi_x1_, roi_y1_, roi_x2_, roi_y2_);
+    }
+    return frame;
+}
+
+void VideoReader::SetRoi(int x1, int y1, int x2, int y2) {
+    x1 = std::max(0, std::min(x1, width_));
+    y1 = std::max(0, std::min(y1, height_));
+    x2 = std::max(0, std::min(x2, width_));
+    y2 = std::max(0, std::min(y2, height_));
+    int w = x2 - x1;
+    int h = y2 - y1;
+    if (w <= 0 || h <= 0) {
+        has_roi_ = false;
+        roi_x2_ = -1; roi_y2_ = -1;
+        roi_w_ = 0; roi_h_ = 0;
+        return;
+    }
+    roi_x1_ = x1; roi_y1_ = y1; roi_x2_ = x2; roi_y2_ = y2;
+    roi_w_ = w; roi_h_ = h;
+    has_roi_ = true;
+    // CPU（FFmpeg filter）路径：crop 在 yuv420p 上要求偶数宽高（奇数尺寸
+    // 实测全黑/崩溃）。按偶数扩充（右/下越界则左/上扩展），CropRoi 按
+    // (x1-fx1, y1-fy1) 偏移从 filter 输出顶部对齐精裁回精确 ROI。
+    // GPU 路径：转换 kernel 直接写精确 ROI 窗口，无需扩充。
+    int fx1 = x1, fy1 = y1, fw = w, fh = h;
+    if (ctx_.device_type != kDLCUDA) {
+        // FFmpeg crop 在 yuv420p 上要求 x/y/w/h 全偶数（奇数位置同样
+        // 实测错乱：luma 行错位 ~55% 像素、奇数尺寸全黑/崩溃）。构造
+        // 偶数超集（位置向下取偶、终点向上取偶），CropRoi 按偏移精裁。
+        fx1 = x1 & ~1;
+        fy1 = y1 & ~1;
+        fw = ((x2 - fx1 + 1) & ~1);
+        fh = ((y2 - fy1 + 1) & ~1);
+        if (fx1 + fw > width_) fx1 = width_ - fw;
+        if (fy1 + fh > height_) fy1 = height_ - fh;
+        if (fx1 < 0 || fy1 < 0 || (fx1 & 1) || (fy1 & 1)
+            || (fw & 1) || (fh & 1) || fw <= 0 || fh <= 0) {
+            // 无法构造偶数超集（奇数帧尺寸等极端情况）→ 传无效矩形使
+            // 解码器回退全帧输出，CropRoi 走旧路径全帧裁剪。
+            fw = -1; fh = -1; fx1 = 0; fy1 = 0;
+        }
+    }
+    roi_fx1_ = fx1; roi_fy1_ = fy1; roi_fw_ = fw; roi_fh_ = fh;
+    // 解码器按 ROI 重建（CPU: filter 图先 crop；GPU: 转换器只算 ROI 窗口）
+    decoder_->SetRoi(fx1, fy1, fx1 + fw, fy1 + fh);
+    if (ctx_.device_type == kDLCUDA) {
+        // GPU 输出池改为 ROI 尺寸（转换器直接写 ROI 窗口；asnumpy 一次
+        // 批量 D2H，免逐帧 cudaMemcpy2D）。池与解码器按 1:1 配对，在途
+        // 缓冲无法重分配 —— 必须在任何解码/seek 之前调用（python 层
+        // 构造参数路径保证）。
+        if (pkts_pushed_ != 0 || frames_popped_ != 0) {
+            LOG(FATAL) << "GPU SetRoi must be called before any decode or "
+                       << "seek (pkts_pushed_=" << pkts_pushed_
+                       << ", frames_popped_=" << frames_popped_ << ")";
+        }
+        ndarray_pool_.Reset(22, {roi_h_, roi_w_, Channels()}, kUInt8, ctx_);
+    }
 }
 
 NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
@@ -574,6 +653,39 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
     if (!frame.defined() || frame.Size() <= 1) {
         // EOF marker / drain sentinel: pass through untouched
         return frame;
+    }
+    // ROI-first 直通：解码器已输出 ROI 尺寸的帧（CPU filter crop 或
+    // GPU 转换器窗口）→ 无需再裁剪/拷贝。
+    if (frame.data_ && frame.data_->dl_tensor.ndim == 3
+        && frame.data_->dl_tensor.shape[0] == y2 - y1
+        && frame.data_->dl_tensor.shape[1] == x2 - x1) {
+        return frame;
+    }
+    // CPU filter 偶数扩充输出（fw×fh 超集）：顶部对齐精裁回精确 ROI。
+    // （FFmpeg crop 在 yuv420p 上要求偶数宽高 —— 奇数尺寸在 filter 层
+    // 按偶数扩充，此处裁掉多出的 ≤1 像素。）
+    if (has_roi_ && frame.data_ && frame.data_->dl_tensor.ndim == 3
+        && frame.data_->dl_tensor.shape[0] == roi_fh_
+        && frame.data_->dl_tensor.shape[1] == roi_fw_
+        && x1 == roi_x1_ && y1 == roi_y1_
+        && x2 == roi_x2_ && y2 == roi_y2_) {
+        int c = Channels();
+        int off_x = roi_x1_ - roi_fx1_;
+        int off_y = roi_y1_ - roi_fy1_;
+        NDArray out = NDArray::Empty({roi_h_, roi_w_, c}, kUInt8, kCPU);
+        const char *src = static_cast<const char *>(
+            frame.data_->dl_tensor.data)
+            + static_cast<int64_t>(off_y) * roi_fw_ * c
+            + static_cast<int64_t>(off_x) * c;
+        char *dst = static_cast<char *>(out.data_->dl_tensor.data);
+        size_t row_bytes = static_cast<size_t>(roi_w_) * c;
+        size_t src_stride = static_cast<size_t>(roi_fw_) * c;
+        for (int y = 0; y < roi_h_; ++y) {
+            std::memcpy(dst + static_cast<int64_t>(y) * row_bytes,
+                        src + static_cast<int64_t>(y) * src_stride,
+                        row_bytes);
+        }
+        return out;
     }
     NDArray roi = NDArray::Empty({y2 - y1, x2 - x1, Channels()}, kUInt8, kCPU);
     if (ctx_.device_type == kDLCUDA) {
@@ -620,10 +732,171 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
 
 NDArray VideoReader::NextFrameRoi(int x1, int y1, int x2, int y2) {
     if (!fmt_ctx_) return NDArray();
+    // clamp 先行：不一致检查与 CropRoi 都使用有效矩形语义
+    x1 = std::max(0, std::min(x1, width_));
+    y1 = std::max(0, std::min(y1, height_));
+    x2 = std::max(0, std::min(x2, width_));
+    y2 = std::max(0, std::min(y2, height_));
+    if (has_roi_ && (x1 != roi_x1_ || y1 != roi_y1_
+                     || x2 != roi_x2_ || y2 != roi_y2_)) {
+        LOG(FATAL) << "NextFrameRoi(" << x1 << "," << y1 << "," << x2 << ","
+                   << y2 << ") does not match SetRoi(" << roi_x1_ << ","
+                   << roi_y1_ << "," << roi_x2_ << "," << roi_y2_
+                   << "): a ROI-first decoder only outputs its fixed "
+                   << "rectangle.";
+    }
     // reuse NextFrameImpl() so fault tolerance / EOF / rewind handling is
     // inherited verbatim; on the GPU path the popped frame is a pool buffer
     NDArray frame = NextFrameImpl();
     return CropRoi(frame, x1, y1, x2, y2);
+}
+
+namespace {
+// On-disk index cache: avoids the full-file demux walk on repeated opens of
+// the same video (training workloads reopen identical files every epoch).
+// Entries are validated against the video's size + mtime; anything that
+// does not match (or fails to parse) silently falls back to a full scan.
+// Disable with DECORD_DISABLE_INDEX_CACHE=1.
+constexpr uint64_t kIndexCacheMagic = 0x4443524449445831ULL;  // "DCRDIDX1"
+constexpr uint32_t kIndexCacheVersion = 1;
+const char* kIndexCacheDisabledEnv = "DECORD_DISABLE_INDEX_CACHE";
+
+struct FileStamp {
+    int64_t size = 0;
+    int64_t mtime = 0;
+    bool ok = false;
+};
+
+FileStamp GetFileStamp(const std::string& path) {
+    FileStamp stamp;
+#ifdef _WIN32
+    struct _stat64 s;
+    if (_stat64(path.c_str(), &s) == 0) {
+        stamp.size = s.st_size;
+        stamp.mtime = s.st_mtime;
+        stamp.ok = true;
+    }
+#else
+    struct stat s;
+    if (stat(path.c_str(), &s) == 0) {
+        stamp.size = s.st_size;
+        stamp.mtime = s.st_mtime;
+        stamp.ok = true;
+    }
+#endif
+    return stamp;
+}
+
+bool MkdirIfMissing(const std::string& path) {
+#ifdef _WIN32
+    return _mkdir(path.c_str()) == 0 || errno == EEXIST;
+#else
+    return mkdir(path.c_str(), 0777) == 0 || errno == EEXIST;
+#endif
+}
+
+std::string HashString(const std::string& s) {
+    // FNV-1a 64
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+    return std::string(buf);
+}
+}  // namespace
+
+std::string VideoReader::IndexCachePath() const {
+    if (filename_.empty() || io_ctx_) return "";
+    return runtime::GetCacheDir() + "/index/" + HashString(filename_) + ".idx";
+}
+
+bool VideoReader::LoadCachedIndex() {
+    if (getenv(kIndexCacheDisabledEnv)) return false;
+    const std::string cache_path = IndexCachePath();
+    if (cache_path.empty()) return false;
+    FileStamp stamp = GetFileStamp(filename_);
+    if (!stamp.ok) return false;
+    std::ifstream in(cache_path, std::ios::binary);
+    if (!in) return false;
+    uint64_t magic = 0;
+    uint32_t version = 0;
+    int64_t fsize = 0, mtime = 0, nframes = 0, nkeys = 0;
+    in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    in.read(reinterpret_cast<char*>(&fsize), sizeof(fsize));
+    in.read(reinterpret_cast<char*>(&mtime), sizeof(mtime));
+    in.read(reinterpret_cast<char*>(&nframes), sizeof(nframes));
+    in.read(reinterpret_cast<char*>(&nkeys), sizeof(nkeys));
+    if (!in || magic != kIndexCacheMagic || version != kIndexCacheVersion
+        || fsize != stamp.size || mtime != stamp.mtime
+        || nframes < 1 || nframes > (1LL << 40) || nkeys < 0 || nkeys > nframes) {
+        return false;
+    }
+    key_indices_.clear();
+    frame_ts_.clear();
+    key_indices_.resize(static_cast<size_t>(nkeys));
+    frame_ts_.resize(static_cast<size_t>(nframes));
+    if (nkeys > 0) {
+        in.read(reinterpret_cast<char*>(key_indices_.data()),
+                static_cast<std::streamsize>(nkeys * sizeof(int64_t)));
+    }
+    for (int64_t i = 0; i < nframes; ++i) {
+        AVFrameTime& t = frame_ts_[static_cast<size_t>(i)];
+        in.read(reinterpret_cast<char*>(&t.pts), sizeof(t.pts));
+        in.read(reinterpret_cast<char*>(&t.dts), sizeof(t.dts));
+        in.read(reinterpret_cast<char*>(&t.start), sizeof(t.start));
+        in.read(reinterpret_cast<char*>(&t.stop), sizeof(t.stop));
+    }
+    if (!in.good()) {
+        key_indices_.clear();
+        frame_ts_.clear();
+        return false;
+    }
+    return true;
+}
+
+void VideoReader::SaveCachedIndex() const {
+    if (getenv(kIndexCacheDisabledEnv)) return;
+    const std::string cache_path = IndexCachePath();
+    if (cache_path.empty() || frame_ts_.empty()) return;
+    FileStamp stamp = GetFileStamp(filename_);
+    if (!stamp.ok) return;
+    const std::string dir = cache_path.substr(0, cache_path.find_last_of("/\\"));
+    MkdirIfMissing(runtime::GetCacheDir());
+    MkdirIfMissing(dir);
+    // write to a temp file then rename: concurrent training workers may
+    // write the same entry simultaneously — a torn .idx must never be
+    // visible as a valid cache file (readers validate on load anyway)
+    const std::string tmp_path = cache_path + ".tmp";
+    std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+    const uint64_t magic = kIndexCacheMagic;
+    const uint32_t version = kIndexCacheVersion;
+    const int64_t nframes = static_cast<int64_t>(frame_ts_.size());
+    const int64_t nkeys = static_cast<int64_t>(key_indices_.size());
+    out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    out.write(reinterpret_cast<const char*>(&stamp.size), sizeof(stamp.size));
+    out.write(reinterpret_cast<const char*>(&stamp.mtime), sizeof(stamp.mtime));
+    out.write(reinterpret_cast<const char*>(&nframes), sizeof(nframes));
+    out.write(reinterpret_cast<const char*>(&nkeys), sizeof(nkeys));
+    if (nkeys > 0) {
+        out.write(reinterpret_cast<const char*>(key_indices_.data()),
+                  static_cast<std::streamsize>(nkeys * sizeof(int64_t)));
+    }
+    for (const AVFrameTime& t : frame_ts_) {
+        out.write(reinterpret_cast<const char*>(&t.pts), sizeof(t.pts));
+        out.write(reinterpret_cast<const char*>(&t.dts), sizeof(t.dts));
+        out.write(reinterpret_cast<const char*>(&t.start), sizeof(t.start));
+        out.write(reinterpret_cast<const char*>(&t.stop), sizeof(t.stop));
+    }
+    out.close();
+    if (!out) return;
+    std::remove(cache_path.c_str());
+    std::rename(tmp_path.c_str(), cache_path.c_str());
 }
 
 void VideoReader::IndexKeyframes() {
@@ -859,6 +1132,18 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
     y1 = std::max(0, std::min(y1, height_));
     x2 = std::max(0, std::min(x2, width_));
     y2 = std::max(0, std::min(y2, height_));
+    if (has_roi_) {
+        // ROI-first 解码器：缺省参数回退到 reader ROI；显式矩形必须一致
+        if (x2 <= x1 || y2 <= y1) {
+            x1 = roi_x1_; y1 = roi_y1_; x2 = roi_x2_; y2 = roi_y2_;
+        } else if (x1 != roi_x1_ || y1 != roi_y1_
+                   || x2 != roi_x2_ || y2 != roi_y2_) {
+            LOG(FATAL) << "GetBatch roi does not match SetRoi(" << roi_x1_
+                       << "," << roi_y1_ << "," << roi_x2_ << ","
+                       << roi_y2_ << "): a ROI-first decoder only outputs "
+                       << "its fixed rectangle.";
+        }
+    }
     bool use_roi = x2 > x1 && y2 > y1;
     int64_t fh = use_roi ? y2 - y1 : height_;
     int64_t fw = use_roi ? x2 - x1 : width_;

@@ -67,6 +67,15 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderNextFrameRoi")
     *rv = arr;
   });
 
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderSetRoi")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    int x1 = args[1], y1 = args[2], x2 = args[3], y2 = args[4];
+    // SetRoi 是 VideoReader 的专属接口（非 VideoReaderInterface）
+    static_cast<VideoReader*>(handle)->SetRoi(x1, y1, x2, y2);
+    *rv = nullptr;
+  });
+
 DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetFrameCount")
 .set_body([] (DECORDArgs args, DECORDRetValue* rv) {
     VideoReaderInterfaceHandle handle = args[0];

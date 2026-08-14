@@ -71,36 +71,92 @@ void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, 
     bool running = run_.load();
     Clear();
     dec_ctx_.reset(dec_ctx);
-    // LOG(INFO) << dec_ctx->width << " x " << dec_ctx->height << " : " << dec_ctx->time_base.num << " , " << dec_ctx->time_base.den;
-    // std::string descr = "scale=320:240";
-    // Force BT.601 (limited) color conversion: the CUDA decode path uses a
-    // fixed BT.601 matrix (improc.cu), while FFmpeg's swscale honours the
-    // stream's color metadata (most racing videos are tagged bt709).  The
-    // two decoders then produce visibly different RGB for the same frame,
-    // which breaks OCR on the CPU path (measured 28/30 recognition fails
-    // and a systematic +7.5 G-channel offset).  setparams rewrites the
-    // frame metadata so swscale picks the BT.601 matrix; the outputs then
-    // match the GPU path within rounding (<=1-2 per pixel).
-    char descr[160];
-    const char *fmt = output_format ? "gray" : "rgb24";
-    switch(rotation) {
-        case 90:
-            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,scale=%d:%d,format=%s", width, height, fmt);
-            break;
-        case 180:
-            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,transpose=1,scale=%d:%d,format=%s", width, height, fmt);
-            break;
-        case 270:
-            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=2,scale=%d:%d,format=%s", width, height, fmt);
-            break;
-        case 0:
-        default:
-            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,scale=%d:%d,format=%s", width, height, fmt);
+    orig_w_ = dec_ctx->width;
+    orig_h_ = dec_ctx->height;
+    out_w_ = width;
+    out_h_ = height;
+    rotation_ = rotation;
+    output_format_ = output_format;
+    // avcodec_flush_buffers（Seek/Clear 触发）会把 time_base 重置为
+    // 0/1 —— filter 图 buffersrc 需要流 time_base（Invalid time base
+    // 0/1）。在此快照，重建图前恢复。
+    time_base_ = dec_ctx->time_base;
+    {
+        std::lock_guard<std::mutex> lk(filter_mutex_);
+        BuildFilterGraph();
     }
-    filter_graph_ = FFMPEGFilterGraphPtr(new FFMPEGFilterGraph(descr, dec_ctx_.get()));
     if (running) {
         Start();
     }
+}
+
+void FFMPEGThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
+    int w = x2 - x1;
+    int h = y2 - y1;
+    bool valid = w > 0 && h > 0 && x1 >= 0 && y1 >= 0
+                 && x2 <= orig_w_ && y2 <= orig_h_;
+    if (valid) {
+        roi_x1_ = x1; roi_y1_ = y1; roi_x2_ = x2; roi_y2_ = y2;
+        roi_valid_ = true;
+    } else {
+        roi_x2_ = -1; roi_y2_ = -1;
+        roi_valid_ = false;
+    }
+    // 热切换 filter 图：不停止工作线程、不 flush avcodec、不丢在途帧。
+    // 在途帧仍走旧图（全帧输出），新帧走新图（ROI 输出）——消费者端
+    // CropRoi 按帧实际尺寸自适应（ROI 尺寸直通，全帧尺寸旧路径裁剪）。
+    // 注意：SetRoi 前已经由旧图输出的帧会被消费方正确裁剪，无帧序影响。
+    std::lock_guard<std::mutex> lk(filter_mutex_);
+    BuildFilterGraph();
+}
+
+void FFMPEGThreadedDecoder::BuildFilterGraph() {
+    // ── filter 描述串 ──
+    // 强制 BT.601 (limited) 颜色转换：CUDA 解码路径用固定 BT.601 矩阵
+    // （improc.cu），而 FFmpeg 的 swscale 遵循流的颜色元数据（多数赛车
+    // 视频标注 bt709）——两者对同一帧产生可见差异的 RGB，破坏 CPU 路径
+    // OCR（实测 28/30 识别失败、G 通道系统性 +7.5 偏移）。setparams 重写
+    // 帧元数据让 swscale 选 BT.601 矩阵，输出与 GPU 路径对齐（逐像素差
+    // ≤1-2）。
+    //
+    // ROI-first（性能）：roi_valid 且 gray 输出、无旋转、无用户缩放时，
+    // crop 先于 format —— 只转换 ROI 像素（全帧 YUV→gray 的 ~99.9% 被
+    // 裁剪丢弃，单帧 ~0.4-0.8ms → ~0）。gray 只取 luma：crop 对 luma
+    // 平面按任意坐标精确裁剪。RGB 输出不启用（色度上采样在裁剪边界
+    // 需要窗口外的色度样本，与旧全帧转换逐像素不一致），保持旧路径。
+    // 旋转非 0 或用户缩放时同样保持旧行为（全帧转换 + 调用方裁剪）。
+    const char *fmt = output_format_ ? "gray" : "rgb24";
+    bool user_scale = (out_w_ > 0 && out_h_ > 0
+                       && (out_w_ != orig_w_ || out_h_ != orig_h_));
+    bool crop_first = roi_valid_ && rotation_ == 0 && !user_scale
+                      && output_format_ == 1;
+    int crop_w = roi_x2_ - roi_x1_;
+    int crop_h = roi_y2_ - roi_y1_;
+    char descr[256];    switch (rotation_) {
+        case 90:
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,scale=%d:%d,format=%s", out_w_, out_h_, fmt);
+            break;
+        case 180:
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=1,transpose=1,scale=%d:%d,format=%s", out_w_, out_h_, fmt);
+            break;
+        case 270:
+            std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,transpose=2,scale=%d:%d,format=%s", out_w_, out_h_, fmt);
+            break;
+        case 0:
+        default:
+            if (crop_first) {
+                std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,crop=%d:%d:%d:%d,format=%s", crop_w, crop_h, roi_x1_, roi_y1_, fmt);
+            } else if (user_scale) {
+                std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,scale=%d:%d,format=%s", out_w_, out_h_, fmt);
+            } else {
+                std::snprintf(descr, sizeof(descr), "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt709,format=%s", fmt);
+            }
+    }
+    // 恢复流 time_base（Clear/flush 会重置为 0/1，buffersrc 需要有效值）
+    if (dec_ctx_.get()) {
+        dec_ctx_->time_base = time_base_;
+    }
+    filter_graph_ = FFMPEGFilterGraphPtr(new FFMPEGFilterGraph(descr, dec_ctx_.get(), output_format_));
 }
 
 void FFMPEGThreadedDecoder::Start() {
@@ -211,11 +267,18 @@ FFMPEGThreadedDecoder::~FFMPEGThreadedDecoder() {
 void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
     // filter image frame (format conversion, scaling...) — runs on the
     // filter worker thread, concurrent with the decode worker.
+    // 每帧在锁内拷贝当前 filter 图指针：SetRoi 的热切换不会让在途帧
+    // 引用到被销毁的旧图（shared_ptr 保活到本帧处理完成）。
+    std::shared_ptr<FFMPEGFilterGraph> graph;
+    {
+        std::lock_guard<std::mutex> lk(filter_mutex_);
+        graph = filter_graph_;
+    }
     pf_f_filter.start();
-    filter_graph_->Push(frame.get());
+    graph->Push(frame.get());
     AVFramePtr out_frame = AVFramePool::Get()->Acquire();
     AVFrame *out_frame_p = out_frame.get();
-    CHECK(filter_graph_->Pop(&out_frame_p)) << "Error fetch filtered frame.";
+    CHECK(graph->Pop(&out_frame_p)) << "Error fetch filtered frame.";
 
     auto tmp = AsNDArray(out_frame);
     // ── Backpressure: if the frame queue is full, wait for consumer ──
@@ -280,7 +343,6 @@ void FFMPEGThreadedDecoder::FilterWorkerThread() {
 
 void FFMPEGThreadedDecoder::FilterWorkerThreadImpl() {
     while (run_.load()) {
-        if (!filter_graph_) return;
         RawItem item;
         pf_f_pop.start();
         if (!raw_queue_->Pop(&item)) {
@@ -337,8 +399,6 @@ void FFMPEGThreadedDecoder::WorkerThread() {
 
 void FFMPEGThreadedDecoder::WorkerThreadImpl() {
     while (run_.load()) {
-        // CHECK(filter_graph_) << "FilterGraph not initialized.";
-        if (!filter_graph_) return;
         AVPacketPtr pkt;
 
         int got_picture;

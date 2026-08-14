@@ -305,11 +305,13 @@ class NDArrayBase(_NDArrayBase):
         return np_arr
 
     # ═══════════════ DLPack zero-copy export (numpy 2.x protocol) ═══════════════
-    # np.from_dlpack(arr) → zero-copy view of the decord buffer.  The view
-    # references this NDArray (kept alive by _DLPACK_HOLDERS); when numpy
-    # releases it, the deleter drops the reference and the buffer returns to
-    # its pool / is freed.  CPU arrays only — GPU arrays must go through
-    # next_roi (D2H ROI copy), numpy has no CUDA support in from_dlpack.
+    # np.from_dlpack(arr) → zero-copy view of the decord buffer (CPU arrays);
+    # torch.from_dlpack(arr) → zero-copy torch tensor (CPU and CUDA arrays).
+    # The consumer keeps this NDArray alive via _DLPACK_HOLDERS; when it
+    # releases the array, the deleter drops the reference and the buffer
+    # returns to its pool / is freed.  numpy's from_dlpack itself only
+    # accepts CPU arrays — GPU frames go to torch (or another DLPack
+    # consumer), where they alias the pool buffer until the deleter runs.
     def __dlpack_device__(self):
         """DLPack device tuple (device_type, device_id), numpy protocol."""
         ctx = self.ctx
@@ -320,15 +322,19 @@ class NDArrayBase(_NDArrayBase):
 
         Returns a PyCapsule named "dltensor" wrapping a DLManagedTensor that
         aliases this array's buffer.  The capsule (and the produced numpy
-        view) keep the source NDArray alive until released.
+        view / torch tensor) keep the source NDArray alive until released.
+
+        ``stream`` is accepted and ignored: decord frames are complete on
+        the device before they are handed out (the decode path synchronizes
+        its stream in the display callback), so the data is ready for use
+        on any consumer stream.
         """
-        if stream not in (None, 0):
-            raise ValueError("decord NDArray supports only stream=None")
         ctx = self.ctx
-        if int(ctx.device_type) != 1:  # kDLCpu
+        if int(ctx.device_type) not in (1, 2):  # kDLCpu, kDLCUDA
             raise RuntimeError(
-                "__dlpack__ supports CPU arrays only (got device type {}); "
-                "use next_roi() for GPU frames".format(ctx.device_type))
+                "__dlpack__ supports CPU and CUDA arrays only (got device "
+                "type {}); use next_roi() for a D2H ROI copy instead".format(
+                    ctx.device_type))
         if self.handle is None or not self.handle.contents.data:
             raise RuntimeError("cannot export an empty NDArray via __dlpack__")
         t = DECORDType(self.dtype)

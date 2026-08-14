@@ -11,6 +11,10 @@ Python API Reference
 
     VideoLoader
 
+    AudioReader
+
+    AVReader
+
 
 API Reference
 -------------
@@ -19,6 +23,12 @@ API Reference
     :members:
 
 .. automodule:: decord.video_loader
+    :members:
+
+.. automodule:: decord.audio_reader
+    :members:
+
+.. automodule:: decord.av_reader
     :members:
 
 .. automodule:: decord.ndarray

@@ -47,6 +47,7 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
     public:
         CUThreadedDecoder(int device_id, AVCodecParameters *codecpar, const AVInputFormat *iformat);
         void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1, int rotation = 0, int output_format = 0);
+        void SetRoi(int x1, int y1, int x2, int y2) override;
         bool Initialized() const;
         void Start();
         void Stop();
@@ -96,6 +97,11 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         AVRational nv_time_base_;
         AVRational frame_base_;
         AVCodecContextPtr dec_ctx_;
+        // ── ROI-first 状态（SetRoi，须在 Start 前调用）──
+        int roi_x1_ = 0, roi_y1_ = 0, roi_x2_ = -1, roi_y2_ = -1;  // 半开
+        bool roi_valid_ = false;
+        int orig_w_ = -1, orig_h_ = -1;  // 解码原始分辨率
+        int out_w_ = -1, out_h_ = -1;    // SetCodecContext 目标尺寸
         /*! \brief AV bitstream filter context */
         AVBSFContextPtr bsf_ctx_;
         unsigned int width_;

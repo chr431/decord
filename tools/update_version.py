@@ -3,15 +3,15 @@ This is the global script that set the version information of DECORD.
 This script runs and update all the locations that related to versions
 List of affected files:
 - decord-root/python/decord/_ffi/libinfo.py
+- decord-root/pyproject.toml
 - decord-root/include/decord/runtime/c_runtime_api.h
-- decord-root/src/runtime/file_util.cc
 """
 import os
 import re
 # current version
 # We use the version of the incoming release for code
 # that is under development
-__version__ = "0.7.1"
+__version__ = "0.7.4"
 
 # Implementations
 def update(file_name, pattern, repl):
@@ -43,15 +43,15 @@ def update(file_name, pattern, repl):
 def main():
     curr_dir = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
     proj_root = os.path.abspath(os.path.join(curr_dir, ".."))
-    # python path
+    # python path（版本事实源；python/setup.py 与 python/decord/__init__.py 从中派生）
     update(os.path.join(proj_root, "python", "decord", "_ffi", "libinfo.py"),
            r"(?<=__version__ = \")[.0-9a-z]+", __version__)
+    # wheel 元数据（scikit-build-core 读 [project].version）
+    update(os.path.join(proj_root, "pyproject.toml"),
+           r"(?<=^version = \")[.0-9a-z]+", __version__)
     # C++ header
     update(os.path.join(proj_root, "include", "decord", "runtime", "c_runtime_api.h"),
            "(?<=DECORD_VERSION \")[.0-9a-z]+", __version__)
-    # file util
-    update(os.path.join(proj_root, "src", "runtime", "file_util.cc"),
-           "(?<=std::string version = \")[.0-9a-z]+", __version__)
 
 if __name__ == "__main__":
     main()
