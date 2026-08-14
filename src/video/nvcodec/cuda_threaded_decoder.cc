@@ -106,8 +106,15 @@ void CUThreadedDecoder::InitBitStreamFilter(AVCodecParameters *codecpar, const A
 }
 
 void CUThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int height, int rotation, int output_format) {
-    // GPU (NVDEC) path always outputs RGB via improc; gray is CPU-only.
-    (void)output_format;
+    // output_format: 0 = RGB24, 1 = GRAY8。与 CPU 路径同一参数语义
+    // （上游 VideoReader(output_format=...)）；GPU 默认 RGB，传 gray 时
+    // improc kernel 直出 Y 平面（range 语义与 CPU swscale GRAY8 一致）。
+    output_format_ = output_format;
+    // 流的 color_range（AVCOL_RANGE_MPEG=0 limited / AVCOL_RANGE_JPEG=1
+    // full）：GRAY8 输出按此决定是否做 limited->full 展开 —— 与 CPU
+    // swscale 遵循流元数据的行为一致（视频标注 tv 但数据 full 时，两侧
+    // 输出相同的展开亮度）。
+    color_range_ = (dec_ctx->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
     CHECK(dec_ctx);
     width_ = width;
     height_ = height;
@@ -301,11 +308,13 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
         ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_,
                      input_width, input_height,
                      roi_x2_ - roi_x1_, roi_y2_ - roi_y1_,
-                     roi_x1_, roi_y1_, 1.0f, 1.0f, decoder_.BitDepth());
+                     roi_x1_, roi_y1_, 1.0f, 1.0f, decoder_.BitDepth(),
+                     output_format_, color_range_);
     } else {
         ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_,
                      input_width, input_height, width_, height_,
-                     0, 0, 0.0f, 0.0f, decoder_.BitDepth());
+                     0, 0, 0.0f, 0.0f, decoder_.BitDepth(),
+                     output_format_, color_range_);
     }
     if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
         LOG(FATAL) << "Error synchronize cuda stream";
