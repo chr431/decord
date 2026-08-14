@@ -47,6 +47,15 @@ static const int DECORD_EAGAIN_SLEEP_MS = std::stoi(
 static const bool DECORD_SYNC_DECODE = std::stoi(
     decord::runtime::GetEnvironmentVariableOrDefault("DECORD_SYNC_DECODE", "0")) != 0;
 
+// Decode-side backpressure slack: in-flight frames the decode thread may
+// keep ahead of the consumer beyond the (bounded) output frame queue.
+// EnqueueRawFrame waits once raw_queue_ + frame_queue_ reach
+// max_queue_frames_ + this.  Without it the raw (pre-filter) queue is
+// unbounded and a contested filter (e.g. two decoders running concurrently)
+// lets raw full-frames accumulate without limit (observed ~1.9 MB/frame
+// runaway to multi-GB on a 1080p VFR clip pair).
+static const int DECORD_RAW_SLACK_FRAMES = 4;
+
 // FFmpeg 8+: prefer avcodec_receive_frame_flags with SYNCHRONOUS flag
 // to bypass internal frame threading overhead.  Falls back to the
 // standard avcodec_receive_frame on older FFmpeg or when sync decode
@@ -328,6 +337,21 @@ void FFMPEGThreadedDecoder::EnqueueRawFrame(AVFramePtr frame) {
     item.frame = frame;
     item.pts = frame->pts;
     item.kind = skip ? RawKind::Skip : RawKind::Frame;
+    // Backpressure: the decode thread must not run ahead of the filter /
+    // consumer.  raw_queue_ and frame_queue_ are the decoded-frame buffers;
+    // without a bound here they grow without limit when the consumer is
+    // slower than the decoder (worst under CPU contention with two readers).
+    // Blocking on the in-flight count propagates the consumer's pace all the
+    // way back to Push(), bounding total memory.  Applied for every kind so
+    // even the tiny markers can't starve the pipeline at the tail.
+    if (max_queue_frames_ > 0) {
+        size_t cap = static_cast<size_t>(max_queue_frames_ + DECORD_RAW_SLACK_FRAMES);
+        while (run_.load()
+               && raw_queue_->Size() + frame_queue_->Size() >= cap) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!run_.load()) return;
+    }
     raw_queue_->Push(item);
 }
 
