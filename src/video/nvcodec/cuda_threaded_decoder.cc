@@ -125,8 +125,9 @@ void CUThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int 
     bool running = run_.load();
     Clear();
     dec_ctx_.reset(dec_ctx);
-    parser_ = CUVideoParser(dec_ctx->codec_id, this, kMaxOutputSurfaces, dec_ctx->extradata,
-                            dec_ctx->extradata_size);
+    parser_ = CUVideoParser(dec_ctx->codec_id, this,
+                            ThreadedDecoderInterface::kDecodeSurfaceCount,
+                            dec_ctx->extradata, dec_ctx->extradata_size);
     if (!parser_.Initialized()) {
         LOG(FATAL) << "Problem creating video parser";
         return;
@@ -170,8 +171,9 @@ void CUThreadedDecoder::Start() {
     // buffers paired 1:1 with newly pushed packets, starving later frames
     // and deadlocking PushNext's backpressure loop.
     decoder_ = CUVideoDecoderImpl();
-    parser_ = CUVideoParser(dec_ctx_->codec_id, this, kMaxOutputSurfaces, dec_ctx_->extradata,
-                            dec_ctx_->extradata_size);
+    parser_ = CUVideoParser(dec_ctx_->codec_id, this,
+                            ThreadedDecoderInterface::kDecodeSurfaceCount,
+                            dec_ctx_->extradata, dec_ctx_->extradata_size);
     if (!parser_.Initialized()) {
         LOG(FATAL) << "Problem creating video parser";
         return;
@@ -201,7 +203,39 @@ void CUThreadedDecoder::Stop() {
 }
 
 void CUThreadedDecoder::Clear() {
-    Stop();
+    // 顺序关键（异步批解码）：
+    // 1) 先通知解码线程退出（不 join）—— run_=false 后显示回调立即返回
+    //    不再 map/launch kernel，也不再有新条目入队；
+    // 2) 再同步解码流 + 解映射：解码线程可能阻塞在"surface 复用等待"
+    //    （NVDEC 契约：未 unmap 的输出表面不可复用于解码），解映射是
+    //    唤醒它的唯一途径 —— 若先 join 会挂死；
+    // 3) 最后 join（此时解码线程已可退出）。
+    draining_.store(false);
+    if (run_.load()) {
+        pkt_queue_->SignalForKill();
+        run_.store(false);
+        frame_queue_->SignalForKill();
+        reorder_queue_->SignalForKill();
+    }
+    pkt_room_cv_.notify_all();  // 唤醒 Push() 背压等待
+    cudaSetDevice(device_id_);
+    CHECK_CUDA_CALL(cudaStreamSynchronize(stream_));
+    {
+        std::lock_guard<std::mutex> lock(pending_maps_mutex_);
+        pending_maps_.clear();
+    }
+    // reorder 中残留条目（含映射）不在此排空：SignalForKill 后 Pop 恒
+    // false（dmlc 队列语义），无法排空。它们随 Start() 的队列 reset 或
+    // 本对象析构而析构 —— 两次 sync + join 保证其 kernel 全部完成，
+    // 析构 unmap 安全。
+    if (launcher_t_.joinable()) {
+        launcher_t_.join();
+    }
+    // 二次 sync：覆盖"run_=false 与首次 sync 之间仍在途的显示回调"
+    // （回调已过 run_ 检查 → 仍会 launch kernel 并 push 条目；kernel
+    // 完成晚于回调返回，join 不等待 kernel）。此 sync 后所有 kernel
+    // 均已完成，后续任何条目析构（Start 队列 reset / 对象析构）安全。
+    CHECK_CUDA_CALL(cudaStreamSynchronize(stream_));
     frame_count_.store(0);
     {
       std::lock_guard<std::mutex> lock(pts_mutex_);
@@ -286,17 +320,23 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
     }
     if (skip) {
         // skip frame processing
-        reorder_queue_->Push(arr);
+        reorder_queue_->Push(FrameEntry{arr, nullptr});
         return 1;
     }
 
     uint8_t* dst_ptr = static_cast<uint8_t*>(arr.data_->dl_tensor.data);
-    auto frame = CUMappedFrame(disp_info, decoder_, stream_);
+    // 异步批解码：映射帧随条目传递（shared_ptr），surface 保持映射直到
+    // 消费者 SyncStream —— 转换 kernel 在 stream_ 上异步执行，本回调
+    // 不再逐帧 cudaStreamSynchronize（旧同步把解码线程的下一包提交与
+    // SM kernel 串行化；现在 NVDEC 与转换 kernel 全异步流水，消费者
+    // 批量收帧后一次 sync）。解映射必须晚于 kernel 完成（否则纹理读取
+    // 未映射资源为未定义行为），故延迟到 SyncStream。
+    auto frame = std::make_shared<CUMappedFrame>(disp_info, decoder_, stream_);
     // int64_t frame_pts = static_cast<int64_t>(frame.disp_info->timestamp);
     auto input_width = decoder_.Width();
     auto input_height = decoder_.Height();
-    auto& textures = tex_registry_.GetTexture(frame.get_ptr(),
-                                            frame.get_pitch(),
+    auto& textures = tex_registry_.GetTexture(frame->get_ptr(),
+                                            frame->get_pitch(),
                                             input_width,
                                             input_height,
                                             ScaleMethod_Linear,
@@ -316,11 +356,7 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
                      0, 0, 0.0f, 0.0f, decoder_.BitDepth(),
                      output_format_, color_range_);
     }
-    if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
-        LOG(FATAL) << "Error synchronize cuda stream";
-        return 0;
-    }
-    reorder_queue_->Push(arr);
+    reorder_queue_->Push(FrameEntry{arr, frame});
     return 1;
 }
 
@@ -349,12 +385,15 @@ void CUThreadedDecoder::Push(AVPacketPtr pkt, NDArray buf) {
     if (!pkt) draining_.store(true);
 
     {
-        // Backpressure: wait until the queue drains below the surface
-        // limit. The decoder thread notifies after every Pop; the old
+        // Backpressure: wait until the queue drains below the pipeline
+        // limit (kMaxPipelinePackets < kDecodeSurfaceCount —— 异步批解码
+        // 下解码线程领先必须受此约束，surface 复用才不追到映射帧）。
+        // The decoder thread notifies after every Pop; the old
         // 1ns busy-poll burned a full core while the decoder saturated.
         std::unique_lock<std::mutex> lock(pkt_room_mutex_);
         pkt_room_cv_.wait(lock, [this]() {
-            return !run_.load() || pkt_queue_->Size() <= kMaxOutputSurfaces;
+            return !run_.load()
+                || pkt_queue_->Size() <= kMaxPipelinePackets;
         });
     }
 
@@ -371,11 +410,40 @@ bool CUThreadedDecoder::Pop(NDArray *frame) {
     if (reorder_queue_->Size() < 1) {
         return false;
     }
-    int ret = reorder_queue_->Pop(frame);
+    // 死锁阀：已弹出未同步的映射 ≥ surface 上限的一半时先行 sync 释放
+    // （异步批解码下 surface 保持映射直到 SyncStream；不释放则解码线程
+    // 会因无空 surface 停滞，而消费者又在等下一帧 —— 互等死锁）。
+    {
+        std::lock_guard<std::mutex> lock(pending_maps_mutex_);
+        if (pending_maps_.size() >= kMaxOutputSurfaces / 2) {
+            // sync 必须先于解映射（析构 unmap）：kernel 读纹理期间
+            // 解映射是未定义行为。
+            cudaSetDevice(device_id_);
+            CHECK_CUDA_CALL(cudaStreamSynchronize(stream_));
+            pending_maps_.clear();
+        }
+    }
+    FrameEntry entry;
+    int ret = reorder_queue_->Pop(&entry);
     CheckErrorStatus();
     if (!ret) return false;
+    if (entry.map) {
+        std::lock_guard<std::mutex> lock(pending_maps_mutex_);
+        pending_maps_.push_back(entry.map);
+    }
+    *frame = entry.arr;
     --frame_count_;
     return true;
+}
+
+void CUThreadedDecoder::SyncStream() {
+    // 批级栅栏：同步解码流（全部在途转换 kernel 完成）→ 解映射全部待
+    // 处理 surface。顺序必须 sync 在前：解映射（析构 unmap）早于
+    // kernel 完成会让纹理读取未映射资源（未定义行为）。
+    cudaSetDevice(device_id_);
+    CHECK_CUDA_CALL(cudaStreamSynchronize(stream_));
+    std::lock_guard<std::mutex> lock(pending_maps_mutex_);
+    pending_maps_.clear();
 }
 
 void CUThreadedDecoder::LaunchThread() {
@@ -446,7 +514,8 @@ void CUThreadedDecoder::LaunchThreadImpl() {
             // same way the CPU decoder does, so NextFrameImpl can fall back
             // to cached frames / rewind recovery instead of spinning.
             for (int i = 0; i < ThreadedDecoderInterface::kDrainMarkerCount; ++i) {
-                reorder_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
+                reorder_queue_->Push(FrameEntry{
+                    NDArray::Empty({1}, kInt64, kCPU), nullptr});
             }
         }
     }

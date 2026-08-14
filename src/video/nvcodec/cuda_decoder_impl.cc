@@ -6,6 +6,7 @@
 
 #include "cuda_decoder_impl.h"
 #include "../../runtime/cuda/cuda_common.h"
+#include "../threaded_decoder_interface.h"
 #include <ostream>
 
 namespace decord {
@@ -154,7 +155,11 @@ int CUVideoDecoderImpl::Initialize(CUVIDEOFORMAT* format) {
     decoder_info_.CodecType = format->codec;
     decoder_info_.ulWidth = format->coded_width;
     decoder_info_.ulHeight = format->coded_height;
-    decoder_info_.ulNumDecodeSurfaces = 20;
+    // 异步批解码（v0.7.9）：surface 数 > 最大在途帧数（~33）—— 解码
+    // surface 延迟复用，映射帧可安全保持到消费者批量 SyncStream
+    // （否则 parser 会在映射未释放时把 surface 复用于新解码：解码覆写
+    // 映射数据 / 双映射报错 CUDA error 205）。
+    decoder_info_.ulNumDecodeSurfaces = ThreadedDecoderInterface::kDecodeSurfaceCount;
     decoder_info_.ChromaFormat = format->chroma_format;
     // 8-bit content uses NV12; 10-bit and above needs the 16-bit P016
     // surface format (the kernel and textures normalize both to [0, 1]).
@@ -177,7 +182,9 @@ int CUVideoDecoderImpl::Initialize(CUVIDEOFORMAT* format) {
     area.bottom = format->display_area.bottom;
     // DLOG(INFO) << "\tUsing full size : [" << area.left << ", " << area.top
     //            << "], [" << area.right << ", " << area.bottom << "]" << std::endl;
-    decoder_info_.ulNumOutputSurfaces = 2;
+    // 与 ulNumDecodeSurfaces 一致：可同时映射帧数上限（一次最多映射
+    // ulNumOutputSurfaces 帧 —— 批量异步下在途映射 ≤ ~33 < 64）。
+    decoder_info_.ulNumOutputSurfaces = ThreadedDecoderInterface::kDecodeSurfaceCount;
     decoder_info_.ulCreationFlags = cudaVideoCreate_PreferCUVID;
     decoder_info_.vidLock = nullptr;
 

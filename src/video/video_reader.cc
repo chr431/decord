@@ -1251,21 +1251,34 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
     }
     // LOG(INFO) << height_ << " "  << width_ << " Buf size: " << bs << " total: " << bs * height_ * width_ * 3;
     int64_t frame_count = GetFrameCount();
-    uint64_t offset = 0;
+    // ── 异步批解码（GPU）：先弹出整批帧，再一次 SyncStream，再批量拷贝 ──
+    // 显示回调不再逐帧 cudaStreamSynchronize（转换 kernel 在解码流上异步
+    // 排队，surface 保持映射）；批级 sync 把 N 次逐帧栅栏合并为一次。
+    // 拷贝仍为同步 cudaMemcpy（默认流全设备同步语义），sync 之后全部
+    // 立即完成。CPU 解码器 SyncStream 为 no-op，本结构对 CPU 路径无损。
+    // 分块处理：输出池仅 22 缓冲，一次持有整批帧会耗尽池（批 > 22 时
+    // PushNext 的 Acquire 阻塞）；16 帧/块 ≤ 池的一半，解码线程始终有
+    // 缓冲可用。
+    constexpr std::size_t kBatchChunk = 16;
     std::vector<int64_t> frame_shape = {fh, fw, Channels()};
-    for (std::size_t i = 0; i < indices.size(); ++i) {
-        int64_t pos = indices[i];
-        auto it = unique_indices.find(pos);
-        if (it != unique_indices.end() && it->second != i) {
-            // not the first occurance of frame, try to copy from buffer rather than load from video
-            CHECK(i > it->second);
-            CHECK(i > 0);
-            uint64_t old_offset = offset / i * it->second;
-            auto old_view = buf.CreateOffsetView(frame_shape, kUInt8, &old_offset);
-            auto view = buf.CreateOffsetView(frame_shape, kUInt8, &offset);
-            old_view.CopyTo(view);
-        }
-        else {
+    uint64_t offset = 0;
+    for (std::size_t start = 0; start < indices.size(); start += kBatchChunk) {
+        std::size_t bend = std::min(start + kBatchChunk, indices.size());
+        std::vector<NDArray> frames(bend - start);
+        std::vector<std::size_t> dup_src(bend - start);  // 重复索引：首个出现位置
+        std::vector<bool> is_dup(bend - start, false);
+        for (std::size_t i = start; i < bend; ++i) {
+            int64_t pos = indices[i];
+            auto it = unique_indices.find(pos);
+            if (it != unique_indices.end() && it->second != i) {
+                // not the first occurance of frame, copy from buffer after
+                // the decode pass (offset math uses the copy order below)
+                CHECK(i > it->second);
+                CHECK(i > 0);
+                is_dup[i - start] = true;
+                dup_src[i - start] = it->second;
+                continue;
+            }
             CHECK_LT(pos, frame_count);
             CHECK_GE(pos, 0);
             if (curr_frame_ != pos) {
@@ -1279,10 +1292,23 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
             if (frame.Size() < 1 && eof_) {
                 LOG(FATAL) << "Error getting frame at: " << pos << " with total frames: " << frame_count;
             }
-            // copy frame to buffer
-            // LOG(INFO) << "index: " << i << ", size: " << height_ * width_ * 3 * i <<  ", offset: " << offset << " Curr frame: " << frame.data_->dl_tensor.shape[0] << " x " << frame.data_->dl_tensor.shape[1] << " x " << frame.data_->dl_tensor.shape[2] << " Frame size: " << frame.Size();
-            auto view = buf.CreateOffsetView(frame_shape, frame.data_->dl_tensor.dtype, &offset);
-            frame.CopyTo(view);
+            frames[i - start] = frame;
+        }
+        decoder_->SyncStream();
+        for (std::size_t i = start; i < bend; ++i) {
+            if (is_dup[i - start]) {
+                // copy the first occurrence's written view into this slot
+                // (same offset math as the historical single-loop order)
+                uint64_t old_offset = offset / i * dup_src[i - start];
+                auto old_view = buf.CreateOffsetView(frame_shape, kUInt8, &old_offset);
+                auto view = buf.CreateOffsetView(frame_shape, kUInt8, &offset);
+                old_view.CopyTo(view);
+            } else {
+                // copy frame to buffer
+                // LOG(INFO) << "index: " << i << ", size: " << height_ * width_ * 3 * i <<  ", offset: " << offset << " Curr frame: " << frame.data_->dl_tensor.shape[0] << " x " << frame.data_->dl_tensor.shape[1] << " x " << frame.data_->dl_tensor.shape[2] << " Frame size: " << frame.Size();
+                auto view = buf.CreateOffsetView(frame_shape, frames[i - start].data_->dl_tensor.dtype, &offset);
+                frames[i - start].CopyTo(view);
+            }
         }
     }
     return buf;

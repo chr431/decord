@@ -12,12 +12,15 @@
 #include "cuda_context.h"
 #include "cuda_decoder_impl.h"
 #include "cuda_texture.h"
+#include "cuda_mapped_frame.h"
 #include "../ffmpeg/ffmpeg_common.h"
 #include "../threaded_decoder_interface.h"
 
 #include <condition_variable>
 #include <thread>
 #include <mutex>
+#include <deque>
+#include <memory>
 
 #include <decord/runtime/ndarray.h>
 #include <dmlc/concurrency.h>
@@ -39,7 +42,14 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
     using FrameQueuePtr = std::unique_ptr<FrameQueue>;
     using PermitQueue = dmlc::ConcurrentBlockingQueue<int>;
     using PermitQueuePtr = std::shared_ptr<PermitQueue>;
-    using ReorderQueue = dmlc::ConcurrentBlockingQueue<NDArray>;
+    // 异步批解码：reorder 条目携带映射帧 —— 转换 kernel 在 stream_ 上
+    // 异步执行，surface 必须保持映射直到批级 SyncStream（否则解映射与
+    // kernel 读竞态）。drain 哨兵条目 map 为 null。
+    struct FrameEntry {
+        NDArray arr;
+        std::shared_ptr<CUMappedFrame> map;
+    };
+    using ReorderQueue = dmlc::ConcurrentBlockingQueue<FrameEntry>;
     using ReorderQueuePtr = std::unique_ptr<ReorderQueue>;
     using FrameOrderQueue = dmlc::ConcurrentBlockingQueue<int64_t>;
     using FrameOrderQueuePtr = std::unique_ptr<FrameOrderQueue>;
@@ -54,6 +64,7 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         void Clear();
         void Push(AVPacketPtr pkt, NDArray buf);
         bool Pop(NDArray *frame);
+        void SyncStream() override;
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~CUThreadedDecoder();
@@ -118,6 +129,12 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         // busy-polling with a 1ns sleep when the queue exceeds the limit
         std::mutex pkt_room_mutex_;
         std::condition_variable pkt_room_cv_;
+        // 已 Pop 但尚未同步的映射帧（转换 kernel 可能仍在 stream_ 上执行；
+        // surface 保持映射直到 SyncStream 解除）。阀值保护：接近 surface
+        // 上限时 Pop 内先行 sync，防"消费者等帧 + 解码线程等空 surface"
+        // 死锁。
+        std::deque<std::shared_ptr<CUMappedFrame>> pending_maps_;
+        std::mutex pending_maps_mutex_;
 
     DISALLOW_COPY_AND_ASSIGN(CUThreadedDecoder);
 };
