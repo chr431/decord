@@ -145,30 +145,16 @@ class CUDADeviceAPI final : public DeviceAPI {
       }
     } else if (ctx_from.device_type == kDLCUDA && ctx_to.device_type == kDLCPU) {
       CUDA_CALL(cudaSetDevice(ctx_from.device_id));
-      // Synchronous cudaMemcpy on the legacy default stream is a global
-      // barrier: it waits for ALL prior work on the decode stream and
-      // blocks it in turn, serialising each D2H with the decode of the
-      // following frames (measured ~9% of GPU sequential throughput).
-      // decord's decode path guarantees the popped frame is complete on
-      // the device (the display callback synchronizes its stream before
-      // handing the frame over), so the copy needs no cross-stream
-      // ordering: run it on a per-thread non-blocking stream and wait only
-      // for that stream, letting the decoder run ahead while the copy is
-      // in flight.
+      // 同步 D2H：cudaMemcpy 在默认（legacy）流上执行，隐式等待设备上
+      // 全部在途工作（解码流/转换 kernel），拷贝完成后才返回。线程本地
+      // 非阻塞拷贝流 + 单流 sync 的异步版本在并发解码管线中产生孤立帧
+      // 撕裂（部分行旧内容）——默认流的全设备同步语义才是正确保障。
       cudaStream_t s = static_cast<cudaStream_t>(stream);
-      bool sync_after = false;
       if (s == 0) {
-        CUDAThreadEntry *te = CUDAThreadEntry::ThreadLocal();
-        if (te->copy_stream == nullptr) {
-          CUDA_CALL(cudaStreamCreateWithFlags(&te->copy_stream, cudaStreamNonBlocking));
-        }
-        s = te->copy_stream;
-        sync_after = true;
+        CUDA_CALL(cudaMemcpy(to, from, size, cudaMemcpyDeviceToHost));
+        return;
       }
       GPUCopy(from, to, size, cudaMemcpyDeviceToHost, s);
-      if (sync_after) {
-        CUDA_CALL(cudaStreamSynchronize(s));
-      }
     } else if (ctx_from.device_type == kDLCPU && ctx_to.device_type == kDLCUDA) {
       CUDA_CALL(cudaSetDevice(ctx_to.device_id));
       GPUCopy(from, to, size, cudaMemcpyHostToDevice, cu_stream);

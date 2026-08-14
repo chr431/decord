@@ -9,6 +9,7 @@
 #include "ffmpeg/threaded_decoder.h"
 #include "../runtime/str_util.h"
 #include "../runtime/file_util.h"
+#include "frame_trace.h"
 #if DECORD_USE_CUDA
 #include "nvcodec/cuda_threaded_decoder.h"
 #include <cuda_runtime_api.h>
@@ -528,6 +529,14 @@ NDArray VideoReader::NextFrameImpl() {
             return NDArray::Empty({}, kUInt8, ctx_);
         }
         ret = decoder_->Pop(&frame);
+        if (frame.Size() > 1) {
+            trace::log("POP", static_cast<long long>(curr_frame_),
+                       static_cast<long long>(frame.pts), 0);
+        } else {
+            trace::log("RETRY", static_cast<long long>(retry),
+                       static_cast<long long>(frame.Size()),
+                       static_cast<long long>(eof_));
+        }
         if (frame.Size() <= 1) {
             if (frame.defined() && frame.data_->dl_tensor.dtype == kInt64) {
               // draining finished
