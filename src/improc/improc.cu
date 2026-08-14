@@ -74,7 +74,8 @@ __global__ void process_frame_kernel(
     cudaTextureObject_t luma, cudaTextureObject_t chroma,
     T* dst, uint16_t input_width, uint16_t input_height,
     uint16_t output_width, uint16_t output_height,
-    int src_x0, int src_y0, float fx, float fy) {
+    int src_x0, int src_y0, float fx, float fy,
+    int output_format, int color_range) {
 
     const int dst_x = blockIdx.x * blockDim.x + threadIdx.x;
     const int dst_y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -88,7 +89,34 @@ __global__ void process_frame_kernel(
 
     YUV<float> yuv;
     yuv.y = tex2D<float>(luma, src_x + 0.5, src_y + 0.5);
-    auto uv = tex2D<float2>(chroma, (src_x / 2) + 0.5, (src_y / 2) + 0.5);
+    if (output_format == 1) {
+        // GRAY8（= Y 平面，按流 range 语义）——与 CPU 路径 swscale 的
+        // GRAY8 输出一致（两侧都遵循流的 color_range）：
+        //   limited (tv): 展开 (Y-16)*255/219（BT.601 limited->full）
+        //   full (pc):    原始 Y 原样
+        // 灰度路径不需要色度采样（省一次 chroma 纹理访问）。
+        // color_range 语义：0 = limited/tv（展开），1 = full/pc（原样）。
+        if (color_range == 0) {
+            dst[dst_x + dst_y * output_width] =
+                convert<T>(clip((yuv.y - 16.0f / 255.0f)
+                                    * (255.0f / 219.0f) * 255.0f,
+                                255.0f));
+        } else {
+            dst[dst_x + dst_y * output_width] =
+                convert<T>(clip(yuv.y * 255.0f, 255.0f));
+        }
+        return;
+    }
+    // 4:2:0 chroma siting：luma 像素 (x,y) 属于色度块 (floor(x/2),
+    // floor(y/2))。必须取该块 texel 中心（索引 +0.5）而不是 (src_x/2)+0.5：
+    // 后者在奇数 luma 像素处落到两个色度 texel 的正中间，被
+    // cudaFilterModeLinear 线性插值 50/50 混合 —— 与 CPU swscale 的
+    // MPEG-2 siting（取所属 2x2 块的单个 texel）不一致，彩色边缘的
+    // RGB 差可达 40+（实测 |Δ|>=8 像素 77-91% 落在奇数行/列）。
+    // 修复后同帧 GPU/CPU 输出收敛到 ±3（仅舍入，实测 |Δ|>=8 = 0%）。
+    auto uv = tex2D<float2>(chroma,
+                            static_cast<int>(src_x * 0.5f) + 0.5f,
+                            static_cast<int>(src_y * 0.5f) + 0.5f);
     yuv.u = uv.x;
     yuv.v = uv.y;
 
@@ -104,7 +132,8 @@ int DivUp(int total, int grain) {
 void ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
     uint8_t* dst, cudaStream_t stream, uint16_t input_width, uint16_t input_height,
     int output_width, int output_height,
-    int src_x0, int src_y0, float fx, float fy, int bit_depth) {
+    int src_x0, int src_y0, float fx, float fy, int bit_depth,
+    int output_format, int color_range) {
     // resize factor: 0 表示由本函数按 in/out 推导（全帧缩放路径）；
     // ROI-first 路径由调用方传 1.0（窗口像素 1:1 映射）。
     if (fx <= 0.0f) fx = static_cast<float>(input_width) / output_width;
@@ -119,7 +148,8 @@ void ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
 
     detail::process_frame_kernel<<<grid, block, 0, stream>>>
             (luma, chroma, dst, input_width, input_height,
-             output_width, output_height, src_x0, src_y0, fx, fy);
+             output_width, output_height, src_x0, src_y0, fx, fy,
+             output_format, color_range);
 }
 }  // namespace cuda
 }  // namespace decord

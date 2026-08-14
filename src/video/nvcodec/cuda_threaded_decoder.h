@@ -102,6 +102,8 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         bool roi_valid_ = false;
         int orig_w_ = -1, orig_h_ = -1;  // 解码原始分辨率
         int out_w_ = -1, out_h_ = -1;    // SetCodecContext 目标尺寸
+        int output_format_ = 0;          // 0 = RGB24, 1 = GRAY8（improc 输出）
+        int color_range_ = 0;            // 0 = limited/tv, 1 = full/pc（GRAY8 展开语义）
         /*! \brief AV bitstream filter context */
         AVBSFContextPtr bsf_ctx_;
         unsigned int width_;

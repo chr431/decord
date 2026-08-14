@@ -19,7 +19,9 @@ void ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
                   int output_width, int output_height,
                   int src_x0 = 0, int src_y0 = 0,
                   float fx = 0.0f, float fy = 0.0f,
-                  int bit_depth = 8);
+                  int bit_depth = 8,
+                  int output_format = 0,
+                  int color_range = 0);
 #endif
 }  // namespace imp
 }  // namespace decord
