@@ -47,3 +47,4 @@ test_video_long/
 
 # local release verification artifacts
 release_check/
+bench_videos/

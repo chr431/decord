@@ -73,7 +73,16 @@ class VideoReader : public VideoReaderInterface {
         NDArray GetBatch(std::vector<int64_t> indices, NDArray buf,
                          int x1 = -1, int y1 = -1, int x2 = -1, int y2 = -1);
         void SkipFrames(int64_t num = 1);
+        /*!
+         * \brief Seek to a frame position by PTS.
+         *
+         * force_backward: always use AVSEEK_FLAG_BACKWARD (land at the
+         * keyframe AT OR BEFORE the target PTS).  Without it, seeking to a
+         * timestamp equal to a keyframe's own PTS can land one keyframe
+         * late (sparse-GOP VFR videos; see SeekAccurate).
+         */
         bool Seek(int64_t pos);
+        bool Seek(int64_t pos, bool force_backward);
         bool SeekAccurate(int64_t pos);
         NDArray GetKeyIndices();
         NDArray GetFramePTS() const;
