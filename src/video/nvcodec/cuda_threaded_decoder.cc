@@ -9,6 +9,7 @@
 #include "cuda_texture.h"
 #include "../../improc/improc.h"
 #include "nv_gpu_dyn.h"
+#include "../frame_trace.h"
 #include <chrono>
 
 
@@ -257,6 +258,8 @@ int CUThreadedDecoder::HandlePictureDecode_(CUVIDPICPARAMS* pic_params) {
 
 int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
     if (!run_.load()) return 0;
+    trace::log("DISP", static_cast<long long>(disp_info->timestamp),
+               static_cast<long long>(disp_info->picture_index), 0);
     // push to converter
     // LOG(INFO) << "frame in use occupy: " << disp_info->picture_index;
     // frame_in_use_[disp_info->picture_index] = 1;
@@ -416,6 +419,11 @@ void CUThreadedDecoder::LaunchThreadImpl() {
                 if (!CHECK_CUDA_CALL(nv::cuvidParseVideoData(parser_, &cupkt))) {
                     LOG(FATAL) << "Problem decoding packet";
                 }
+                // 每轮 receive 前释放：av_bsf_receive_packet 会重填同一
+                // 池缓冲；若解析器异步持有上轮 payload，重填会损坏其
+                // 正在消费的位流（孤立帧错误隐藏的特征性损坏）。按
+                // FFmpeg 规范每轮 unref 消除该竞态。
+                av_packet_unref(filtered_avpkt.get());
             }
         } else {
             CUVIDSOURCEDATAPACKET cupkt = {0};
