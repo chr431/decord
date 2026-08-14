@@ -371,6 +371,10 @@ std::vector<int64_t> VideoReader::FramesToPTS(const std::vector<int64_t>& positi
 }
 
 bool VideoReader::Seek(int64_t pos) {
+    return Seek(pos, false);
+}
+
+bool VideoReader::Seek(int64_t pos, bool force_backward) {
     if (!fmt_ctx_) return false;
     if (curr_frame_ == pos) return true;
     decoder_->Clear();
@@ -382,7 +386,13 @@ bool VideoReader::Seek(int64_t pos) {
     frames_popped_ = 0;
 
     int64_t ts = FrameToPTS(pos);
-    int flag = curr_frame_ > pos ? AVSEEK_FLAG_BACKWARD : 0;
+    // AVSEEK_FLAG_BACKWARD lands at the keyframe at-or-before ts.  Without
+    // it av_seek_frame lands at the first keyframe with ts >= target; when
+    // the target equals a keyframe's own PTS the mp4 seek can overshoot to
+    // the NEXT keyframe (observed on sparse-GOP VFR: 17 keyframes / 4264
+    // frames), silently corrupting every frame-counted skip that follows.
+    int flag = (force_backward || curr_frame_ > pos)
+                   ? AVSEEK_FLAG_BACKWARD : 0;
 
     int ret = av_seek_frame(fmt_ctx_.get(), actv_stm_idx_, ts, flag);
     if (flag != AVSEEK_FLAG_BACKWARD && ret < 0) {
@@ -414,20 +424,16 @@ bool VideoReader::SeekAccurate(int64_t pos) {
     int64_t key_pos = LocateKeyframe(pos);
     int64_t curr_key_pos = LocateKeyframe(curr_frame_);
     overrun_ = false;
-    // std::cout << "seek " << pos << "(" << frame_ts_[pos].pts << "), nearest key " << key_pos << "(" << frame_ts_[key_pos].pts << "), current pos "
-    // << curr_frame_ << "(" << frame_ts_[curr_frame_].pts << "), current key " << curr_key_pos  << "(" << frame_ts_[curr_key_pos].pts << ")" << std:: endl;
     if (key_pos != curr_key_pos || pos < curr_frame_) {
-        // need to seek to keyframes first
-        // std::cout << "need to seek to keyframe " << key_pos << " first " << std::endl;
-        // Direct keyframe seek on both CPU and GPU.  Verified pixel-exact
-        // against sequential decode across 8+ videos (rotated, unordered,
-        // 10-bit, sparse-keyframe, last-frame) — the rewind-to-0 previously
-        // done for "CPU accuracy" (c9bc48b) doubled the I/O and thread
-        // restarts of every random access.  CheckKeyFrame() below
-        // recalibrates via pts_frame_map_ if a position drifts, and any
-        // residual mismatch surfaces as a duplicate-frame fault-tolerance
-        // warning rather than silent corruption.
-        bool ret = Seek(key_pos);
+        // need to seek to keyframes first.
+        // Force AVSEEK_FLAG_BACKWARD: without it, seeking to a timestamp
+        // equal to a keyframe's own PTS lands one keyframe LATE on
+        // sparse-GOP VFR videos (test3: 17 keyframes / 4264 frames, seek
+        // to 2369 landed at 2403), and CheckKeyFrame's pts-map miss then
+        // trusted the wrong anchor — every skip counted from there landed
+        // +267 frames off.  Backward lands at-or-before, so the anchor is
+        // the target keyframe and the forward skip is exact.
+        bool ret = Seek(key_pos, /*force_backward=*/true);
         if (!ret) return false;
         // double check if keyframe was jumpped correctly
         if(CheckKeyFrame()){
@@ -449,6 +455,65 @@ bool VideoReader::SeekAccurate(int64_t pos) {
     } else {
         // no need to seek to keyframe, since both current and seek position belong to same keyframe
         SkipFramesImpl(pos - curr_frame_);
+    }
+
+    // ── Landing verification (frame-counted correction) ──
+    // Decode one frame at the claimed position and match its PTS against
+    // the index (tolerance +-2 time-base ticks: best-effort PTS rounding).
+    // CheckKeyFrame can wrongly accept a mis-landed keyframe when the
+    // decoded PTS misses pts_frame_map_, leaving the forward skip anchored
+    // at the wrong keyframe; this corrects the residual in one exact
+    // frame-counted skip (or re-emits the verified frame for NextFrame).
+    {
+        decoder_->Start();
+        NDArray vf;
+        bool got = false;
+        while (!got && !eof_) {
+            PushNext();
+            got = decoder_->Pop(&vf);
+        }
+        if (got && vf.pts >= 0 && vf.Size() > 1) {
+            auto lo = pts_frame_map_.lower_bound(vf.pts - 2);
+            auto hi = pts_frame_map_.upper_bound(vf.pts + 2);
+            int64_t best_idx = -1;
+            int64_t best_dist = 4;
+            for (auto it = lo; it != hi; ++it) {
+                int64_t d = it->first > vf.pts ? it->first - vf.pts
+                                               : vf.pts - it->first;
+                if (d < best_dist) {
+                    best_dist = d;
+                    best_idx = it->second;
+                }
+            }
+            if (best_idx >= 0 && best_idx != pos) {
+                if (best_idx < pos) {
+                    // stream is one past the popped (wrong) frame: reset
+                    // bookkeeping to the actual position, then count the
+                    // residual skip exactly (clamp uses curr_frame_).
+                    curr_frame_ = best_idx + 1;
+                    SkipFramesImpl(pos - curr_frame_);
+                } else {
+                    // overshoot (backward-flagged seek should prevent it):
+                    // rewind to the keyframe and re-skip; drop any stale
+                    // cached frame so NextFrame does not return it twice
+                    key_pos = LocateKeyframe(pos);
+                    Seek(key_pos, /*force_backward=*/true);
+                    SkipFramesImpl(pos - key_pos);
+                    overrun_ = false;
+                }
+            } else {
+                // best_idx == pos (verified target) or lookup inconclusive
+                // (PTS jitter beyond +-2 ticks): hand the popped frame back
+                // to NextFrame either way — the verify must never consume
+                // a frame without returning it (off-by-one).  Advance the
+                // bookkeeping past the cached frame so a following
+                // sequential access (get_batch) short-circuits without a
+                // re-seek.
+                overrun_ = true;
+                tmp_key_frame_ = vf;
+                curr_frame_ = pos + 1;
+            }
+        }
     }
     return true;
 }
@@ -549,6 +614,15 @@ NDArray VideoReader::NextFrameImpl() {
                   << " for example to allow more auto-substituded frames, exit...";
                 }
                 SeekAccurate(curr_frame_ - rewind_offset);
+                // SeekAccurate's landing verification may have consumed and
+                // cached the target frame (overrun_): hand it back instead
+                // of popping the next one (would swap two frames).
+                if (overrun_) {
+                    overrun_ = false;
+                    frame = tmp_key_frame_;
+                    ret = true;
+                    break;
+                }
                 ++rewind_offset;
                 ret = false;
               }
@@ -767,7 +841,10 @@ namespace {
 // does not match (or fails to parse) silently falls back to a full scan.
 // Disable with DECORD_DISABLE_INDEX_CACHE=1.
 constexpr uint64_t kIndexCacheMagic = 0x4443524449445831ULL;  // "DCRDIDX1"
-constexpr uint32_t kIndexCacheVersion = 1;
+// v2: pts_frame_map_ is now rebuilt from the cached frame_ts_ on load
+// (v1 caches were never re-indexed into the map, silently breaking
+// CheckKeyFrame / seek landing verification on every cache hit).
+constexpr uint32_t kIndexCacheVersion = 2;
 const char* kIndexCacheDisabledEnv = "DECORD_DISABLE_INDEX_CACHE";
 
 struct FileStamp {
@@ -864,6 +941,16 @@ bool VideoReader::LoadCachedIndex() {
         frame_ts_.clear();
         return false;
     }
+    // Rebuild the PTS -> frame map from the cached index.  IndexKeyframes
+    // does this on the scan path; the cache path must too, or CheckKeyFrame
+    // and SeekAccurate's landing verification degrade to lenient-accept on
+    // EVERY cache hit and a mis-landed keyframe seek goes uncorrected
+    // (sparse-GOP VFR videos then seek one keyframe late: the +267 frame
+    // corruption seen on test3).
+    pts_frame_map_.clear();
+    for (size_t i = 0; i < frame_ts_.size(); ++i) {
+        pts_frame_map_.insert(std::pair<int64_t, int64_t>(frame_ts_[i].pts, i));
+    }
     return true;
 }
 
@@ -949,6 +1036,7 @@ void VideoReader::IndexKeyframes() {
             [](const AVFrameTime& a, const AVFrameTime& b) -> bool
                 {return a.pts < b.pts;});
 
+    pts_frame_map_.clear();
     for (size_t i = 0; i < frame_ts_.size(); ++i){
         pts_frame_map_.insert(std::pair<int64_t, int64_t>(frame_ts_[i].pts, i));
         // std::cout << i << ": pts " << frame_ts_[i].pts << ", dts " << frame_ts_[i].dts << ", start pts " << frame_ts_[i].start << ", stop pts " << frame_ts_[i].stop << std::endl;
@@ -1047,7 +1135,9 @@ void VideoReader::SkipFrames(int64_t num) {
     if (it2 > it1) {
         int64_t old_frame = curr_frame_;
         // LOG(INFO) << "Seek to frame: " << *it2;
-        Seek(*it2);
+        // Backward-flagged like SeekAccurate: forward seek to a keyframe's
+        // own PTS can land one keyframe late on sparse-GOP VFR videos.
+        Seek(*it2, /*force_backward=*/true);
         // LOG(INFO) << "current: " << curr_frame_ << ", adjust skip from " << num << " to " << num + old_frame - *it2;
         num += old_frame - *it2;
     }
