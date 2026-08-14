@@ -110,6 +110,10 @@ void CUThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int 
     CHECK(dec_ctx);
     width_ = width;
     height_ = height;
+    orig_w_ = dec_ctx->width;
+    orig_h_ = dec_ctx->height;
+    out_w_ = width;
+    out_h_ = height;
     bool running = run_.load();
     Clear();
     dec_ctx_.reset(dec_ctx);
@@ -121,6 +125,24 @@ void CUThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int 
     }
     if (running) {
         Start();
+    }
+}
+
+void CUThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
+    // 须在 Start()（首次解码）前调用：输出池（VideoReader 侧）与转换器
+    // 输出尺寸在此固化。用户缩放（out != 原始分辨率）时不启用 ROI 窗口
+    // —— 保持全帧缩放 + 调用方裁剪的旧语义。
+    int w = x2 - x1;
+    int h = y2 - y1;
+    bool valid = w > 0 && h > 0 && x1 >= 0 && y1 >= 0
+                 && x2 <= orig_w_ && y2 <= orig_h_
+                 && out_w_ == orig_w_ && out_h_ == orig_h_;
+    if (valid) {
+        roi_x1_ = x1; roi_y1_ = y1; roi_x2_ = x2; roi_y2_ = y2;
+        roi_valid_ = true;
+    } else {
+        roi_x2_ = -1; roi_y2_ = -1;
+        roi_valid_ = false;
     }
 }
 
@@ -270,7 +292,18 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
                                             ScaleMethod_Linear,
                                             ChromaUpMethod_Linear,
                                             decoder_.BitDepth());
-    ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_, input_width, input_height, width_, height_, decoder_.BitDepth());
+    if (roi_valid_) {
+        // ROI-first：只转换 ROI 窗口（1:1 像素映射），输出池已是 ROI 尺寸
+        // （VideoReader::SetRoi 重建）→ 免全帧转换与每帧裁剪拷贝。
+        ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_,
+                     input_width, input_height,
+                     roi_x2_ - roi_x1_, roi_y2_ - roi_y1_,
+                     roi_x1_, roi_y1_, 1.0f, 1.0f, decoder_.BitDepth());
+    } else {
+        ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_,
+                     input_width, input_height, width_, height_,
+                     0, 0, 0.0f, 0.0f, decoder_.BitDepth());
+    }
     if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
         LOG(FATAL) << "Error synchronize cuda stream";
         return 0;

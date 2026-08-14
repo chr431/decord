@@ -28,6 +28,14 @@ class ThreadedDecoderInterface {
         static constexpr int kDrainMarkerCount = 128;
 
         virtual void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1, int rotation = 0, int output_format = 0) = 0;
+        /*!
+         * \brief 固定 ROI 输出（ROI-first 解码管线，须在任何帧解码前调用）。
+         * \param x1,y1,x2,y2 半开区间 [x1,x2) x [y1,y2)（全帧坐标）。
+         *        w<=0 或 h<=0 表示清除 ROI（回退全帧输出 + 调用方裁剪）。
+         * 语义：解码器从此只输出该矩形（CPU: filter 图先 crop 再格式转换；
+         * GPU: 转换 kernel 只处理 ROI 窗口，池缓冲缩小为 ROI 尺寸）。
+         */
+        virtual void SetRoi(int x1, int y1, int x2, int y2) = 0;
         virtual void Start() = 0;
         virtual void Stop() = 0;
         virtual void Clear() = 0;

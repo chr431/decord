@@ -115,6 +115,80 @@ def test_get_batch_roi_empty_falls_back_to_full_frame():
     assert batch.shape == (2, 240, 426, 3)
 
 
+# ═══════════════ ROI-first 解码管线（reader 级 ROI 固化） ═══════════════
+
+def test_reader_roi_ctor_fixed_rectangle():
+    """构造时固化 ROI：无 roi 参数的读帧也返回固定矩形。"""
+    full0 = _reader()[0].asnumpy()
+    vr = _reader(roi=(10, 20, 100, 60))
+    assert vr.next().asnumpy().shape == (40, 90, 3)
+    vr.seek_accurate(0)
+    roi = vr.next().asnumpy()
+    assert np.array_equal(roi, full0[20:60, 10:100])
+    vr.seek_accurate(0)
+    batch = vr.get_batch([0, 3]).asnumpy()
+    assert batch.shape == (2, 40, 90, 3)
+    assert np.array_equal(batch[0], full0[20:60, 10:100])
+    full3 = _reader()[3].asnumpy()
+    assert np.array_equal(batch[1], full3[20:60, 10:100])
+
+
+def test_reader_roi_ctor_gray():
+    """ROI-first 与 gray 输出组合：crop 先于 format（luma 精确裁剪）。"""
+    vr = _reader(roi=(10, 20, 100, 60), output_format='gray')
+    arr = vr.next().asnumpy()
+    assert arr.shape == (40, 90, 1)
+    rgb = _reader()[0].asnumpy()
+    luma = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    assert np.abs(arr[..., 0] - luma[20:60, 10:100]).max() < 8
+
+
+def test_reader_roi_auto_fix_on_first_call():
+    """处女 reader 的首个带 roi 读帧调用自动固化（无需构造参数）。"""
+    full = _reader()[0].asnumpy()
+    vr = _reader()  # 未 seek、未读帧
+    assert vr.next_roi(10, 20, 100, 60).asnumpy().shape == (40, 90, 3)
+    with pytest.raises(ValueError):
+        vr.next_roi(0, 0, 50, 50)
+    # 固化后缺省 roi 的调用返回固定矩形
+    vr.seek_accurate(0)
+    assert np.array_equal(vr.next().asnumpy(), full[20:60, 10:100])
+
+
+def test_reader_roi_seek_then_roi_stays_legacy():
+    """seek 后带 roi 的调用保持旧行为（每帧裁剪、不固化）——兼容性。"""
+    full = _reader().get_batch([5, 6]).asnumpy()
+    vr = _reader()
+    vr.seek_accurate(5)
+    f5 = vr.next_roi(10, 20, 100, 60).asnumpy()
+    assert np.array_equal(f5, full[0][20:60, 10:100])
+    # 未固化：后续可用不同 roi
+    assert vr.next_roi(30, 40, 80, 90).asnumpy().shape == (50, 50, 3)
+
+
+def test_reader_roi_mismatch_raises():
+    vr = _reader(roi=(10, 20, 100, 60))
+    with pytest.raises(ValueError):
+        vr.next_roi(5, 5, 50, 50)
+    with pytest.raises(ValueError):
+        vr.get_batch([0], roi=(0, 0, 80, 80))
+
+
+def test_reader_roi_invalid_ctor_raises():
+    with pytest.raises(ValueError):
+        _reader(roi=(10, 10, 10, 20))
+
+
+def test_reader_roi_legacy_after_reads_started():
+    """已开始读帧后（未固化）带 roi 的调用保持旧行为：每帧裁剪、不固化。"""
+    vr = _reader()
+    first = vr.next().asnumpy()          # 读帧 0（全帧，未带 roi）
+    roi = vr.next_roi(10, 20, 100, 60).asnumpy()   # 帧 1 的裁剪
+    assert roi.shape == (40, 90, 3)
+    # 未固化：后续可以用不同 roi（旧路径）
+    assert vr.next_roi(30, 40, 80, 90).asnumpy().shape == (50, 50, 3)
+
+
 def test_dlpack_device():
     vr = _reader()  # keep the reader alive: the frame aliases its pool buffer
     arr = vr[0]

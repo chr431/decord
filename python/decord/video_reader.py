@@ -40,11 +40,21 @@ class VideoReader(object):
         If 1 < `fault_tol`, if N > `fault_tol`, raise `DECORDLimitReachedError`.
     output_format : str, default is 'rgb'
         Output pixel format: ``'rgb'`` (3 channels) or ``'gray'`` (1 channel).
+    roi : tuple of 4 ints or None
+        Optional fixed half-open ROI ``(x1, y1, x2, y2)``: the decoder then
+        only ever outputs that rectangle (ROI-first pipeline — CPU crops
+        before color conversion, GPU converts only the ROI window).  All
+        subsequent ``next_roi`` / ``get_batch(roi=...)`` calls must pass the
+        same rectangle (a mismatch raises ``ValueError``); calls without a
+        roi argument return the fixed rectangle.  ``None`` keeps the legacy
+        behaviour: the first roi-bearing read call before any frame is
+        consumed fixes the ROI automatically, later calls fall back to
+        per-frame cropping.
 
 
     """
     def __init__(self, uri, ctx=cpu(0), width=-1, height=-1, num_threads=0, fault_tol=-1,
-                 output_format='rgb'):
+                 output_format='rgb', roi=None):
         self._handle = None
         if output_format not in ('rgb', 'gray'):
             raise ValueError("output_format must be 'rgb' or 'gray'")
@@ -68,6 +78,55 @@ class VideoReader(object):
         self._key_indices = None
         self._frame_pts = None
         self._avg_fps = None
+        # ROI-first 解码管线状态
+        self._reader_roi = None   # (x1, y1, x2, y2) 半开，None = 未固化
+        self._frames_read = 0
+        self._seeked = False      # seek 后内部可能已有在途解码帧
+        if roi is not None:
+            x1, y1, x2, y2 = (int(v) for v in roi)
+            if x2 <= x1 or y2 <= y1:
+                raise ValueError(
+                    "roi 必须是有效矩形（x2>x1 且 y2>y1），当前: {}".format(roi))
+            self._set_reader_roi(x1, y1, x2, y2)
+
+    def _set_reader_roi(self, x1, y1, x2, y2):
+        """固化 reader 级 ROI（ROI-first：解码器只输出该矩形）。
+
+        必须在读取任何帧之前调用：此后解码器（CPU filter 图 / GPU 转换
+        kernel + 输出池）按 ROI 尺寸工作，无法再输出其他矩形。首次带 roi
+        的读帧调用会自动固化（如 RaceVideoToLog 的固定 ROI 场景）；已开始
+        读帧后请求 ROI 走旧路径（每帧裁剪），保持向后兼容。
+        """
+        if self._frames_read > 0:
+            raise RuntimeError(
+                "SetRoi 必须在读取任何帧之前调用（当前已读 {} 帧）".format(
+                    self._frames_read))
+        _CAPI_VideoReaderSetRoi(self._handle, int(x1), int(y1), int(x2), int(y2))
+        self._reader_roi = (int(x1), int(y1), int(x2), int(y2))
+
+    def _check_roi(self, roi):
+        """带 roi 的读帧调用前的 ROI 一致性处理；返回归一化 roi 元组或 None。
+
+        reader ROI 已固化时：roi 必须一致（缺省回退到 reader ROI）；
+        完全处女 reader（未读帧且未 seek）自动固化（ROI-first 快速路径）；
+        已 seek / 已读帧后保持旧路径（每帧裁剪）。空矩形（x2<=x1 或
+        y2<=y1）保持旧语义（回退全帧），不固化。
+        """
+        if roi is None:
+            return None
+        x1, y1, x2, y2 = (int(v) for v in roi)
+        if x2 <= x1 or y2 <= y1:
+            return (x1, y1, x2, y2)  # 旧路径：全帧回退，不固化
+        if self._reader_roi is not None:
+            if (x1, y1, x2, y2) != self._reader_roi:
+                raise ValueError(
+                    "roi {} 与 reader 固化 ROI {} 不一致：ROI-first 解码器"
+                    "只能输出固定矩形".format((x1, y1, x2, y2), self._reader_roi))
+            return self._reader_roi
+        if self._frames_read == 0 and not self._seeked:
+            self._set_reader_roi(x1, y1, x2, y2)
+            return self._reader_roi
+        return (x1, y1, x2, y2)  # 旧路径：每帧裁剪
 
     def __del__(self):
         try:
@@ -131,12 +190,14 @@ class VideoReader(object):
 
         """
         assert self._handle is not None
+        roi = self._check_roi(roi)
         if roi is not None:
-            x1, y1, x2, y2 = (int(v) for v in roi)
+            x1, y1, x2, y2 = roi
             arr = _CAPI_VideoReaderNextFrameRoi(
                 self._handle, x1, y1, x2, y2)
         else:
             arr = _CAPI_VideoReaderNextFrame(self._handle)
+        self._frames_read += 1
         if not arr.shape:
             raise StopIteration()
         return bridge_out(arr)
@@ -163,8 +224,14 @@ class VideoReader(object):
 
         """
         assert self._handle is not None
-        arr = _CAPI_VideoReaderNextFrameRoi(
-            self._handle, int(x1), int(y1), int(x2), int(y2))
+        roi = self._check_roi((x1, y1, x2, y2))
+        if roi is not None:
+            x1, y1, x2, y2 = roi
+            arr = _CAPI_VideoReaderNextFrameRoi(
+                self._handle, int(x1), int(y1), int(x2), int(y2))
+        else:
+            arr = _CAPI_VideoReaderNextFrame(self._handle)
+        self._frames_read += 1
         if not arr.shape:
             raise StopIteration()
         return bridge_out(arr)
@@ -228,12 +295,14 @@ class VideoReader(object):
         """
         assert self._handle is not None
         indices = _nd.array(self._validate_indices(indices))
+        roi = self._check_roi(roi)
         if roi is not None:
-            x1, y1, x2, y2 = (int(v) for v in roi)
+            x1, y1, x2, y2 = roi
             arr = _CAPI_VideoReaderGetBatchRoi(
                 self._handle, indices, x1, y1, x2, y2)
         else:
             arr = _CAPI_VideoReaderGetBatch(self._handle, indices)
+        self._frames_read += len(indices)
         return bridge_out(arr)
 
     def get_key_indices(self):
@@ -285,6 +354,7 @@ class VideoReader(object):
         """
         assert self._handle is not None
         assert pos >= 0 and pos < self._num_frame
+        self._seeked = True
         success = _CAPI_VideoReaderSeek(self._handle, pos)
         if not success:
             raise RuntimeError("Failed to seek to frame {}".format(pos))
@@ -301,6 +371,7 @@ class VideoReader(object):
         """
         assert self._handle is not None
         assert pos >= 0 and pos < self._num_frame
+        self._seeked = True
         success = _CAPI_VideoReaderSeekAccurate(self._handle, pos)
         if not success:
             raise RuntimeError("Failed to seek_accurate to frame {}".format(pos))
