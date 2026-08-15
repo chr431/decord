@@ -48,3 +48,9 @@ test_video_long/
 # local release verification artifacts
 release_check/
 bench_videos/
+
+# frame index runtime cache (generated next to the repo)
+index/
+
+# local upstream issue/PR analysis artifacts
+upstream-analysis/

@@ -36,8 +36,9 @@ namespace runtime {
  */
 class NDArray {
  public:
-  // pts of the frame
-  int pts=-1;
+  // pts of the frame (int64: container PTS is 64-bit; int truncates
+  // large-PTS streams and breaks frame reordering — dmlc/decord#269)
+  int64_t pts=-1;
   // internal container type
   struct Container;
   /*! \brief default constructor */

@@ -54,6 +54,7 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         void Clear();
         void Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf);
         bool Pop(runtime::NDArray *frame);
+        bool Drained() const override;
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~FFMPEGThreadedDecoder();

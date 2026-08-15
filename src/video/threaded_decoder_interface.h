@@ -41,6 +41,13 @@ class ThreadedDecoderInterface {
         virtual void Clear() = 0;
         virtual void Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) = 0;
         virtual bool Pop(runtime::NDArray *frame) = 0;
+        /*!
+         * \brief Whether every decoded output (including EOF drain markers)
+         *        has been consumed.  Used to distinguish "no frame right now"
+         *        from "EOF and the decoder can never produce another frame",
+         *        which matters for the non-blocking GPU Pop().
+         */
+        virtual bool Drained() const = 0;
         virtual void SuggestDiscardPTS(std::vector<int64_t> dts) = 0;
         virtual void ClearDiscardPTS() = 0;
         virtual ~ThreadedDecoderInterface() = default;
