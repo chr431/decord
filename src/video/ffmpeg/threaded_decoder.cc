@@ -7,6 +7,9 @@
 #include "threaded_decoder.h"
 
 #include <dmlc/logging.h>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <thread>
 #include <chrono>
 #include "../../runtime/str_util.h"
@@ -86,6 +89,7 @@ void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, 
     out_h_ = height;
     rotation_ = rotation;
     output_format_ = output_format;
+    color_range_ = (dec_ctx->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
     // avcodec_flush_buffers（Seek/Clear 触发）会把 time_base 重置为
     // 0/1 —— filter 图 buffersrc 需要流 time_base（Invalid time base
     // 0/1）。在此快照，重建图前恢复。
@@ -128,17 +132,19 @@ void FFMPEGThreadedDecoder::BuildFilterGraph() {
     // 帧元数据让 swscale 选 BT.601 矩阵，输出与 GPU 路径对齐（逐像素差
     // ≤1-2）。
     //
-    // ROI-first（性能）：roi_valid 且 gray 输出、无旋转、无用户缩放时，
-    // crop 先于 format —— 只转换 ROI 像素（全帧 YUV→gray 的 ~99.9% 被
-    // 裁剪丢弃，单帧 ~0.4-0.8ms → ~0）。gray 只取 luma：crop 对 luma
-    // 平面按任意坐标精确裁剪。RGB 输出不启用（色度上采样在裁剪边界
-    // 需要窗口外的色度样本，与旧全帧转换逐像素不一致），保持旧路径。
+    // ROI-first（性能）：roi_valid 且 gray/nv12 输出、无旋转、无用户缩放时，
+    // crop 先于 format —— 只转换 ROI 像素。gray 只取 luma：crop 对 luma
+    // 平面按任意坐标精确裁剪；nv12 的色度按 2x2 块裁剪（VideoReader::SetRoi
+    // 已把 ROI 扩成偶数超集，CropRoi 再精裁回精确矩形）。RGB 输出不启用
+    // （色度上采样在裁剪边界需要窗口外的色度样本，与旧全帧转换逐像素
+    // 不一致），保持旧路径。
     // 旋转非 0 或用户缩放时同样保持旧行为（全帧转换 + 调用方裁剪）。
-    const char *fmt = output_format_ ? "gray" : "rgb24";
+    const char *fmt = output_format_ == 2 ? "yuv420p"
+                      : (output_format_ == 1 ? "gray" : "rgb24");
     bool user_scale = (out_w_ > 0 && out_h_ > 0
                        && (out_w_ != orig_w_ || out_h_ != orig_h_));
     bool crop_first = roi_valid_ && rotation_ == 0 && !user_scale
-                      && output_format_ == 1;
+                      && output_format_ != 0;
     int crop_w = roi_x2_ - roi_x1_;
     int crop_h = roi_y2_ - roi_y1_;
     char descr[256];    switch (rotation_) {
@@ -531,20 +537,53 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
 
 NDArray FFMPEGThreadedDecoder::CopyToNDArray(AVFramePtr p) {
     CHECK(p) << "Error: converting empty AVFrame to DLTensor";
-    // int channel = p->linesize[0] / p->width;
-    CHECK(AVPixelFormat(p->format) == AV_PIX_FMT_RGB24 || AVPixelFormat(p->format) == AV_PIX_FMT_GRAY8)
-        << "Only support RGB24/GRAY8 image to NDArray conversion, given: "
+    CHECK(AVPixelFormat(p->format) == AV_PIX_FMT_RGB24
+          || AVPixelFormat(p->format) == AV_PIX_FMT_GRAY8
+          || AVPixelFormat(p->format) == AV_PIX_FMT_YUV420P)
+        << "Only support RGB24/GRAY8/YUV420P image to NDArray conversion, given: "
         << AVPixelFormat(p->format);
+    DLDevice ctx;
+    CHECK(!p->hw_frames_ctx) << "Not supported hw_frames_ctx";
+    ctx = kCPU;
+    auto device_api = runtime::DeviceAPI::Get(ctx);
+    if (AVPixelFormat(p->format) == AV_PIX_FMT_YUV420P) {
+        // packed 2D 输出：前 h 行原始 Y，随后 ceil(h/2) 行 interleaved
+        // U/V（原始 4:2:0，按 MPEG-2 siting 打包）。Y 不做 range 展开：
+        // 调用方通过 get_color_range() 自行展开（与 gray 输出同一语义）。
+        int h = p->height;
+        int w = p->width;
+        int rows = h + (h + 1) / 2;
+        NDArray arr = NDArray::Empty({rows, w}, kUInt8, ctx);
+        uint8_t *to_ptr = static_cast<uint8_t *>(arr.data_->dl_tensor.data);
+        // Y：原始值逐行拷贝（调用方按 get_color_range 自行展开；
+        // gray 输出仍在此处展开，两者语义清晰分离）
+        for (int y = 0; y < h; ++y) {
+            const uint8_t *src = p->data[0] + static_cast<int64_t>(y) * p->linesize[0];
+            uint8_t *dst = to_ptr + static_cast<int64_t>(y) * w;
+            std::memcpy(dst, src, static_cast<size_t>(w));
+        }
+        // U/V：交错打包成 NV12 行（每对 luma 列一个 U、一个 V）
+        int uv_w = (w + 1) / 2;
+        int uv_h = h / 2;
+        for (int y = 0; y < uv_h; ++y) {
+            const uint8_t *u = p->data[1] + static_cast<int64_t>(y) * p->linesize[1];
+            const uint8_t *v = p->data[2] + static_cast<int64_t>(y) * p->linesize[2];
+            uint8_t *dst = to_ptr + static_cast<int64_t>(h + y) * w;
+            for (int x = 0; x < w / 2; ++x) {
+                int sx = std::min(x, uv_w - 1);
+                dst[x * 2] = u[sx];
+                dst[x * 2 + 1] = v[sx];
+            }
+        }
+        arr.pts = p->pts;
+        return arr;
+    }
     int channel = AVPixelFormat(p->format) == AV_PIX_FMT_RGB24 ? 3 : 1;
     // CHECK(p->linesize[0] % p->width == 0)
     //     << "AVFrame data is not a compact array. linesize: " << p->linesize[0]
     //     << " width: " << p->width;
 
-    DLDevice ctx;
-    CHECK(!p->hw_frames_ctx) << "Not supported hw_frames_ctx";
-    ctx = kCPU;
     NDArray arr = NDArray::Empty({p->height, p->width, channel}, kUInt8, ctx);
-    auto device_api = runtime::DeviceAPI::Get(ctx);
     void *to_ptr = arr.data_->dl_tensor.data;
     void *from_ptr = p->data[0];
     int linesize = p->width * channel;
@@ -567,6 +606,11 @@ static void AVFrameManagerDeleter(DLManagedTensor *manager) {
 }
 
 NDArray FFMPEGThreadedDecoder::AsNDArray(AVFramePtr p) {
+    if (AVPixelFormat(p->format) == AV_PIX_FMT_YUV420P) {
+        // YUV420P 有三个平面（Y/U/V），无法零拷贝单个 DLPack tensor ——
+        // 打包成 NV12 布局的 2D 数组并拷贝（ROI-first 下只拷 ROI 尺寸）。
+        return CopyToNDArray(p);
+    }
     if (p->linesize[0] % p->width != 0) {
         // Fallback to copy since original AVFrame is not compact
         return CopyToNDArray(p);

@@ -89,6 +89,8 @@ class VideoReader : public VideoReaderInterface {
         double GetAverageFPS() const;
         double GetRotation() const;
         std::string GetCodec() const;
+        /*! \brief 流 color_range：0 = limited/tv, 1 = full/pc（Y 展开语义）。 */
+        int GetColorRange() const { return color_range_; }
     protected:
         friend class VideoLoader;
         std::vector<int64_t> GetKeyIndicesVector() const;
@@ -114,6 +116,8 @@ class VideoReader : public VideoReaderInterface {
         /*! \brief Row-stride copy of a frame's ROI rectangle (CPU memcpy or
          *  GPU cudaMemcpy2D).  Shared by NextFrameRoi and GetBatch(roi). */
         NDArray CropRoi(NDArray frame, int x1, int y1, int x2, int y2);
+        /*! \brief ROI crop for packed NV12 frames (Y rows + interleaved UV). */
+        NDArray CropRoiYuv420(NDArray frame, int x1, int y1, int x2, int y2);
 
         DLDevice ctx_;
         std::vector<int64_t> key_indices_;
@@ -133,8 +137,19 @@ class VideoReader : public VideoReaderInterface {
         int64_t nb_thread_decoding_;  // number of threads for decoding
         int width_;   // output video width
         int height_;  // output video height
-        int output_format_;  // 0 = RGB24, 1 = GRAY8 (1 channel)
-        int Channels() const { return output_format_ ? 1 : 3; }
+        int output_format_;  // 0 = RGB24, 1 = GRAY8, 2 = YUV420/NV12
+        int color_range_ = 0;  // 0 = limited/tv, 1 = full/pc（Y 展开语义）
+        // RGB/gray use 3D frames (h,w,c); yuv420 uses a packed 2D frame
+        // (h+ceil(h/2), w) — Y rows first, then interleaved U/V rows.
+        int OutputChannels() const { return output_format_ == 1 ? 1 : 3; }
+        bool IsYuv420() const { return output_format_ == 2; }
+        int64_t FrameRows(int64_t h) const {
+            return IsYuv420() ? h + (h + 1) / 2 : h;
+        }
+        std::vector<int64_t> FrameShape(int64_t h, int64_t w) const {
+            if (IsYuv420()) return {FrameRows(h), w};
+            return {h, w, OutputChannels()};
+        }
         // ── ROI-first 状态（SetRoi）──
         int roi_x1_ = 0, roi_y1_ = 0, roi_x2_ = -1, roi_y2_ = -1;  // 半开
         bool has_roi_ = false;

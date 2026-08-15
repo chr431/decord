@@ -39,7 +39,11 @@ class VideoReader(object):
         If 0 < `fault_tol` < 1.0, if N > `fault_tol * len(video)`, raise `DECORDLimitReachedError`.
         If 1 < `fault_tol`, if N > `fault_tol`, raise `DECORDLimitReachedError`.
     output_format : str, default is 'rgb'
-        Output pixel format: ``'rgb'`` (3 channels) or ``'gray'`` (1 channel).
+        Output pixel format: ``'rgb'`` (HxWx3), ``'gray'`` (HxW, luma after
+        color-range expansion) or ``'yuv420'`` (semi-planar NV12 packed into
+        a single H*3/2 x W array: first H rows are raw luma, followed by
+        ceil(H/2) rows of interleaved raw U/V 4:2:0; use
+        ``get_color_range()`` to apply the same luma expansion as 'gray').
     roi : tuple of 4 ints or None
         Optional fixed half-open ROI ``(x1, y1, x2, y2)``: the decoder then
         only ever outputs that rectangle (ROI-first pipeline — CPU crops
@@ -56,9 +60,9 @@ class VideoReader(object):
     def __init__(self, uri, ctx=cpu(0), width=-1, height=-1, num_threads=0, fault_tol=-1,
                  output_format='rgb', roi=None):
         self._handle = None
-        if output_format not in ('rgb', 'gray'):
-            raise ValueError("output_format must be 'rgb' or 'gray'")
-        self._output_format = 1 if output_format == 'gray' else 0
+        if output_format not in ('rgb', 'gray', 'yuv420'):
+            raise ValueError("output_format must be 'rgb', 'gray' or 'yuv420'")
+        self._output_format = 1 if output_format == 'gray' else (2 if output_format == 'yuv420' else 0)
         assert isinstance(ctx, DECORDContext)
         fault_tol = str(fault_tol)
         if hasattr(uri, 'read'):
@@ -345,6 +349,19 @@ class VideoReader(object):
 
         """
         return _CAPI_VideoReaderGetCodec(self._handle)
+
+    def get_color_range(self):
+        """Get the stream luma color range.
+
+        Returns
+        -------
+        int
+            ``0`` = limited/tv (16-235), ``1`` = full/pc (0-255).
+            ``'gray'`` output expands limited→full accordingly; ``'yuv420'``
+            keeps the raw Y plane so callers can apply the same expansion.
+
+        """
+        return _CAPI_VideoReaderGetColorRange(self._handle)
 
     def get_avg_fps(self):
         """Get average FPS(frame per second).

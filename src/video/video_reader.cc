@@ -282,8 +282,9 @@ void VideoReader::SetVideoStream(int stream_nb) {
         // the popped buffer for zero-copy fault tolerance) plus 1 margin.
         // Recycling buffers removes a cudaMalloc/cudaFree per frame, which
         // measures ~+59% GPU sequential decode on HEVC with no memory cost
-        ndarray_pool_.Reset(22, {height_, width_, Channels()}, kUInt8, ctx_);
+        ndarray_pool_.Reset(22, FrameShape(height_, width_), kUInt8, ctx_);
     }
+    color_range_ = (dec_ctx->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
 
     decoder_->SetCodecContext(dec_ctx, width_, height_, rotation, output_format_);
     // Frame/keyframe index: reuse a fresh on-disk cache entry (keyed by file
@@ -694,9 +695,10 @@ void VideoReader::SetRoi(int x1, int y1, int x2, int y2) {
     // CPU（FFmpeg filter）路径：crop 在 yuv420p 上要求偶数宽高（奇数尺寸
     // 实测全黑/崩溃）。按偶数扩充（右/下越界则左/上扩展），CropRoi 按
     // (x1-fx1, y1-fy1) 偏移从 filter 输出顶部对齐精裁回精确 ROI。
-    // GPU 路径：转换 kernel 直接写精确 ROI 窗口，无需扩充。
+    // GPU 路径：RGB/gray 转换 kernel 直接写精确 ROI 窗口，无需扩充；
+    // YUV420 输出两个路径都按偶数扩充（NV12 色度平面以 2x2 块为粒度）。
     int fx1 = x1, fy1 = y1, fw = w, fh = h;
-    if (ctx_.device_type != kDLCUDA) {
+    if (IsYuv420() || ctx_.device_type != kDLCUDA) {
         // FFmpeg crop 在 yuv420p 上要求 x/y/w/h 全偶数（奇数位置同样
         // 实测错乱：luma 行错位 ~55% 像素、奇数尺寸全黑/崩溃）。构造
         // 偶数超集（位置向下取偶、终点向上取偶），CropRoi 按偏移精裁。
@@ -726,8 +728,95 @@ void VideoReader::SetRoi(int x1, int y1, int x2, int y2) {
                        << "seek (pkts_pushed_=" << pkts_pushed_
                        << ", frames_popped_=" << frames_popped_ << ")";
         }
-        ndarray_pool_.Reset(22, {roi_h_, roi_w_, Channels()}, kUInt8, ctx_);
+        if (IsYuv420()) {
+            // YUV420 用偶数超集（NV12 色度 2x2 对齐），CropRoi 精确裁回
+            ndarray_pool_.Reset(22, FrameShape(roi_fh_, roi_fw_), kUInt8, ctx_);
+        } else {
+            ndarray_pool_.Reset(22, {roi_h_, roi_w_, OutputChannels()},
+                                kUInt8, ctx_);
+        }
     }
+}
+
+NDArray VideoReader::CropRoiYuv420(NDArray frame, int x1, int y1, int x2, int y2) {
+    // 输入为 packed NV12：前 h 行 Y（宽 w），后 ceil(h/2) 行 interleaved
+    // U/V（同一行宽 w；奇宽时末字节无意义）。两个来源：
+    //  a) ROI-first 偶数超集（shape = FrameShape(roi_fh_, roi_fw_)）
+    //  b) 旧路径全帧输出（shape = FrameShape(height_, width_)）
+    int w = x2 - x1;
+    int h = y2 - y1;
+    NDArray out = NDArray::Empty(FrameShape(h, w), kUInt8, kCPU);
+    if (!frame.defined() || frame.data_ == nullptr
+        || frame.data_->dl_tensor.ndim != 2) {
+        return out;
+    }
+    const char *src = static_cast<const char *>(frame.data_->dl_tensor.data);
+    char *dst = static_cast<char *>(out.data_->dl_tensor.data);
+    int64_t src_fw = frame.data_->dl_tensor.shape[1];
+    int64_t src_rows = frame.data_->dl_tensor.shape[0];
+    // Y 平面行数：完整 NV12 时为 src_rows * 2 / 3（向偶数取整的逆运算）
+    int src_h = static_cast<int>(src_rows * 2 / 3);
+    // ROI-first 超集：裁剪偏移 = 精确 ROI - 偶数超集左上角；
+    // 全帧旧路径：偏移 = ROI 坐标本身。
+    bool from_roi_superset = has_roi_ && src_h == roi_fh_ && src_fw == roi_fw_;
+    int off_x = from_roi_superset ? x1 - roi_fx1_ : x1;
+    int off_y = from_roi_superset ? y1 - roi_fy1_ : y1;
+    if (off_x < 0 || off_y < 0 || off_x + w > src_fw || off_y + h > src_h) {
+        // 越界防御：只拷有效区域（调用方已 clamp 到整帧范围）
+        return out;
+    }
+    if (ctx_.device_type == kDLCUDA) {
+#if DECORD_USE_CUDA
+        // GPU 帧在设备内存：Y 与 UV 各一次 2D 拷贝到主机（ROI 尺寸），
+        // 避免全帧 D2H；后续 GetBatch 会把该主机 ROI 拷回批缓冲。
+        cudaError_t err = cudaSetDevice(ctx_.device_id);
+        CHECK_EQ(err, cudaSuccess) << "cudaSetDevice failed in CropRoiYuv420";
+        err = cudaMemcpy2D(
+            dst, static_cast<size_t>(w),                          // dst pitch
+            src + static_cast<int64_t>(off_y) * src_fw + off_x,   // src Y
+            static_cast<size_t>(src_fw),                          // src pitch
+            static_cast<size_t>(w), static_cast<size_t>(h),
+            cudaMemcpyDeviceToHost);
+        CHECK_EQ(err, cudaSuccess) << "cudaMemcpy2D failed in CropRoiYuv420 (Y)";
+        int pairs = w / 2;
+        int uv_rows = (h + 1) / 2;
+        err = cudaMemcpy2D(
+            dst + static_cast<int64_t>(h) * w,                    // dst UV
+            static_cast<size_t>(w),                               // dst pitch
+            src + static_cast<int64_t>(src_h) * src_fw
+                + static_cast<int64_t>(off_y / 2) * src_fw
+                + 2 * static_cast<int64_t>(off_x / 2),            // src UV
+            static_cast<size_t>(src_fw),                          // src pitch
+            static_cast<size_t>(2 * pairs), static_cast<size_t>(uv_rows),
+            cudaMemcpyDeviceToHost);
+        CHECK_EQ(err, cudaSuccess) << "cudaMemcpy2D failed in CropRoiYuv420 (UV)";
+#endif
+        return out;
+    }
+    // 1) Y 平面：逐行精确拷贝（luma 任意坐标裁剪）
+    const char *y_src = src + static_cast<int64_t>(off_y) * src_fw + off_x;
+    char *y_dst = dst;
+    for (int y = 0; y < h; ++y) {
+        std::memcpy(y_dst + static_cast<int64_t>(y) * w,
+                    y_src + static_cast<int64_t>(y) * src_fw,
+                    static_cast<size_t>(w));
+    }
+    // 2) UV 平面（NV12，2x2 块）：输出每行 j 对应源色度行
+    //    floor((off_y + 2*j)/2)；每对列 j 对应源色度块
+    //    floor((off_x + 2*j)/2)。奇数起始坐标按 floor 对齐（标准 4:2:0
+    //    裁剪语义）；奇宽末列无独立色度，末字节留空由调用方忽略。
+    const char *uv_src = src + static_cast<int64_t>(src_h) * src_fw
+        + static_cast<int64_t>(off_y / 2) * src_fw
+        + 2 * static_cast<int64_t>(off_x / 2);
+    char *uv_dst = dst + static_cast<int64_t>(h) * w;
+    int pairs = w / 2;
+    int uv_rows = (h + 1) / 2;
+    for (int j = 0; j < uv_rows; ++j) {
+        std::memcpy(uv_dst + static_cast<int64_t>(j) * w,
+                    uv_src + static_cast<int64_t>(j) * src_fw,
+                    static_cast<size_t>(2 * pairs));
+    }
+    return out;
 }
 
 NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
@@ -742,6 +831,9 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
     if (!frame.defined() || frame.Size() <= 1) {
         // EOF marker / drain sentinel: pass through untouched
         return frame;
+    }
+    if (IsYuv420()) {
+        return CropRoiYuv420(frame, x1, y1, x2, y2);
     }
     // ROI-first 直通：解码器已输出 ROI 尺寸的帧（CPU filter crop 或
     // GPU 转换器窗口）→ 无需再裁剪/拷贝。
@@ -758,7 +850,7 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
         && frame.data_->dl_tensor.shape[1] == roi_fw_
         && x1 == roi_x1_ && y1 == roi_y1_
         && x2 == roi_x2_ && y2 == roi_y2_) {
-        int c = Channels();
+        int c = OutputChannels();
         int off_x = roi_x1_ - roi_fx1_;
         int off_y = roi_y1_ - roi_fy1_;
         NDArray out = NDArray::Empty({roi_h_, roi_w_, c}, kUInt8, kCPU);
@@ -776,7 +868,7 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
         }
         return out;
     }
-    NDArray roi = NDArray::Empty({y2 - y1, x2 - x1, Channels()}, kUInt8, kCPU);
+    NDArray roi = NDArray::Empty({y2 - y1, x2 - x1, OutputChannels()}, kUInt8, kCPU);
     if (ctx_.device_type == kDLCUDA) {
 #if DECORD_USE_CUDA
         // the display callback already synchronized the decode stream, so the
@@ -788,12 +880,12 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
         if (err == cudaSuccess) {
             err = cudaMemcpy2D(
                 roi->data,                                   // dst
-                static_cast<size_t>(x2 - x1) * Channels(),   // dst pitch (bytes)
+                static_cast<size_t>(x2 - x1) * OutputChannels(),   // dst pitch (bytes)
                 static_cast<const char *>(frame->data)
-                    + static_cast<int64_t>(y1) * width_ * Channels()
-                    + static_cast<int64_t>(x1) * Channels(), // src + row/col offset
-                static_cast<size_t>(width_) * Channels(),    // src pitch (bytes)
-                static_cast<size_t>(x2 - x1) * Channels(),   // bytes per row
+                    + static_cast<int64_t>(y1) * width_ * OutputChannels()
+                    + static_cast<int64_t>(x1) * OutputChannels(), // src + row/col offset
+                static_cast<size_t>(width_) * OutputChannels(),    // src pitch (bytes)
+                static_cast<size_t>(x2 - x1) * OutputChannels(),   // bytes per row
                 static_cast<size_t>(y2 - y1),                // rows
                 cudaMemcpyDeviceToHost);
         }
@@ -805,11 +897,11 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
         // caller's asnumpy() would otherwise copy the whole frame per call
         // (measured ~0.6ms/frame, ~37% of the 4-thread decode budget).
         const char *src = static_cast<const char *>(frame->data)
-            + static_cast<int64_t>(y1) * width_ * Channels()
-            + static_cast<int64_t>(x1) * Channels();
+            + static_cast<int64_t>(y1) * width_ * OutputChannels()
+            + static_cast<int64_t>(x1) * OutputChannels();
         char *dst = static_cast<char *>(roi->data);
-        size_t src_pitch = static_cast<size_t>(width_) * Channels();
-        size_t row_bytes = static_cast<size_t>(x2 - x1) * Channels();
+        size_t src_pitch = static_cast<size_t>(width_) * OutputChannels();
+        size_t row_bytes = static_cast<size_t>(x2 - x1) * OutputChannels();
         for (int y = 0; y < y2 - y1; ++y) {
             std::memcpy(dst + static_cast<int64_t>(y) * row_bytes,
                         src + static_cast<int64_t>(y) * src_pitch,
@@ -1291,13 +1383,16 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
     bool use_roi = x2 > x1 && y2 > y1;
     int64_t fh = use_roi ? y2 - y1 : height_;
     int64_t fw = use_roi ? x2 - x1 : width_;
+    std::vector<int64_t> frame_shape = FrameShape(fh, fw);
     if (!buf.defined()) {
-        buf = NDArray::Empty({static_cast<int64_t>(bs), fh, fw, Channels()}, kUInt8, ctx_);
+        std::vector<int64_t> buf_shape = {
+            static_cast<int64_t>(bs), frame_shape[0], frame_shape[1]};
+        if (frame_shape.size() == 3) buf_shape.push_back(frame_shape[2]);
+        buf = NDArray::Empty(buf_shape, kUInt8, ctx_);
     }
     // LOG(INFO) << height_ << " "  << width_ << " Buf size: " << bs << " total: " << bs * height_ * width_ * 3;
     int64_t frame_count = GetFrameCount();
     uint64_t offset = 0;
-    std::vector<int64_t> frame_shape = {fh, fw, Channels()};
     for (std::size_t i = 0; i < indices.size(); ++i) {
         int64_t pos = indices[i];
         auto it = unique_indices.find(pos);
@@ -1348,7 +1443,7 @@ bool VideoReader::FetchCachedFrame(NDArray &frame, int64_t pos) {
   if (!use_cached_frame_) return false;
   if (cached_frame_.Size() <= 1) return false;
   if (!frame.defined() || frame.Size() != cached_frame_.Size()) {
-      frame = NDArray::Empty({height_, width_, Channels()}, kUInt8, ctx_);
+      frame = NDArray::Empty(FrameShape(height_, width_), kUInt8, ctx_);
   }
   frame.CopyFrom(cached_frame_);
   failed_idx_.insert(pos);

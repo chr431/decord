@@ -28,7 +28,7 @@ class FFMPEGFilterGraph {
          *
          * \param filter_desc String defining filter descriptions
          * \param dec_ctx Decoder context
-         * \param output_format 0 = RGB24 (default), 1 = GRAY8
+         * \param output_format 0 = RGB24 (default), 1 = GRAY8, 2 = YUV420P
          */
         FFMPEGFilterGraph(std::string filter_desc, AVCodecContext *dec_ctx, int output_format = 0);
         /**
@@ -56,7 +56,7 @@ class FFMPEGFilterGraph {
          *
          * \param filter_desc String defining filter descriptions
          * \param dec_ctx Decoder context
-         * \param output_format 0 = RGB24 (default), 1 = GRAY8
+         * \param output_format 0 = RGB24 (default), 1 = GRAY8, 2 = YUV420P
          */
         void Init(std::string filter_desc, AVCodecContext *dec_ctx, int output_format);
         /**

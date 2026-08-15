@@ -120,6 +120,26 @@ __global__ void process_frame_kernel(
     yuv.u = uv.x;
     yuv.v = uv.y;
 
+    if (output_format == 2) {
+        // YUV420/NV12 packed 2D 输出：前 output_height 行是原始 Y
+        // （调用方通过 get_color_range 自行做与 GRAY8 相同的展开），
+        // 之后 output_height/2 行是原始 interleaved U/V。调用方
+        // （VideoReader）保证输出宽高为偶数（ROI-first 路径按偶数超集
+        // 重建输出池）。
+        uint8_t* out = dst;
+        out[dst_x + dst_y * output_width] =
+            convert<uint8_t>(clip(yuv.y * 255.0f, 255.0f));
+        if ((dst_x & 1) == 0 && (dst_y & 1) == 0) {
+            uint8_t* uv_out = out
+                + static_cast<size_t>(output_height) * output_width
+                + static_cast<size_t>(dst_y / 2) * output_width
+                + static_cast<size_t>(dst_x);
+            uv_out[0] = convert<uint8_t>(clip(uv.x * 255.0f, 255.0f));
+            uv_out[1] = convert<uint8_t>(clip(uv.y * 255.0f, 255.0f));
+        }
+        return;
+    }
+
     T* out = dst + (dst_x + dst_y * output_width) * 3;
     yuv2rgb(yuv, out, 1, false);
 }
@@ -136,6 +156,8 @@ void ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
     int output_format, int color_range) {
     // resize factor: 0 表示由本函数按 in/out 推导（全帧缩放路径）；
     // ROI-first 路径由调用方传 1.0（窗口像素 1:1 映射）。
+    // output_format: 0 = RGB24, 1 = GRAY8, 2 = YUV420/NV12 packed 2D
+    // （Y 平面按 color_range 展开，U/V 原始）。
     if (fx <= 0.0f) fx = static_cast<float>(input_width) / output_width;
     if (fy <= 0.0f) fy = static_cast<float>(input_height) / output_height;
     // 位深语义：P016/P012 的 10/12-bit 数据在 16-bit 字中左对齐存储，

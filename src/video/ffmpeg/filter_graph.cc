@@ -37,7 +37,12 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx,
     CHECK(buffersink) << "Error: no buffersink";
     AVFilterInOut *outputs = avfilter_inout_alloc();
 	AVFilterInOut *inputs  = avfilter_inout_alloc();
-	enum AVPixelFormat pix_fmts[] = { output_format ? AV_PIX_FMT_GRAY8 : AV_PIX_FMT_RGB24, AV_PIX_FMT_NONE };
+	enum AVPixelFormat pix_fmts[] = {
+        output_format == 1 ? AV_PIX_FMT_GRAY8
+                           : (output_format == 2 ? AV_PIX_FMT_YUV420P
+                                                 : AV_PIX_FMT_RGB24),
+        AV_PIX_FMT_NONE
+    };
 	// AVBufferSinkParams *buffersink_params;
 
 	filter_graph_.reset(avfilter_graph_alloc());

@@ -113,5 +113,24 @@ def test_bytes_io():
         assert np.mean(np.abs(vr[10].asnumpy().astype('float') - vr2[10].asnumpy().astype('float'))) < 2 # average pixel diff < 2
         
 
+def test_yuv420_full_and_roi():
+    # packed NV12 2D 输出：H + ceil(H/2) 行；Y 为原始 luma，
+    # get_color_range 告诉调用方是否 limited（0）/full（1）
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..',
+                                         'examples', 'flipping_a_pancake.mkv'))
+    vr = VideoReader(path, ctx=cpu(0))
+    h, w = vr[0].shape[:2]
+    vr_yuv = VideoReader(path, ctx=cpu(0), output_format='yuv420')
+    yuv = vr_yuv.get_batch([0, 1]).asnumpy()
+    assert yuv.shape == (2, h + (h + 1) // 2, w)
+    assert yuv.dtype == np.uint8
+    assert vr_yuv.get_color_range() in (0, 1)
+
+    vr_roi = VideoReader(path, ctx=cpu(0), output_format='yuv420',
+                         roi=(1, 1, 100, 101))
+    crop = vr_roi.get_batch([0, 2], roi=(1, 1, 100, 101)).asnumpy()
+    assert crop.shape == (2, 100 + 50, 99)  # 奇数宽：色度末字节留空
+
+
 if __name__ == '__main__':
     raise SystemExit(pytest.main([__file__]))

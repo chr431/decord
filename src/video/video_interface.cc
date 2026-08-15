@@ -35,7 +35,7 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetVideoReader")
     int num_thread = args[5];
     int io_type = args[6];
     std::string fault_tol = args[7];
-    // output_format: 0 = RGB (default), 1 = GRAY8 (1 channel, CPU path)
+    // output_format: 0 = RGB24 (default), 1 = GRAY8, 2 = YUV420/NV12
     int output_format = 0;
     try { output_format = args[8]; } catch (...) { output_format = 0; }
     DLDevice ctx;
@@ -161,6 +161,13 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetCodec")
     VideoReaderInterfaceHandle handle = args[0];
     std::string codec = static_cast<VideoReaderInterface*>(handle)->GetCodec();
     *rv = codec;
+  });
+
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetColorRange")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    int color_range = static_cast<VideoReader*>(handle)->GetColorRange();
+    *rv = color_range;
   });
 
 DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderFree")

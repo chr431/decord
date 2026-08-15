@@ -106,9 +106,10 @@ void CUThreadedDecoder::InitBitStreamFilter(AVCodecParameters *codecpar, const A
 }
 
 void CUThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int height, int rotation, int output_format) {
-    // output_format: 0 = RGB24, 1 = GRAY8。与 CPU 路径同一参数语义
-    // （上游 VideoReader(output_format=...)）；GPU 默认 RGB，传 gray 时
-    // improc kernel 直出 Y 平面（range 语义与 CPU swscale GRAY8 一致）。
+    // output_format: 0 = RGB24, 1 = GRAY8, 2 = YUV420/NV12。与 CPU 路径
+    // 同一参数语义（上游 VideoReader(output_format=...)）；GPU 默认 RGB，
+    // 传 gray/yuv420 时 improc kernel 直出 Y 平面 / packed NV12（Y 的
+    // range 语义与 CPU swscale GRAY8 一致，U/V 原始）。
     output_format_ = output_format;
     // 流的 color_range（AVCOL_RANGE_MPEG=0 limited / AVCOL_RANGE_JPEG=1
     // full）：GRAY8 输出按此决定是否做 limited->full 展开 —— 与 CPU

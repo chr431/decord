@@ -101,6 +101,7 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         int out_w_ = -1, out_h_ = -1;   // SetCodecContext 传入的目标尺寸
         int rotation_ = 0;
         int output_format_ = 0;
+        int color_range_ = 0;             // 0 = limited/tv, 1 = full/pc（Y 展开）
         AVRational time_base_{0, 1};    // 流 time_base 快照（flush 会重置）
 
     DISALLOW_COPY_AND_ASSIGN(FFMPEGThreadedDecoder);
