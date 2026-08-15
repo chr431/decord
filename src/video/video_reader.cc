@@ -342,8 +342,14 @@ int64_t VideoReader::GetFrameCount() const {
     int64_t cnt = fmt_ctx_->streams[actv_stm_idx_]->nb_frames;
     if (cnt < 1) {
         AVStream *stm = fmt_ctx_->streams[actv_stm_idx_];
-        // many formats do not provide accurate frame count, use duration and FPS to approximate
-        cnt = static_cast<double>(stm->avg_frame_rate.num) / stm->avg_frame_rate.den * fmt_ctx_->duration / AV_TIME_BASE;
+        // many formats do not provide accurate frame count, use duration and FPS to approximate.
+        // Broken metadata can carry avg_frame_rate.den == 0; guard it instead of
+        // dividing by zero (dmlc/decord PR #230).
+        if (stm->avg_frame_rate.den != 0) {
+            cnt = static_cast<double>(stm->avg_frame_rate.num) / stm->avg_frame_rate.den * fmt_ctx_->duration / AV_TIME_BASE;
+        } else {
+            cnt = 0;
+        }
     }
     if (cnt < 1) {
         LOG(FATAL) << "[" << filename_ << "] Failed to measure duration/frame-count due to broken metadata.";
@@ -841,10 +847,18 @@ namespace {
 // does not match (or fails to parse) silently falls back to a full scan.
 // Disable with DECORD_DISABLE_INDEX_CACHE=1.
 constexpr uint64_t kIndexCacheMagic = 0x4443524449445831ULL;  // "DCRDIDX1"
-// v2: pts_frame_map_ is now rebuilt from the cached frame_ts_ on load
-// (v1 caches were never re-indexed into the map, silently breaking
-// CheckKeyFrame / seek landing verification on every cache hit).
-constexpr uint32_t kIndexCacheVersion = 2;
+// Cache-format revisions:
+//   v2: pts_frame_map_ is now rebuilt from the cached frame_ts_ on load
+//       (v1 caches were never re-indexed into the map, silently breaking
+//       CheckKeyFrame / seek landing verification on every cache hit).
+// The encoded version additionally mixes in LIBAVFORMAT_VERSION_INT so a
+// cache written by one FFmpeg build can never be reused by another: packet
+// timestamp rounding differs between FFmpeg releases, and a stale index made
+// bytes-IO and path readers disagree on frame timestamps by enough to shift
+// audio-video alignment (observed when switching a local build between
+// FFmpeg 7.1 and 8.1 on the same checkout).
+constexpr uint32_t kIndexCacheVersion =
+    3u + static_cast<uint32_t>(LIBAVFORMAT_VERSION_INT);
 const char* kIndexCacheDisabledEnv = "DECORD_DISABLE_INDEX_CACHE";
 
 struct FileStamp {
@@ -1156,6 +1170,13 @@ bool VideoReader::CheckKeyFrame()
     {
         PushNext();
         ret = decoder_->Pop(&frame);
+        if (!ret && eof_) {
+            // The decoder is drained before yielding a frame (corrupted tail or
+            // container over-reporting its frame count): treat it as a miss at
+            // EOF instead of looping forever (dmlc/decord PR #230).
+            curr_frame_ = GetFrameCount();
+            return false;
+        }
     }
 
     if (eof_ && frame.pts == -1){
@@ -1201,10 +1222,34 @@ void VideoReader::SkipFramesImpl(int64_t num)
     NDArray frame;
     decoder_->Start();
     bool ret = false;
+    const int64_t initial_num = num;
     while (num > 0) {
         PushNext();
         ret = decoder_->Pop(&frame);
-        if (!ret) continue;
+        if (!ret) {
+            // eof_ means every packet has been read.  For the GPU decoder
+            // Pop() is non-blocking and can return false while the worker is
+            // still draining in-flight frames, so only treat EOF as final
+            // once the decoder reports that every output has been consumed.
+            // Some containers over-report the frame count
+            // (dmlc/decord#373: len()=431 with 300 decodable frames); without
+            // this exit the loop would spin forever and later reads would
+            // sample "ghost frames" beyond EOF.
+            if (eof_) {
+                if (decoder_->Drained()) {
+                    LOG(WARNING) << "[" << filename_ << "] EOF reached while skipping "
+                                 << initial_num << " frames; only "
+                                 << (initial_num - num) << " decoded. "
+                                 << "The container likely over-reports its frame count.";
+                    curr_frame_ = GetFrameCount();
+                    break;
+                }
+                // let in-flight decode/display callbacks finish instead of
+                // burning a core while the GPU drains
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            continue;
+        }
         ++curr_frame_;
         // LOG(INFO) << "skip: " << num;
         --num;

@@ -98,10 +98,12 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx,
 	// av_free(buffersink_params);
     // LOG(INFO) << "create filter sink";
     // CHECK_GE(av_opt_set_bin(buffersink_ctx_, "pix_fmts", (uint8_t *)&pix_fmts, sizeof(AV_PIX_FMT_RGB24), AV_OPT_SEARCH_CHILDREN), 0) << "Set bin error";
-#if LIBAVFILTER_VERSION_INT >= AV_VERSION_INT(11, 0, 0)
-    // FFmpeg 8+: pixel_formats option is AV_OPT_TYPE_PIXEL_FMT, not binary.
-    // The format=... filter at the end of the chain controls the output
-    // there; the buffersink follows it without an explicit constraint.
+#if LIBAVFILTER_VERSION_INT >= AV_VERSION_INT(10, 0, 0)
+    // FFmpeg 7+: pix_fmts on buffersink became an AV_OPT_TYPE_PIXEL_FMT
+    // option and can no longer be set as an int list (av_opt_set_int_list
+    // fails with AVERROR_OPTION_NOT_FOUND).  The format=... filter at the
+    // end of the chain controls the output there; the buffersink follows it
+    // without an explicit constraint.
     (void)pix_fmts;
 #else
     CHECK_GE(av_opt_set_int_list(buffersink_ctx_, "pix_fmts", pix_fmts,

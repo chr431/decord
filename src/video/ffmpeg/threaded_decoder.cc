@@ -237,7 +237,12 @@ void FFMPEGThreadedDecoder::ClearDiscardPTS() {
 }
 
 void FFMPEGThreadedDecoder::Push(AVPacketPtr pkt, runtime::NDArray buf) {
-    CHECK(run_.load());
+    CheckErrorStatus();
+    if (!run_.load()) {
+        LOG(FATAL) << "Push() called after the decoder worker stopped "
+                   << "(decoder thread exited unexpectedly). Check the previous "
+                   << "decoder error before reading more frames.";
+    }
     if (!pkt) {
         CHECK(!draining_.load()) << "Start draining twice...";
         draining_.store(true);
@@ -267,6 +272,10 @@ bool FFMPEGThreadedDecoder::Pop(runtime::NDArray *frame) {
         --frame_count_;
     }
     return (ret && frame->data_);
+}
+
+bool FFMPEGThreadedDecoder::Drained() const {
+    return !frame_count_.load() && !draining_.load();
 }
 
 FFMPEGThreadedDecoder::~FFMPEGThreadedDecoder() {

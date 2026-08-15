@@ -54,6 +54,7 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         void Clear();
         void Push(AVPacketPtr pkt, NDArray buf);
         bool Pop(NDArray *frame);
+        bool Drained() const override;
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~CUThreadedDecoder();

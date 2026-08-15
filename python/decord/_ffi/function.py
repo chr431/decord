@@ -301,6 +301,9 @@ def _init_api_prefix(module_name, prefix):
         setattr(target_module, ff.__name__, ff)
 
 def _init_internal_api():
+    # Ensure the namespace module is loaded before touching sys.modules:
+    # lazy-import environments may not have imported it yet (dmlc/decord PR #364).
+    import decord._api_internal
     for name in list_global_func_names():
         if not name.startswith("_"):
             continue

@@ -128,10 +128,27 @@ class VideoReader(object):
             return self._reader_roi
         return (x1, y1, x2, y2)  # 旧路径：每帧裁剪
 
+    def close(self):
+        """Explicitly release the native reader.
+
+        Releasing the handle deterministically lets the OS reclaim the file
+        handle immediately (rename/delete on Windows, dmlc/decord#222) instead
+        of waiting for GC.  Safe to call more than once; the reader cannot be
+        used afterwards.
+        """
+        if self._handle is not None:
+            _CAPI_VideoReaderFree(self._handle)
+            self._handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     def __del__(self):
         try:
-            if self._handle is not None:
-                _CAPI_VideoReaderFree(self._handle)
+            self.close()
         except TypeError:
             pass
 

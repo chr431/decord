@@ -35,8 +35,20 @@ class DECORDLimitReachedError(Exception):
 def _load_lib():
     """Load libary by searching possible path."""
     lib_path = libinfo.find_lib_path()
-    os.environ['PATH'] += os.pathsep + os.path.dirname(lib_path[0])
-    lib = ctypes.CDLL(lib_path[0], ctypes.RTLD_GLOBAL)
+    # PATH may legitimately be unset in embedded/container environments
+    # (dmlc/decord#357); get() keeps import alive there.
+    existing_path = os.environ.get('PATH', '')
+    if existing_path:
+        os.environ['PATH'] = existing_path + os.pathsep + os.path.dirname(lib_path[0])
+    else:
+        os.environ['PATH'] = os.path.dirname(lib_path[0])
+    # RTLD_GLOBAL exports FFmpeg/libav symbols into the process namespace and
+    # breaks other native extensions (PyAV/torch/cv2/duckdb; dmlc/decord#361).
+    # Load with the ctypes default (RTLD_LOCAL) unless explicitly opted in.
+    if os.environ.get('DECORD_RTLD_GLOBAL', '').strip() in ('1', 'true', 'TRUE'):
+        lib = ctypes.CDLL(lib_path[0], ctypes.RTLD_GLOBAL)
+    else:
+        lib = ctypes.CDLL(lib_path[0])
     # DMatrix functions
     lib.DECORDGetLastError.restype = ctypes.c_char_p
     return lib, os.path.basename(lib_path[0])

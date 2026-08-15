@@ -378,6 +378,13 @@ bool CUThreadedDecoder::Pop(NDArray *frame) {
     return true;
 }
 
+bool CUThreadedDecoder::Drained() const {
+    // After the EOF packet is parsed (synchronously inside the worker),
+    // every display callback has pushed its output into reorder_queue_ and
+    // Pop() has consumed it exactly once frame_count_ reaches zero.
+    return frame_count_.load() == 0 && reorder_queue_->Size() == 0;
+}
+
 void CUThreadedDecoder::LaunchThread() {
   try {
       LaunchThreadImpl();
