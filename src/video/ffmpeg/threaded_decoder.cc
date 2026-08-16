@@ -76,7 +76,8 @@ static inline int ReceiveFrame(AVCodecContext *ctx, AVFrame *frame) {
 FFMPEGThreadedDecoder::FFMPEGThreadedDecoder()
     : frame_count_(0), draining_(false), run_(false),
       error_status_(false), error_message_(),
-      max_queue_frames_(DECORD_CPU_FRAME_QUEUE_SIZE) {
+      max_queue_frames_(DECORD_CPU_FRAME_QUEUE_SIZE),
+      codec_is_av1_(false) {
 }
 
 void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, int height, int rotation, int output_format) {
@@ -90,6 +91,8 @@ void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, 
     rotation_ = rotation;
     output_format_ = output_format;
     color_range_ = (dec_ctx->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+    // AV1（dav1d）批量解码模式标记：dav1d 帧并行需要多 packet 在途
+    codec_is_av1_ = (dec_ctx->codec_id == AV_CODEC_ID_AV1);
     // avcodec_flush_buffers（Seek/Clear 触发）会把 time_base 重置为
     // 0/1 —— filter 图 buffersrc 需要流 time_base（Invalid time base
     // 0/1）。在此快照，重建图前恢复。
@@ -459,6 +462,77 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
                     break;
                 }
                 EnqueueRawFrame(frame);
+            }
+        } else if (codec_is_av1_) {
+            // ── AV1（dav1d）批量模式 ──
+            // dav1d 的帧并行需要多个 packet 同时在解码器中积累；通用
+            // drain-then-send 节奏每次只留 ~1-2 帧在途 → dav1d 内部
+            // 线程池只有 ~3 核在跑（实测 cpu/wall=3.0，16 核 AV1 软解
+            // 仅 ~300fps，多核扩展被节奏扼杀）。批量 send：连续 send
+            // 直到 EAGAIN（解码器在途队列满）或攒够 kAV1BatchMax，
+            // 再批量 receive 到 EAGAIN（EAGAIN = 在途帧仍在并行解码）。
+            // dav1d 无 B 帧参考帧依赖（与 h264 帧线程不同），批量 send
+            // 安全；receive 用普通语义（SYNCHRONOUS 会阻塞到帧完成，
+            // 同样扼杀帧并行）。
+            AVPacketPtr pending = std::move(pkt);
+            int batch_sent = 0;
+            const int kAV1BatchMax = 16;
+            while (run_.load()) {
+                if (!pending) {
+                    if (!pkt_queue_->Pop(&pending)) return;
+                    if (!pending) {
+                        // 哨兵 → 转 drain（与通用模式相同）
+                        CHECK_GE(avcodec_send_packet(dec_ctx_.get(), NULL), 0)
+                            << "Thread worker: Error entering draining mode.";
+                        while (true) {
+                            AVFramePtr frame = AVFramePool::Get()->Acquire();
+                            got_picture = ReceiveFrame(dec_ctx_.get(), frame.get());
+                            if (got_picture == AVERROR_EOF) {
+                                for (int cnt = 0;
+                                     cnt < ThreadedDecoderInterface::kDrainMarkerCount;
+                                     ++cnt) {
+                                    raw_queue_->Push(RawItem{
+                                        AVFramePtr(), RawKind::DrainEnd, 0});
+                                }
+                                break;
+                            }
+                            EnqueueRawFrame(frame);
+                        }
+                        break;
+                    }
+                }
+                int send_ret = avcodec_send_packet(dec_ctx_.get(), pending.get());
+                if (send_ret == 0) {
+                    pending.reset();
+                    if (++batch_sent < kAV1BatchMax) {
+                        continue;  // 继续积累在途帧（帧并行）
+                    }
+                } else if (send_ret == AVERROR(EAGAIN)) {
+                    // 在途已满 → 批量 receive 腾空后重试 send
+                } else {
+                    LOG(FATAL) << "Thread worker: Error sending packet: "
+                               << send_ret;
+                }
+                // 批量 receive：取走所有已完成的帧（EAGAIN = 在途仍在解）
+                while (run_.load()) {
+                    AVFramePtr f = AVFramePool::Get()->Acquire();
+                    got_picture = avcodec_receive_frame(dec_ctx_.get(), f.get());
+                    if (got_picture == 0) {
+                        EnqueueRawFrame(f);
+                        continue;
+                    }
+                    if (got_picture == AVERROR(EAGAIN)) {
+                        break;  // 在途未完成，回到 send 继续积累
+                    }
+                    if (got_picture == AVERROR_EOF) {
+                        raw_queue_->Push(
+                            RawItem{AVFramePtr(), RawKind::Eof, 0});
+                        break;
+                    }
+                    LOG(FATAL) << "Thread worker: Error decoding frame: "
+                               << got_picture;
+                }
+                batch_sent = 0;
             }
         } else {
             // ── normal mode: drain-then-send rhythm ──

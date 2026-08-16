@@ -94,6 +94,8 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         std::atomic<bool> error_status_;
         std::string error_message_;
         int max_queue_frames_;
+        // AV1（dav1d）解码：批量 send 模式（dav1d 帧并行需多 packet 在途）
+        bool codec_is_av1_ = false;
         // ── ROI-first 状态（SetRoi）──
         int roi_x1_ = 0, roi_y1_ = 0, roi_x2_ = -1, roi_y2_ = -1;  // 半开
         bool roi_valid_ = false;

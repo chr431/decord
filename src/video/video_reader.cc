@@ -240,6 +240,20 @@ void VideoReader::SetVideoStream(int stream_nb) {
     } else {
         dec_ctx->thread_count = nb_thread_decoding_;
     }
+    // AV1（dav1d）：显式 max_frame_delay，恢复帧并行。
+    // dav1d 的 frame_delay 自动值太小（≈1-2）→ 帧并行被扼杀，实测
+    // 16 核 AV1 软解只有 ~3 核在跑（cpu/wall=3.0，~360fps）。FFmpeg
+    // libdav1d 封装的 max_frame_delay 默认 0（dav1d 自动）；显式设
+    // ≥16 后帧并行充分（ffmpeg CLI 实测 3000 帧：threads=12 + delay=16
+    // → 753fps vs 默认 361fps，-53% wall；delay≥16 且 threads≥12 饱和
+    // ~770fps）。内存代价：1080p YUV 帧缓冲 ~3MB × delay，可接受。
+    // 必须经 avcodec_open2 的 AVDictionary 传入：open2 内部会
+    // av_opt_set_defaults 重置 avctx 选项，open 前 av_opt_set_int 无效。
+    AVDictionary *codec_opts = NULL;
+    if (codecs_[st_nb]->id == AV_CODEC_ID_AV1 && kDLCPU == ctx_.device_type) {
+        int delay = std::max(dec_ctx->thread_count, 16);
+        av_dict_set_int(&codec_opts, "max_frame_delay", delay, 0);
+    }
     // LOG(INFO) << "Original decoder multithreading: " << dec_ctx->thread_count;
     // CHECK_GE(avcodec_copy_context(dec_ctx, fmt_ctx_->streams[stream_nb]->codec), 0) << "Error: copy context";
     // CHECK_GE(avcodec_parameters_to_context(dec_ctx, fmt_ctx_->streams[st_nb]->codecpar), 0) << "Error: copy parameters to codec context.";
@@ -247,7 +261,9 @@ void VideoReader::SetVideoStream(int stream_nb) {
     CHECK_GE(avcodec_parameters_to_context(dec_ctx, codecpar.get()), 0)
         << "ERROR copying codec parameters to context";
     // initialize AVCodecContext to use given AVCodec
-    int open_ret = avcodec_open2(dec_ctx, codecs_[st_nb], NULL);
+    int open_ret = avcodec_open2(dec_ctx, codecs_[st_nb],
+                                 codec_opts ? &codec_opts : NULL);
+    av_dict_free(&codec_opts);
     if (open_ret < 0 ) {
         char errstr[200];
         av_strerror(open_ret, errstr, 200);
