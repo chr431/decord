@@ -1409,6 +1409,44 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
     // LOG(INFO) << height_ << " "  << width_ << " Buf size: " << bs << " total: " << bs * height_ * width_ * 3;
     int64_t frame_count = GetFrameCount();
     uint64_t offset = 0;
+    // ── 等差步长快速路径（分频采样 / frame-skip）──
+    // 顶层引擎以固定 stride 采样帧时，indices 是严格递增、公差恒定且 >1 的
+    // 等差数列（如 0,3,6,...）。此时用"顺序流式解码 + 帧间解码丢弃
+    // （SkipFramesImpl）"替代逐索引 SeekAccurate：稀疏 seek 在 AV1/HEVC 上
+    // 每次都要从邻近关键帧重新解码，实测比顺序解码慢 ~2×；本路径解码器只顺序
+    // 跑一遍，仅对采样帧做输出转换 / ROI / D2H，采样帧之间的帧解码后即丢。
+    // 公差 == 1（全量顺序）与非等差（含重复索引）仍走下方通用逻辑，行为不变。
+    bool is_arith_prog = indices.size() >= 2;
+    int64_t ap_gap = is_arith_prog ? (indices[1] - indices[0]) : 0;
+    if (is_arith_prog && ap_gap <= 0) is_arith_prog = false;
+    for (std::size_t i = 1; is_arith_prog && i < indices.size(); ++i) {
+        if (indices[i] - indices[i - 1] != ap_gap) is_arith_prog = false;
+    }
+    if (is_arith_prog && ap_gap > 1) {
+        for (std::size_t i = 0; i < indices.size(); ++i) {
+            int64_t pos = indices[i];
+            CHECK_LT(pos, frame_count);
+            CHECK_GE(pos, 0);
+            if (curr_frame_ < pos) {
+                // 顺序前跳：解码 (pos - curr_frame_) 帧并丢弃，只推进帧号。
+                // 与通用路径每索引 SeekAccurate 结果一致（都从当前流位置
+                // 顺序解码到目标帧），但避免反复 seek 的开销。
+                SkipFramesImpl(pos - curr_frame_);
+            } else if (curr_frame_ != pos) {
+                SeekAccurate(pos);
+            }
+            NDArray frame = NextFrameImpl();
+            if (use_roi) {
+                frame = CropRoi(frame, x1, y1, x2, y2);
+            }
+            if (frame.Size() < 1 && eof_) {
+                LOG(FATAL) << "Error getting frame at: " << pos << " with total frames: " << frame_count;
+            }
+            auto view = buf.CreateOffsetView(frame_shape, frame.data_->dl_tensor.dtype, &offset);
+            frame.CopyTo(view);
+        }
+        return buf;
+    }
     for (std::size_t i = 0; i < indices.size(); ++i) {
         int64_t pos = indices[i];
         auto it = unique_indices.find(pos);
