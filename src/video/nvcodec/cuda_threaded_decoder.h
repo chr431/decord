@@ -12,12 +12,14 @@
 #include "cuda_context.h"
 #include "cuda_decoder_impl.h"
 #include "cuda_texture.h"
+#include "cuda_mapped_frame.h"
 #include "../ffmpeg/ffmpeg_common.h"
 #include "../threaded_decoder_interface.h"
 
 #include <condition_variable>
 #include <thread>
 #include <mutex>
+#include <memory>
 
 #include <decord/runtime/ndarray.h>
 #include <dmlc/concurrency.h>
@@ -71,6 +73,7 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         void LaunchThreadImpl();
         void RecordInternalError(std::string message);
         void CheckErrorStatus();
+        void FlushDeferred();
         void InitBitStreamFilter(AVCodecParameters *codecpar, const AVInputFormat *iformat);
 
         int device_id_;
@@ -117,6 +120,18 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         std::string error_message_;
         // packet-queue backpressure: Push() waits on this cv instead of
         // busy-polling with a 1ns sleep when the queue exceeds the limit
+        // Deferred per-frame sync+unmap: the display callback used to run
+        // map -> convert kernel -> cudaStreamSynchronize -> unmap per frame,
+        // stalling the parser thread (sync callbacks inside
+        // cuvidParseVideoData) on each GPU round trip while NVDEC idled.
+        // Now: callback k starts with FlushDeferred() (sync+unmap frame k-1,
+        // whose kernel finished during the last decode interval), and the
+        // tail sync of frame k moves to the consumer-side Pop (first pop
+        // syncs once, later pops are free). At most 2 frames stay mapped;
+        // all CUDA calls remain on the parser thread.
+        std::unique_ptr<CUMappedFrame> deferred_frame_;
+        std::atomic<bool> deferred_valid_{false};
+        std::atomic<bool> tail_unsynced_{false};
         std::mutex pkt_room_mutex_;
         std::condition_variable pkt_room_cv_;
 

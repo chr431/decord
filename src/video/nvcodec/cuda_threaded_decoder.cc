@@ -203,6 +203,11 @@ void CUThreadedDecoder::Stop() {
 
 void CUThreadedDecoder::Clear() {
     Stop();
+    // The normal thread-exit path already flushed the deferred mapping in
+    // LaunchThreadImpl; this is a safety net (on abnormal paths the caller
+    // thread must hold the CUDA context, which the GPU VideoReader main
+    // thread does).
+    FlushDeferred();
     frame_count_.store(0);
     {
       std::lock_guard<std::mutex> lock(pts_mutex_);
@@ -264,8 +269,23 @@ int CUThreadedDecoder::HandlePictureDecode_(CUVIDPICPARAMS* pic_params) {
     return 1;
 }
 
+void CUThreadedDecoder::FlushDeferred() {
+    // Sync and unmap the previous deferred mapping. Must run on a thread
+    // with the CUDA context current (parser thread / normal exit path).
+    if (deferred_valid_.exchange(false)) {
+        if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
+            LOG(FATAL) << "Error synchronize cuda stream";
+        }
+        deferred_frame_.reset();
+    }
+    tail_unsynced_.store(false);
+}
+
 int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
     if (!run_.load()) return 0;
+    // Release the previous deferred mapping before enqueuing this frame's
+    // conversion (its kernel finished during the last decode interval).
+    FlushDeferred();
     trace::log("DISP", static_cast<long long>(disp_info->timestamp),
                static_cast<long long>(disp_info->picture_index), 0);
     // push to converter
@@ -317,10 +337,14 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
                      0, 0, 0.0f, 0.0f, decoder_.BitDepth(),
                      output_format_, color_range_);
     }
-    if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
-        LOG(FATAL) << "Error synchronize cuda stream";
-        return 0;
-    }
+    // No per-frame sync anymore: the tail sync moves to consumer-side Pop
+    // (tail_unsynced_) and the unmap moves to the next display callback
+    // (FlushDeferred). The parser thread returns immediately and keeps
+    // submitting packets; NVDEC decode and conversion kernels pipeline
+    // back-to-back on stream_.
+    deferred_frame_.reset(new CUMappedFrame(std::move(frame)));
+    deferred_valid_.store(true);
+    tail_unsynced_.store(true);
     reorder_queue_->Push(arr);
     return 1;
 }
@@ -376,6 +400,15 @@ bool CUThreadedDecoder::Pop(NDArray *frame) {
     CheckErrorStatus();
     if (!ret) return false;
     --frame_count_;
+    if (tail_unsynced_.exchange(false)) {
+        // First pop of the unsynced tail frame: sync here (the GPU work is
+        // long done, the call itself is microseconds); afterwards the frame
+        // is safe to read from any stream or from host memory.
+        if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
+            LOG(FATAL) << "Error synchronize cuda stream";
+            return 0;
+        }
+    }
     return true;
 }
 
@@ -407,7 +440,12 @@ void CUThreadedDecoder::LaunchThreadImpl() {
         bool ret;
         AVPacketPtr avpkt = nullptr;
         ret = pkt_queue_->Pop(&avpkt);
-        if (!ret) return;
+        if (!ret) {
+            // Flush the deferred mapping before the thread exits (context
+            // stays current on this thread).
+            FlushDeferred();
+            return;
+        }
         // a slot freed: wake any Push() waiting on backpressure
         pkt_room_cv_.notify_one();
 
