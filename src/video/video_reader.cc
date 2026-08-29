@@ -254,6 +254,20 @@ void VideoReader::SetVideoStream(int stream_nb) {
         int delay = std::max(dec_ctx->thread_count, 16);
         av_dict_set_int(&codec_opts, "max_frame_delay", delay, 0);
     }
+    // 去块滤波（loop filter / deblocking）开关 —— 有损优化，默认不启用。
+    // 关掉可省重建阶段的一道滤波，实测 h264 软解 1.11~1.36×
+    // （线程越多收益越大；与"丢非参考帧"互补，叠加 1.48~1.59×）。
+    // 代价是**输出像素变化**（少一道去块平滑），可能影响小字号/细笔画
+    // 的 OCR 准确率 —— 必须做端到端质量回归才能决定是否可用，
+    // 故仅 env 显式开启：DECORD_SKIP_LOOP_FILTER=none|default|noref|
+    // bidir|nokey|all（AVDiscard 语义，'all' 收益最大、像素变化也最大）。
+    // 只对 CPU 软解生效：NVDEC 的滤波由硬件管，透传选项语义不保证一致。
+    if (kDLCPU == ctx_.device_type) {
+        const char *slf = getenv("DECORD_SKIP_LOOP_FILTER");
+        if (slf != nullptr && slf[0] != '\0') {
+            av_dict_set(&codec_opts, "skip_loop_filter", slf, 0);
+        }
+    }
     // LOG(INFO) << "Original decoder multithreading: " << dec_ctx->thread_count;
     // CHECK_GE(avcodec_copy_context(dec_ctx, fmt_ctx_->streams[stream_nb]->codec), 0) << "Error: copy context";
     // CHECK_GE(avcodec_parameters_to_context(dec_ctx, fmt_ctx_->streams[st_nb]->codecpar), 0) << "Error: copy parameters to codec context.";
