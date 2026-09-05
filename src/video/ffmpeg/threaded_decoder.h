@@ -11,6 +11,7 @@
 #include "../threaded_decoder_interface.h"
 #include <decord/runtime/ndarray.h>
 
+#include <chrono>
 #include <thread>
 #include <unordered_set>
 #include <mutex>
@@ -58,6 +59,13 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~FFMPEGThreadedDecoder();
+        /*! 生产侧解码速率（帧/秒，段式 EWMA，filter 线程产出点实测）。
+         *  发射速率是消费驱动的（慢消费会把能力低估数倍）；本速率只在
+         *  连续产出段（帧间隔 <50ms）内统计，背压等待/断流重置段不计
+         *  —— 近似真实解码能力，与消费速率解耦。供混合解码调度用。 */
+        double ProductionRate() const {
+            return prod_rate_.load(std::memory_order_relaxed);
+        }
     private:
         void WorkerThread();
         void WorkerThreadImpl();
@@ -94,6 +102,11 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         std::atomic<bool> error_status_;
         std::string error_message_;
         int max_queue_frames_;
+        // ── 生产侧速率（仅 filter 线程访问，除原子速率外）──
+        std::atomic<double> prod_rate_{0.0};
+        std::chrono::steady_clock::time_point last_prod_tp_{};
+        int64_t prod_seg_frames_ = 0;
+        double prod_seg_secs_ = 0.0;
         // AV1（dav1d）解码：批量 send 模式（dav1d 帧并行需多 packet 在途）
         bool codec_is_av1_ = false;
         // ── ROI-first 状态（SetRoi）──

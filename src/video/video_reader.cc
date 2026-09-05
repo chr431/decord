@@ -85,8 +85,11 @@ static const int DECORD_PREFETCH_DEPTH = std::stoi(runtime::GetEnvironmentVariab
 
 
 VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol, int output_format)
-     : ctx_(ctx), out_ctx_(static_cast<int>(ctx.device_type) == kHybridDeviceType
-                          ? DLDevice{kDLCPU, 0} : ctx),
+     : ctx_(ctx), out_ctx_(VideoReader::IsHybridType(static_cast<int>(ctx.device_type))
+                          ? (static_cast<int>(ctx.device_type) == kHybridGpuDeviceType
+                                 ? DLDevice{kDLCUDA, ctx.device_id}
+                                 : DLDevice{kDLCPU, ctx.device_id})
+                          : ctx),
        key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
      actv_stm_idx_(-1), fmt_ctx_(nullptr), decoder_(nullptr), curr_frame_(0),
      nb_thread_decoding_(nb_thread), width_(width), height_(height), eof_(false), io_ctx_(),
@@ -200,6 +203,12 @@ VideoReader::~VideoReader(){
     // the pool; if the pool were freed first, their deleter would touch a
     // destroyed pool.
     decoder_.reset();
+    // hybrid_gpu 的输出帧驻留显存且直接引用解码器内部池缓冲；
+    // cached_frame_ / tmp_key_frame_ 可能仍持有这类引用 —— 解码器
+    // （含其池）销毁后必须先释放，否则成员析构阶段 deleter 回调悬空池。
+    // （hybrid 的 CPU 输出帧是独立宿主分配，无此问题；统一释放无害。）
+    cached_frame_ = NDArray();
+    tmp_key_frame_ = NDArray();
     // avformat_free_context(fmt_ctx_);
     // avformat_close_input(&fmt_ctx_);
     // LOG(INFO) << "Destruct Video REader";
@@ -228,12 +237,15 @@ void VideoReader::SetVideoStream(int stream_nb) {
 #else
         LOG(FATAL) << "CUDA not enabled. Requested context GPU(" << ctx_.device_id << ").";
 #endif
-    } else if (kHybridDeviceType == static_cast<int>(ctx_.device_type)) {
+    } else if (IsHybridType(static_cast<int>(ctx_.device_type))) {
 #ifdef DECORD_USE_CUDA
-        // 混合解码: 单 demux 按 keyframe chunk 路由 CPU 软解 + NVDEC,
-        // 输出统一落 CPU (out_ctx_)。GPU 子解码器在此完成 NVDEC 初始化。
+        // 混合解码: 单 demux 按 keyframe chunk 路由 CPU 软解 + NVDEC。
+        // hybrid: 输出统一落 CPU (out_ctx_)；hybrid_gpu: 输出统一驻留
+        // 显存（GPU chunk 零拷贝、CPU chunk H2D 上载）。GPU 子解码器
+        // 在此完成 NVDEC 初始化。
         decoder_ = std::unique_ptr<ThreadedDecoderInterface>(new HybridThreadedDecoder(
-            ctx_.device_id, codecpar.get(), fmt_ctx_->iformat));
+            ctx_.device_id, codecpar.get(), fmt_ctx_->iformat,
+            static_cast<int>(ctx_.device_type) == kHybridGpuDeviceType));
 #else
         LOG(FATAL) << "CUDA not enabled. Requested context hybrid(" << ctx_.device_id << ").";
 #endif
@@ -245,7 +257,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
     // LOG(INFO) << "nb_thread_decoding_: " << nb_thread_decoding_;
     // CPU decoding: use DECORD_FFMPEG_THREAD_COUNT (default 2) to keep
     // FFmpeg's internal frame-buffer pool small.  GPU (NVDEC) is unaffected.
-    if (kDLCPU == ctx_.device_type || kHybridDeviceType == static_cast<int>(ctx_.device_type)) {
+    if (kDLCPU == ctx_.device_type || IsHybridType(static_cast<int>(ctx_.device_type))) {
         dec_ctx->thread_count = nb_thread_decoding_ > 0
             ? nb_thread_decoding_
             : DECORD_FFMPEG_THREAD_COUNT;
@@ -263,7 +275,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
     // av_opt_set_defaults 重置 avctx 选项，open 前 av_opt_set_int 无效。
     AVDictionary *codec_opts = NULL;
     if (codecs_[st_nb]->id == AV_CODEC_ID_AV1
-        && (kDLCPU == ctx_.device_type || kHybridDeviceType == static_cast<int>(ctx_.device_type))) {
+        && (kDLCPU == ctx_.device_type || IsHybridType(static_cast<int>(ctx_.device_type)))) {
         int delay = std::max(dec_ctx->thread_count, 16);
         av_dict_set_int(&codec_opts, "max_frame_delay", delay, 0);
     }
@@ -275,7 +287,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
     // 故仅 env 显式开启：DECORD_SKIP_LOOP_FILTER=none|default|noref|
     // bidir|nokey|all（AVDiscard 语义，'all' 收益最大、像素变化也最大）。
     // 只对 CPU 软解生效：NVDEC 的滤波由硬件管，透传选项语义不保证一致。
-    if (kDLCPU == ctx_.device_type || kHybridDeviceType == static_cast<int>(ctx_.device_type)) {
+    if (kDLCPU == ctx_.device_type || IsHybridType(static_cast<int>(ctx_.device_type))) {
         const char *slf = getenv("DECORD_SKIP_LOOP_FILTER");
         if (slf != nullptr && slf[0] != '\0') {
             av_dict_set(&codec_opts, "skip_loop_filter", slf, 0);
@@ -340,7 +352,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
     }
     // hybrid 解码器需要 (关键帧 pts, 呈现序帧号) 表：chunk 的 expected
     // 帧数 = 相邻关键帧 rank 差，是"补满才关 chunk"合并逻辑的基准。
-    if (kHybridDeviceType == static_cast<int>(ctx_.device_type)) {
+    if (IsHybridType(static_cast<int>(ctx_.device_type))) {
         auto *hybrid = dynamic_cast<HybridThreadedDecoder *>(decoder_.get());
         if (hybrid && !frame_ts_.empty() && !key_indices_.empty()
                 && key_indices_.back() < static_cast<int64_t>(frame_ts_.size())) {
@@ -823,9 +835,9 @@ NDArray VideoReader::CropRoiYuv420(NDArray frame, int x1, int y1, int x2, int y2
         // 越界防御：只拷有效区域（调用方已 clamp 到整帧范围）
         return out;
     }
-    if (ctx_.device_type == kDLCUDA) {
+    if (out_ctx_.device_type == kDLCUDA) {
 #if DECORD_USE_CUDA
-        // GPU 帧在设备内存：Y 与 UV 各一次 2D 拷贝到主机（ROI 尺寸），
+        // 帧在设备内存（kDLCUDA 或 hybrid_gpu）：Y 与 UV 各一次 2D 拷贝到主机（ROI 尺寸），
         // 避免全帧 D2H；后续 GetBatch 会把该主机 ROI 拷回批缓冲。
         cudaError_t err = cudaSetDevice(ctx_.device_id);
         CHECK_EQ(err, cudaSuccess) << "cudaSetDevice failed in CropRoiYuv420";
@@ -892,6 +904,17 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
     }
     if (IsYuv420()) {
         return CropRoiYuv420(frame, x1, y1, x2, y2);
+    }
+    if (frame.defined() && frame.data_ != nullptr
+        && frame.data_->dl_tensor.device.device_type == kDLCUDA) {
+        // hybrid_gpu 的 3D 帧（rgb/gray）驻留显存：精裁前先 D2H 整帧
+        // （ROI 组合的简单正确路径；yuv420 已走 CropRoiYuv420 的 2D 设备分支）
+        NDArray h = NDArray::Empty(
+            std::vector<int64_t>(frame.data_->dl_tensor.shape,
+                                 frame.data_->dl_tensor.shape + frame.data_->dl_tensor.ndim),
+            kUInt8, kCPU);
+        frame.CopyTo(h);
+        frame = h;
     }
     // ROI-first 直通：解码器已输出 ROI 尺寸的帧（CPU filter crop 或
     // GPU 转换器窗口）→ 无需再裁剪/拷贝。

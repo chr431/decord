@@ -39,6 +39,13 @@ class VideoReader : public VideoReaderInterface {
          * 输出帧统一落在 CPU 内存（python 侧 decord.hybrid(dev)）。
          * 取 100 避开 DLPack 既有设备类型。 */
         static constexpr int kHybridDeviceType = 100;
+        /*! hybrid 的 GPU 驻留变体：合并输出帧留在显存（kDLCUDA），
+         *  GPU chunk 零拷贝、CPU chunk 由混合解码器 H2D 上载 ——
+         *  供全程显存管线（TRT 等）消费，与 gpu() 输出设备语义一致。 */
+        static constexpr int kHybridGpuDeviceType = 101;
+        static bool IsHybridType(int dt) {
+            return dt == kHybridDeviceType || dt == kHybridGpuDeviceType;
+        }
 
         VideoReader(std::string fn, DLDevice ctx, int width=-1, int height=-1,
                     int nb_thread=0, int io_type=kNormal, std::string fault_tol="-1",

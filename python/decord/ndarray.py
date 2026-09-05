@@ -50,6 +50,19 @@ def gpu(dev_id=0):
     """
     return DECORDContext(2, dev_id)
 
+def hybrid_gpu(dev_id=0):
+    """Construct a GPU-resident hybrid decoding context.
+
+    Same chunk routing as :func:`hybrid`, but merged output frames stay
+    in GPU memory (device_type 101): GPU chunks pass through with zero
+    copies and CPU chunks are uploaded H2D by the decoder.  Matches
+    gpu() output semantics for VRAM-resident pipelines (e.g. TensorRT
+    consumers): get_batch returns a contiguous CUDA NDArray batch with
+    no host round-trip.
+    """
+    return DECORDContext(101, dev_id)
+
+
 def hybrid(dev_id=0):
     """Construct a hybrid CPU+GPU decoding context
 

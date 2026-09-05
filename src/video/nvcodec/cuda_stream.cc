@@ -17,7 +17,11 @@ CUStream::CUStream(int device_id, bool default_stream) : created_{false}, stream
             set_device = true;
             cudaSetDevice(device_id);
         }
-        CUDA_CALL(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+        // blocking 流（flags=0）：与 legacy 默认流（消费侧 D2D/D2H 拷贝所在）
+        // 隐式互斥序。非阻塞流下，池缓冲回池后立即被新帧的转换 kernel
+        // 覆盖，而消费侧已提交、未执行的拷贝可能读到半新半旧内容
+        // （实测 hybrid_gpu 偶发单帧内容差，位置漂移）。
+        CUDA_CALL(cudaStreamCreateWithFlags(&stream_, 0));
         created_ = true;
         if (set_device) {
             CUDA_CALL(cudaSetDevice(orig_device));

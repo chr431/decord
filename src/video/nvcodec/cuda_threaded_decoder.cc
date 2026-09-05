@@ -400,14 +400,17 @@ bool CUThreadedDecoder::Pop(NDArray *frame) {
     CheckErrorStatus();
     if (!ret) return false;
     --frame_count_;
-    if (tail_unsynced_.exchange(false)) {
-        // First pop of the unsynced tail frame: sync here (the GPU work is
-        // long done, the call itself is microseconds); afterwards the frame
-        // is safe to read from any stream or from host memory.
-        if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
-            LOG(FATAL) << "Error synchronize cuda stream";
-            return 0;
-        }
+    // Sync EVERY popped frame.  The old single tail_unsynced_ flag had a
+    // clear-on-the-wrong-frame race: display callback for frame k sets
+    // the flag, pop of frame k-1 exchanges it away, then pop of frame k
+    // skips the sync and the consumer can read a half-written conversion
+    // kernel output (observed as rare nondeterministic frame corruption
+    // right after a hybrid GPU chunk boundary).  The sync is cheap when
+    // the stream is idle and correctness beats the microsecond saved.
+    tail_unsynced_.store(false);
+    if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
+        LOG(FATAL) << "Error synchronize cuda stream";
+        return 0;
     }
     return true;
 }

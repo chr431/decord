@@ -330,6 +330,31 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
         frame_queue_->Push(tmp);
         ++frame_count_;
     }
+    // 生产速率段式 EWMA（混合解码调度用）：连续产出段（帧间隔 <50ms）
+    // 内统计，段满 16 帧折算一次段速率并 EWMA；背压等待/断流重置段
+    // 不计入 —— 与消费速率解耦，近似真实解码能力。
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (last_prod_tp_.time_since_epoch().count() != 0) {
+            double dt = std::chrono::duration<double>(now - last_prod_tp_).count();
+            if (dt > 0.05) {
+                prod_seg_frames_ = 0;
+                prod_seg_secs_ = 0.0;
+            } else if (dt > 1e-6) {
+                prod_seg_frames_++;
+                prod_seg_secs_ += dt;
+                if (prod_seg_frames_ >= 16) {
+                    double r = prod_seg_frames_ / prod_seg_secs_;
+                    double prev = prod_rate_.load(std::memory_order_relaxed);
+                    prod_rate_.store(prev > 0 ? 0.5 * prev + 0.5 * r : r,
+                                     std::memory_order_relaxed);
+                    prod_seg_frames_ = 0;
+                    prod_seg_secs_ = 0.0;
+                }
+            }
+        }
+        last_prod_tp_ = now;
+    }
     pf_f_push.stop();
     if (DECORD_PROFILE && pf_f_filter.n % 3000 == 2999) {
         std::cerr << "[P2] d_send=" << pf_d_send.acc / pf_d_send.n

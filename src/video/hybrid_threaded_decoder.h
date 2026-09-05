@@ -93,9 +93,12 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *       GPU 子解码器的 AVCodecContext 在 SetCodecContext 内部从
      *       bsf 转换后的参数副本派生（annexb extradata）单独 open。
      */
+    /* output_cuda: true = hybrid_gpu —— 输出帧驻留显存（GPU chunk
+     * 零拷贝、CPU chunk H2D 上载）；false = 输出统一落 CPU。 */
     HybridThreadedDecoder(int device_id,
                           AVCodecParameters *codecpar,
-                          const AVInputFormat *iformat);
+                          const AVInputFormat *iformat,
+                          bool output_cuda = false);
     ~HybridThreadedDecoder() override;
 
     void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1,
@@ -158,6 +161,22 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  EOF 时在队列排空后补推 kMaxOutputSurfaces 个 flush 缓冲。
      *  返回是否做了实际工作。 */
     bool FeedStep();
+    /*! \brief 上载一步（仅 GPU 驻留模式）：CPU 侧帧 H2D 入 cpu_ready_。
+     *  先取池缓冲再取帧（帧不可回退入 CPU 解码器，必须不滞留）；
+     *  marker 直通不拷贝。返回是否做了实际工作。 */
+    bool UploadStep();
+    /*! \brief 上载线程主循环（GPU 驻留模式） */
+    void UploaderLoop();
+    /*! \brief 上载专用非阻塞 CUDA 流。同步 H2D 若走 legacy 默认流，
+     *  会与 CU 解码器 stream_（blocking 流）互斥 —— 每次上载都整体暂停
+     *  NVDEC/转换管线（实测 hevc hybrid_gpu 被压到 0.75x）。 */
+    void *up_stream_ = nullptr;
+    /*! \brief pinned 暂存环（4 槽，仅上载线程访问）：pageable H2D
+     *  走驱动内 staging（WDDM 下 ~1.2ms/帧），pinned H2D ~0.4ms —— 上载
+     *  能力从 ~830fps 提到 ~1300fps+。 */
+    void *up_staging_[4] = {nullptr, nullptr, nullptr, nullptr};
+    std::size_t up_stage_bytes_ = 0;
+    int up_stage_idx_ = 0;
     /*! \brief 停止并回收 GPU 工作线程（Stop/Clear 共用） */
     void StopGpuWorker();
 #endif
@@ -165,6 +184,10 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     static bool IsMarker(const runtime::NDArray &f);
     /*! \brief GPU 输出缓冲池形状（与 VideoReader::FrameShape 同语义） */
     std::vector<int64_t> GpuFrameShape() const;
+    /* 输出形状（fmt: 0=RGB24, 1=GRAY8, 2=YUV420 packed 2D）：
+     * yuv420 -> (h+ceil(h/2), w) 的 Y+交错UV；gray -> (h,w)；rgb -> (h,w,3)。
+     * 与 VideoReader::FrameShape 同语义。 */
+    static std::vector<int64_t> FrameShapeFor(int fmt, int h, int w);
     /*! \brief ready_ 队列的帧数上限（由字节预算换算，随分辨率自适应） */
     std::size_t ReadyCap() const;
     /*! \brief 记录 chunk 发射速率（EWMA，供 ChooseSide） */
@@ -175,6 +198,10 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  成员按声明逆序析构，保证 ~CUThreadedDecoder 销毁内部队列时
      *  在途缓冲经 deleter 回调的池仍然存活。 */
     HybridGpuBufferPool gpu_pool_;
+    /* GPU 驻留模式专用：CPU chunk 上载帧的独立容器池。GPU 帧从解码到
+     * 按序消费全程持有 gpu_pool_ 缓冲（周转=消费速率），若共用单池，
+     * GPU 解码超前会占满全部缓冲、CPU 上载饿死（实测 19+9=28 卡死）。 */
+    HybridGpuBufferPool up_pool_;
     std::unique_ptr<cuda::CUThreadedDecoder> gpu_;
     /*! \brief GPU 侧专属 codecpar 副本：CUThreadedDecoder 初始化 bsf
      * (mp4→annexb) 时会就地改写传入的 codecpar（extradata 变 annexb），
@@ -182,10 +209,19 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     ffmpeg::AVCodecParametersPtr gpu_codecpar_;
     /*! \brief 池大小：kMaxOutputSurfaces(20) + 解码/转换在途余量 */
     static constexpr std::size_t kGpuPoolBuffers = 28;
+    /*! \brief GPU 驻留模式解码池：GPU 帧驻留显存、消费后才归还，池大小
+     *  = NVDEC 超前上限 —— 28 帧会迫使 NVDEC 频繁停等消费（实测 hevc
+     *  0.76x），扩到 128 帧让硬件解跑满。 */
+    static constexpr std::size_t kGpuResidentPoolBuffers = 128;
     /*! \brief ready_ 落地队列字节预算（宿主 RAM 的硬边界） */
     static constexpr std::size_t kReadyMaxBytes = 1ull << 30;
     /*! \brief GPU 工作线程（Start/Stop 管理）：喂包 + 落地 */
     std::thread lander_;
+    /*! \brief CPU 帧上载线程（仅 GPU 驻留模式启动）。与落地分离：
+     *  hevc NVDEC ~1800fps 时帧间 <0.6ms，若与 H2D 同步拷贝（~1.2ms/帧）
+     *  同线程串行，GPU 落地节奏被上载拖住、NVDEC 被迫降速（实测 hevc
+     *  hybrid_gpu 反而 0.71x 于纯 GPU）。 */
+    std::thread uploader_;
     std::atomic<bool> lander_run_{false};
     /*! \brief 保护 gpu_pkt_q_ / gpu_flush_left_（demux 线程写，工作线程读） */
     mutable std::mutex lcv_mtx_;
@@ -198,6 +234,15 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief 已落地待发射的宿主帧队列（含 GPU drain marker），字节预算有界 */
     mutable std::mutex rmtx_;
     std::deque<runtime::NDArray> ready_;
+    /*! \brief GPU 驻留模式的落地预算（字节）：GPU 帧驻留显存直到按序
+     *  消费，NVDEC 超前必须覆盖一个 CPU chunk 的发射期（~300 帧@1080p），
+     *  1GiB 预算的 213 帧上限不够（实测 hevc 每 chunk 对损失 ~40ms）。 */
+    static constexpr std::size_t kReadyMaxBytesGpu = 2ull << 30;
+    /* GPU 驻留模式：CPU 侧已上载的显存帧队列（含 CPU drain marker），
+     * 发射序保持。CPU 落地模式不用（CPU 帧直读子解码器）。 */
+    std::deque<runtime::NDArray> cpu_ready_;
+    /* 输出设备：false=落 CPU（hybrid），true=驻留显存（hybrid_gpu） */
+    bool out_cuda_ = false;
     /*! rief GPU 侧实测产出速率（落地 EWMA，帧/秒）。调度用它而非
      *  chunk 发射速率：发射被"前序 chunk 消费"拖长，会把 NVDEC 能力
      *  低估数倍（实测 hevc GPU 被低估后 util 仅 17%）。 */
