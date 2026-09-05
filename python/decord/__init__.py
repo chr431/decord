@@ -8,7 +8,7 @@ from ._ffi.base import DECORDError, DECORDLimitReachedError, __version__
 from .base import ALL
 
 from . import ndarray as nd
-from .ndarray import cpu, gpu
+from .ndarray import cpu, gpu, hybrid
 from . import bridge
 from . import logging
 from .video_reader import VideoReader

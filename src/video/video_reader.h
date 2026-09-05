@@ -1,4 +1,4 @@
-/*!
+﻿/*!
  *  Copyright (c) 2019 by Contributors if not otherwise specified
  * \file video_reader.h
  * \brief FFmpeg video reader, implements VideoReaderInterface
@@ -34,6 +34,12 @@ class VideoReader : public VideoReaderInterface {
     using ThreadedDecoderPtr = std::unique_ptr<ThreadedDecoderInterface>;
     using NDArray = runtime::NDArray;
     public:
+        /*! \brief hybrid ctx 的 device_type 值（python decord.hybrid 传入）。
+         * 混合解码：单 demux 按 keyframe chunk 路由 CPU 软解 + NVDEC，
+         * 输出帧统一落在 CPU 内存（python 侧 decord.hybrid(dev)）。
+         * 取 100 避开 DLPack 既有设备类型。 */
+        static constexpr int kHybridDeviceType = 100;
+
         VideoReader(std::string fn, DLDevice ctx, int width=-1, int height=-1,
                     int nb_thread=0, int io_type=kNormal, std::string fault_tol="-1",
                     int output_format = 0);
@@ -119,6 +125,9 @@ class VideoReader : public VideoReaderInterface {
         /*! \brief ROI crop for packed NV12 frames (Y rows + interleaved UV). */
         NDArray CropRoiYuv420(NDArray frame, int x1, int y1, int x2, int y2);
 
+        /*! \brief 输出帧所在设备：hybrid 解码出的帧统一落 CPU，
+         * 其余沿用 ctx_（CPU/CUDA）。NDArray::Empty 的分配一律用它。 */
+        DLDevice out_ctx_;
         DLDevice ctx_;
         std::vector<int64_t> key_indices_;
         std::map<int64_t, int64_t> pts_frame_map_;

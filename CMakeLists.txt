@@ -46,6 +46,10 @@ if(MSVC)
   add_definitions(-DHalide_SHARED)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
+  # UTF-8 源码（含中文注释）：本地中文 Windows 的 MSVC 默认按系统代码页
+  # (cp936) 解码, GBK 双字节会吞掉紧随的引号/括号导致解析错乱（CI 的
+  # cp1252 环境不受影响）。强制 /utf-8 消除该类编译错误与 C4819。
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /bigobj")
   if(USE_MSVC_MT)
     foreach(flag_var

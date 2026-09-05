@@ -19,6 +19,7 @@ namespace decord {
  * \brief Forward declarations
  */
 class NDArrayPool;
+class HybridGpuBufferPool;
 class VideoReader;
 class VideoLoader;
 class AudioReader;
@@ -220,6 +221,7 @@ class NDArray {
   friend class ffmpeg::FFMPEGThreadedDecoder;
   friend class cuda::CUThreadedDecoder;
   friend class decord::NDArrayPool;
+  friend class decord::HybridGpuBufferPool;
   friend class decord::VideoReader;
   friend class decord::VideoLoader;
   friend class decord::AudioReader;

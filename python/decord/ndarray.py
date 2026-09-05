@@ -50,6 +50,28 @@ def gpu(dev_id=0):
     """
     return DECORDContext(2, dev_id)
 
+def hybrid(dev_id=0):
+    """Construct a hybrid CPU+GPU decoding context
+
+    VideoReader(ctx=hybrid(dev)) decodes one demux stream split at keyframe
+    chunk boundaries between the CPU software decoder and the NVDEC hardware
+    decoder (rate-aware greedy routing, self-balancing).  Output frames are
+    always returned on the CPU, matching cpu() semantics (rgb / gray are
+    bit-identical to cpu(); yuv420 differs from the gpu() NV12 layout only
+    in U/V rounding by +-1 on some frames).
+
+    Parameters
+    ----------
+    dev_id : int, optional
+        The CUDA device id used by the NVDEC side
+
+    Returns
+    -------
+    ctx : DECORDContext
+        The created context
+    """
+    return DECORDContext(100, dev_id)
+
 def array(arr, ctx=cpu(0)):
     """Create an array from source arr.
 

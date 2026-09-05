@@ -1,10 +1,11 @@
-/*!
+﻿/*!
  *  Copyright (c) 2019 by Contributors if not otherwise specified
  * \file video_reader.cc
  * \brief Video reader Impl
  */
 
 #include "video_reader.h"
+#include "hybrid_threaded_decoder.h"
 #include <thread>
 #include "ffmpeg/threaded_decoder.h"
 #include "../runtime/str_util.h"
@@ -84,7 +85,9 @@ static const int DECORD_PREFETCH_DEPTH = std::stoi(runtime::GetEnvironmentVariab
 
 
 VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol, int output_format)
-     : ctx_(ctx), key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
+     : ctx_(ctx), out_ctx_(static_cast<int>(ctx.device_type) == kHybridDeviceType
+                          ? DLDevice{kDLCPU, 0} : ctx),
+       key_indices_(), pts_frame_map_(), tmp_key_frame_(), overrun_(false), frame_ts_(), codecs_(),
      actv_stm_idx_(-1), fmt_ctx_(nullptr), decoder_(nullptr), curr_frame_(0),
      nb_thread_decoding_(nb_thread), width_(width), height_(height), eof_(false), io_ctx_(),
      output_format_(output_format),
@@ -225,6 +228,15 @@ void VideoReader::SetVideoStream(int stream_nb) {
 #else
         LOG(FATAL) << "CUDA not enabled. Requested context GPU(" << ctx_.device_id << ").";
 #endif
+    } else if (kHybridDeviceType == static_cast<int>(ctx_.device_type)) {
+#ifdef DECORD_USE_CUDA
+        // 混合解码: 单 demux 按 keyframe chunk 路由 CPU 软解 + NVDEC,
+        // 输出统一落 CPU (out_ctx_)。GPU 子解码器在此完成 NVDEC 初始化。
+        decoder_ = std::unique_ptr<ThreadedDecoderInterface>(new HybridThreadedDecoder(
+            ctx_.device_id, codecpar.get(), fmt_ctx_->iformat));
+#else
+        LOG(FATAL) << "CUDA not enabled. Requested context hybrid(" << ctx_.device_id << ").";
+#endif
     } else {
         LOG(FATAL) << "Unknown device type: " << ctx_.device_type;
     }
@@ -233,7 +245,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
     // LOG(INFO) << "nb_thread_decoding_: " << nb_thread_decoding_;
     // CPU decoding: use DECORD_FFMPEG_THREAD_COUNT (default 2) to keep
     // FFmpeg's internal frame-buffer pool small.  GPU (NVDEC) is unaffected.
-    if (kDLCPU == ctx_.device_type) {
+    if (kDLCPU == ctx_.device_type || kHybridDeviceType == static_cast<int>(ctx_.device_type)) {
         dec_ctx->thread_count = nb_thread_decoding_ > 0
             ? nb_thread_decoding_
             : DECORD_FFMPEG_THREAD_COUNT;
@@ -250,7 +262,8 @@ void VideoReader::SetVideoStream(int stream_nb) {
     // 必须经 avcodec_open2 的 AVDictionary 传入：open2 内部会
     // av_opt_set_defaults 重置 avctx 选项，open 前 av_opt_set_int 无效。
     AVDictionary *codec_opts = NULL;
-    if (codecs_[st_nb]->id == AV_CODEC_ID_AV1 && kDLCPU == ctx_.device_type) {
+    if (codecs_[st_nb]->id == AV_CODEC_ID_AV1
+        && (kDLCPU == ctx_.device_type || kHybridDeviceType == static_cast<int>(ctx_.device_type))) {
         int delay = std::max(dec_ctx->thread_count, 16);
         av_dict_set_int(&codec_opts, "max_frame_delay", delay, 0);
     }
@@ -262,7 +275,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
     // 故仅 env 显式开启：DECORD_SKIP_LOOP_FILTER=none|default|noref|
     // bidir|nokey|all（AVDiscard 语义，'all' 收益最大、像素变化也最大）。
     // 只对 CPU 软解生效：NVDEC 的滤波由硬件管，透传选项语义不保证一致。
-    if (kDLCPU == ctx_.device_type) {
+    if (kDLCPU == ctx_.device_type || kHybridDeviceType == static_cast<int>(ctx_.device_type)) {
         const char *slf = getenv("DECORD_SKIP_LOOP_FILTER");
         if (slf != nullptr && slf[0] != '\0') {
             av_dict_set(&codec_opts, "skip_loop_filter", slf, 0);
@@ -324,6 +337,21 @@ void VideoReader::SetVideoStream(int stream_nb) {
     if (!LoadCachedIndex()) {
         IndexKeyframes();
         SaveCachedIndex();
+    }
+    // hybrid 解码器需要 (关键帧 pts, 呈现序帧号) 表：chunk 的 expected
+    // 帧数 = 相邻关键帧 rank 差，是"补满才关 chunk"合并逻辑的基准。
+    if (kHybridDeviceType == static_cast<int>(ctx_.device_type)) {
+        auto *hybrid = dynamic_cast<HybridThreadedDecoder *>(decoder_.get());
+        if (hybrid && !frame_ts_.empty() && !key_indices_.empty()
+                && key_indices_.back() < static_cast<int64_t>(frame_ts_.size())) {
+            std::vector<int64_t> pts_list;
+            pts_list.reserve(key_indices_.size());
+            for (int64_t idx : key_indices_) {
+                pts_list.push_back(frame_ts_[idx].pts);
+            }
+            hybrid->SetKeyframeRanks(pts_list, key_indices_,
+                                     static_cast<int64_t>(frame_ts_.size()));
+        }
     }
 }
 
@@ -628,7 +656,7 @@ NDArray VideoReader::NextFrameImpl() {
         PushNext();
         ++pkts_pushed_;  // prefetch accounting: every pushed packet counts
         if (curr_frame_ >= GetFrameCount()) {
-            return NDArray::Empty({}, kUInt8, ctx_);
+            return NDArray::Empty({}, kUInt8, out_ctx_);
         }
         ret = decoder_->Pop(&frame);
         if (frame.Size() > 1) {
@@ -1418,7 +1446,7 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
         std::vector<int64_t> buf_shape = {
             static_cast<int64_t>(bs), frame_shape[0], frame_shape[1]};
         if (frame_shape.size() == 3) buf_shape.push_back(frame_shape[2]);
-        buf = NDArray::Empty(buf_shape, kUInt8, ctx_);
+        buf = NDArray::Empty(buf_shape, kUInt8, out_ctx_);
     }
     // LOG(INFO) << height_ << " "  << width_ << " Buf size: " << bs << " total: " << bs * height_ * width_ * 3;
     int64_t frame_count = GetFrameCount();
@@ -1511,7 +1539,7 @@ bool VideoReader::FetchCachedFrame(NDArray &frame, int64_t pos) {
   if (!use_cached_frame_) return false;
   if (cached_frame_.Size() <= 1) return false;
   if (!frame.defined() || frame.Size() != cached_frame_.Size()) {
-      frame = NDArray::Empty(FrameShape(height_, width_), kUInt8, ctx_);
+      frame = NDArray::Empty(FrameShape(height_, width_), kUInt8, out_ctx_);
   }
   frame.CopyFrom(cached_frame_);
   failed_idx_.insert(pos);
