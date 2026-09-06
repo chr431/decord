@@ -474,14 +474,10 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
         if (forced == SIDE_GPU) return SIDE_GPU;
         if (forced == SIDE_CPU) return IsIdrLikeCodec() ? SIDE_CPU : SIDE_GPU;
     }
-    if (!IsIdrLikeCodec()) {
-        // kick 冲刷的前提是 "关键帧包解码输出的帧 pts == 包 pts 且帧独立"，
-        // 只对 IDR 型（H.264/HEVC）成立。AV1 的 show_existing/时间戳映射
-        // 使 kick 帧输出 pts 落回上一 chunk 区间（实测 596 双发、整流错位
-        // 一帧），且 drain+Clear 复位又有 mid-stream 错帧问题 —— AV1 固定
-        // 单侧 GPU（NVDEC 吞吐高于软解，仍优于纯 CPU）。见 README 已知限制。
-        return SIDE_GPU;
-    }
+    // AV1 与 IDR 型走统一 min-max 贪心：实测 racelog AV1 流 has_b_frames=0
+    // 且包 pts==dts（解码序=显示序），跨侧切换无重排残留、不需要 kick
+    // （kick 的 show_existing 映射反而造成双发错位）。重排流的安全网见
+    // Pop 的 force-close。
     // 冷启动：前 kColdStartChunks 个 chunk 交替分配，采集两侧速率
     int total = chunks_assigned_[0] + chunks_assigned_[1];
     if (total < kColdStartChunks) {
@@ -524,13 +520,20 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // 在慢侧发射期间持续生产（T → r_c+r_g）。比较"各自排空时间"会让
     // 快侧积压清得更快、恒被选中、包办到底（实测 h264 f_c=0.82、
     // T=r_fast=1433，均衡后 1700+）。
+    // 对称前瞻：两侧都假定获得等量新工作（last_chunk_frames_）。若只算
+    // 当前积压，快侧清空自己的积压后 t=自身 work/rate 恒更小 → 快侧包办、
+    // 慢侧全程闲置（实测 av1 f_c=0.8、T≈r_fast）；对称前瞻使稳态分配
+    // 比例收敛到速率比，T → r_c + r_g（两侧生产并行）。
     double t[2];
     for (int s = 0; s < 2; ++s) {
         int o = 1 - s;
         double work_s = static_cast<double>(backlog[s]) + last_chunk_frames_;
-        double work_o = static_cast<double>(backlog[o]);
+        double work_o = static_cast<double>(backlog[o]) + last_chunk_frames_;
         t[s] = std::max(work_s / rate[s], work_o / rate[o]);
     }
+    // tie（均衡态下 t 两侧精确相等，利特尔定律稳态）给 CPU：实测对比
+    // 三轮中位 —— tie->CPU 时 h264 1.48x / hevc 1.05x / av1 1.00x；
+    // tie->GPU 时 h264 掉到 1.28x（快侧 CPU 被压制）而 av1 无收益。
     Side chosen = t[SIDE_CPU] <= t[SIDE_GPU] ? SIDE_CPU : SIDE_GPU;
     if (getenv("DECORD_HYBRID_DEBUG")) {
         fprintf(stderr, "[hybrid/sched] key=%lld t_cpu=%.3f(r=%.0f) t_gpu=%.3f(r=%.0f) pend=%lld -> %s\n",
@@ -586,13 +589,11 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (!routing_active_) {
-            // 首包：IDR 型（H.264/HEVC）首 chunk 固定 CPU（顺序消费最关心
-            // 首帧延迟）；非 IDR 型（AV1）首 chunk 即 GPU —— 否则必然经历
-            // CPU→GPU 切换并触发 kick，而 AV1 的 show_existing/时间戳映射
-            // 使 kick 帧输出 pts 错位（见 ChooseSide 注释），实测边界帧
-            // 内容随时序在两种结果间摆动（非确定 1-5 帧 diff）。
+            // 首包：首 chunk 固定 CPU（首帧延迟优先 + CPU 速率学习）。
+            // 跨侧冲刷仅 IDR 型需要 kick；AV1 无重排流（pts==dts）不依赖
+            // kick，混合路由由 Pop 的 force-close 安全网兜底。
             routing_active_ = true;
-            cur_side_ = IsIdrLikeCodec() ? SIDE_CPU : SIDE_GPU;
+            cur_side_ = SIDE_CPU;
             cur_start_pts_ = pkt->pts;
             Chunk c{cur_side_, pkt->pts, INT64_MAX, 0, 0, {}, false};
             emit_queue_.push_back(c);
@@ -608,7 +609,12 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
             }
             Side old_side = cur_side_;
             Side s = ChooseSide(pkt->pts);
-            if (s != old_side) {
+            // kick 冲刷仅 IDR 型：其关键帧重置参考状态、迫使重排帧交出，
+            // 且输出 pts == 包 pts（stash 闭环成立）。AV1 的 show_existing
+            // 映射使 kick 帧输出 pts 回落上一 chunk（实测双发错位），且
+            // 无重排流（pts==dts）边界本就干净 —— 跨侧直接切换不发 kick，
+            // 重排流的残留由 Pop 的 force-close 兜底。
+            if (s != old_side && IsIdrLikeCodec()) {
                 flush_side = old_side;
                 need_flush = true;
             }
@@ -753,6 +759,29 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             }
             ch = emit_queue_.front();
         }
+        // force-close 安全网：该侧已路由的包全部出清（pending==0）但
+        // expected 未补满 —— 重排流的跨侧切换残留（无 kick 的 AV1 混合
+        // 路由）。接受缺失帧关闭 chunk（后续陈旧丢弃保序），避免无限等待。
+        if (!eof_pushed_ && ch.expected > 0 && ch.emitted < ch.expected
+                && side_pending_[ch.side] == 0) {
+            bool close_it = false;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (emit_queue_.size() > 1
+                        && emit_queue_.front().start_pts == ch.start_pts
+                        && emit_queue_.front().emitted == ch.emitted
+                        && side_pending_[ch.side] == 0) {
+                    RecordChunkRate(emit_queue_.front());
+                    emit_queue_.pop_front();
+                    close_it = true;
+                }
+            }
+            if (close_it) {
+                DLOG(INFO) << "[hybrid] force-close chunk start=" << ch.start_pts
+                           << " emitted=" << ch.emitted << "/" << ch.expected;
+                continue;
+            }
+        }
         Side s = ch.side;
         runtime::NDArray f;
         if (!PopSide(s, &f)) {
@@ -858,6 +887,34 @@ bool HybridThreadedDecoder::LandStep() {
     }
     runtime::NDArray f;
     if (!gpu_->Pop(&f) || !f.defined()) return false;
+    // 落地速率（供调度）：段式统计 —— 只累计连续落地段（间隔 <50ms），
+    // 段满 16 帧折算一次段速率并 EWMA。断流（chunk 间包断流/预算等待）
+    // 重置段且不计入，否则"没活干"会被误判为"能力低"，调度锁死。
+    // 必须在直通分支之前：GPU 驻留模式无 D2H，若统计挂在 ToHost 后
+    // 则 gpu_rate_landed_ 恒 0 → "gpu-rate unknown" → CPU 包办
+    // （实测 av1 f_c=0.8、混合退化）。
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (last_land_tp_.time_since_epoch().count() != 0) {
+            double dt = std::chrono::duration<double>(now - last_land_tp_).count();
+            if (dt > 1e-6 && dt < 0.05) {
+                land_seg_frames_++;
+                land_seg_secs_ += dt;
+                if (land_seg_frames_ >= 16) {
+                    double r = land_seg_frames_ / land_seg_secs_;
+                    double prev = gpu_rate_landed_.load(std::memory_order_relaxed);
+                    gpu_rate_landed_.store(
+                        prev > 0 ? 0.5 * prev + 0.5 * r : r, std::memory_order_relaxed);
+                    land_seg_frames_ = 0;
+                    land_seg_secs_ = 0.0;
+                }
+            } else {
+                land_seg_frames_ = 0;
+                land_seg_secs_ = 0.0;
+            }
+        }
+        last_land_tp_ = now;
+    }
     if (IsMarker(f)) {
         // drain marker（kCPU kInt64）：直接透传，不占字节预算的实质空间
         std::lock_guard<std::mutex> lk(rmtx_);
@@ -876,29 +933,6 @@ bool HybridThreadedDecoder::LandStep() {
         std::lock_guard<std::mutex> lk(rmtx_);
         ready_.push_back(std::move(h));
     }
-    // 落地速率（供调度）：段式统计 —— 只累计连续落地段（间隔 <50ms），
-    // 段满 16 帧折算一次段速率并 EWMA。断流（chunk 间包断流/预算等待）
-    // 重置段且不计入，否则"没活干"会被误判为"能力低"，调度锁死 CPU。
-    auto now = std::chrono::steady_clock::now();
-    if (last_land_tp_.time_since_epoch().count() != 0) {
-        double dt = std::chrono::duration<double>(now - last_land_tp_).count();
-        if (dt > 1e-6 && dt < 0.05) {
-            land_seg_frames_++;
-            land_seg_secs_ += dt;
-            if (land_seg_frames_ >= 16) {
-                double r = land_seg_frames_ / land_seg_secs_;
-                double prev = gpu_rate_landed_.load(std::memory_order_relaxed);
-                gpu_rate_landed_.store(
-                    prev > 0 ? 0.5 * prev + 0.5 * r : r, std::memory_order_relaxed);
-                land_seg_frames_ = 0;
-                land_seg_secs_ = 0.0;
-            }
-        } else {
-            land_seg_frames_ = 0;
-            land_seg_secs_ = 0.0;
-        }
-    }
-    last_land_tp_ = now;
     return true;
 }
 
