@@ -14,7 +14,7 @@ os.environ.setdefault('DECORD_LIBRARY_PATH',
                       r'D:/Repo/decord/build-cuda13/Release')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
-from decord import VideoReader, hybrid  # noqa: E402
+from decord import VideoReader, hybrid, hybrid_gpu  # noqa: E402
 
 
 def sample_loop(stop, samples, t0):
@@ -37,7 +37,8 @@ def main():
     timeout = float(sys.argv[3]) if len(sys.argv) > 3 else 60.0
     nt = int(sys.argv[4]) if len(sys.argv) > 4 else 6
 
-    vr = VideoReader(video, ctx=hybrid(0), output_format='yuv420', num_threads=nt)
+    ctx = hybrid_gpu(0) if os.environ.get('OBS_GPU_RESIDENT') else hybrid(0)
+    vr = VideoReader(video, ctx=ctx, output_format='yuv420', num_threads=nt)
     total = min(n, len(vr))
     print(f'observing {os.path.basename(video)}: {total} frames, nt={nt}, timeout={timeout}s')
     vr.seek(0)

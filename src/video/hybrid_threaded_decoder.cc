@@ -210,7 +210,7 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
     // CPU 子解码器接管 VideoReader 打开的 ctx（内部 dec_ctx_.reset 持有）
     // 深存货队列：CPU chunk 的发射靠 cpu_ready_/cpu_ 内部存货瞬时完成，
     // 默认 32 帧背压会让每个 CPU chunk 退化为实时跟随解码（hevc 0.70x）。
-    cpu_.SetQueueDepth(512);
+    cpu_.SetQueueDepth(384);  // 存货深度与 prefetch 匹配（~1.2GB RAM@1080p）
     cpu_.SetCodecContext(dec_ctx, width, height, rotation, output_format);
 #ifdef DECORD_USE_CUDA
     if (gpu_) {
@@ -502,6 +502,15 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     double rate[2] = {r_cpu,
                       gpu_rate_landed_.load(std::memory_order_relaxed)};
     int64_t backlog[2] = {side_pending_[SIDE_CPU], side_pending_[SIDE_GPU]};
+    // 积压钳制：某侧失去 chunk 分配后，其积压只在"front 轮到该侧"时排空
+    // —— 不再分 chunk 就永不排空，min-max 的完工时间被幻觉积压顶死
+    //（实测 av1 小 GOP：GPU pending 600 恒挂、f_c 漂到 0.97）。按 chunk
+    // 尺寸钳制上限，保证落后侧能重新赢得分配、积压真实流动。
+    {
+        const int64_t cap = 2 * last_chunk_frames_ + 64;
+        backlog[0] = std::min(backlog[0], cap);
+        backlog[1] = std::min(backlog[1], cap);
+    }
     // 速率未测得（测量天然滞后于分配）：不给 CPU。消费驱动 demux 下
     // CPU 包到达即发射前夕（仅 prefetch 领先），分给 CPU 的 chunk 必然
     // 以实时解码速率发射 —— 未证明有益（rate_cpu >= 已知吞吐）的 CPU
@@ -515,31 +524,17 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
         DLOG(INFO) << "[hybrid/sched] gpu-rate unknown -> CPU";
         return SIDE_CPU;
     }
-    // min-max 目标：把新 chunk 分给 s 后，两侧"排空各自积压+新 chunk"的
-    // 完成时间的较大值 —— 两侧生产并行、发射互斥，均衡分配才能让快侧
-    // 在慢侧发射期间持续生产（T → r_c+r_g）。比较"各自排空时间"会让
-    // 快侧积压清得更快、恒被选中、包办到底（实测 h264 f_c=0.82、
-    // T=r_fast=1433，均衡后 1700+）。
-    // 对称前瞻：两侧都假定获得等量新工作（last_chunk_frames_）。若只算
-    // 当前积压，快侧清空自己的积压后 t=自身 work/rate 恒更小 → 快侧包办、
-    // 慢侧全程闲置（实测 av1 f_c=0.8、T≈r_fast）；对称前瞻使稳态分配
-    // 比例收敛到速率比，T → r_c + r_g（两侧生产并行）。
-    double t[2];
-    for (int s = 0; s < 2; ++s) {
-        int o = 1 - s;
-        double work_s = static_cast<double>(backlog[s]) + last_chunk_frames_;
-        double work_o = static_cast<double>(backlog[o]) + last_chunk_frames_;
-        t[s] = std::max(work_s / rate[s], work_o / rate[o]);
-    }
-    // tie（均衡态下 t 两侧精确相等，利特尔定律稳态）给 CPU：实测对比
-    // 三轮中位 —— tie->CPU 时 h264 1.48x / hevc 1.05x / av1 1.00x；
-    // tie->GPU 时 h264 掉到 1.28x（快侧 CPU 被压制）而 av1 无收益。
-    Side chosen = t[SIDE_CPU] <= t[SIDE_GPU] ? SIDE_CPU : SIDE_GPU;
-    if (getenv("DECORD_HYBRID_DEBUG")) {
-        fprintf(stderr, "[hybrid/sched] key=%lld t_cpu=%.3f(r=%.0f) t_gpu=%.3f(r=%.0f) pend=%lld -> %s\n",
-                (long long)key_pts, t[SIDE_CPU], rate[SIDE_CPU], t[SIDE_GPU], rate[SIDE_GPU],
-                (long long)gpu_pending_, chosen == SIDE_CPU ? "CPU" : "GPU");
-    }
+    // 份额均衡（water-filling 计数器）：目标份额 ∝ 实测速率，按"实际分配
+    // 帧数与理想份额的差"决策。deficit 精确、无 tie 陷阱 —— min-max 在
+    // 积压钳制成对称后两侧 work 恒等、t 恒 tie，tie->CPU 使 f_c 漂移到 1
+    //（test6 全量实测 6000 帧后断崖跌到 529fps、CPU 独占、GPU 闲置）。
+    // 积压安全由 GPU 字节预算 + 池耗尽背压独立兜底。
+    const double est = static_cast<double>(est_chunk_frames_);
+    const double tot = rate[SIDE_CPU] + rate[SIDE_GPU];
+    const double want_cpu = (static_cast<double>(alloc_frames_[0]
+                            + alloc_frames_[1]) + est) * rate[SIDE_CPU] / tot;
+    Side chosen = (static_cast<double>(alloc_frames_[SIDE_CPU]) <= want_cpu)
+                      ? SIDE_CPU : SIDE_GPU;
     return chosen;
 }
 
@@ -553,7 +548,6 @@ int64_t HybridThreadedDecoder::RankOfPts(int64_t pts) const {
     if (*it != pts && r > 0) return r - 1;
     return r;
 }
-
 
 void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) {
     // VideoReader 对 hybrid 一律推 NDArray()（与 CPU 分支一致）；
@@ -605,7 +599,10 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                 Chunk &last = emit_queue_.back();
                 last.end_pts = pkt->pts;
                 last.expected = ExpectedFrames(last.start_pts, pkt->pts);
-                if (last.expected > 0) last_chunk_frames_ = last.expected;
+                if (last.expected > 0) {
+                    last_chunk_frames_ = last.expected;
+                    est_chunk_frames_ = last.expected;
+                }
             }
             Side old_side = cur_side_;
             Side s = ChooseSide(pkt->pts);
@@ -623,6 +620,7 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
             Chunk c{s, pkt->pts, INT64_MAX, 0, 0, {}, false};
             emit_queue_.push_back(c);
             ++chunks_assigned_[s];
+            alloc_frames_[s] += est_chunk_frames_;
 
         } else {
             // 非 key 包：按 pts 归属路由。解码序与 pts 序不一致的码流

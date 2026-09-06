@@ -229,13 +229,17 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  0.76x），扩到 128 帧让硬件解跑满。 */
     /*! GPU 驻留模式的解码池 = NVDEC 超前上限（帧驻留直到按序消费）。
      *  须覆盖一个 CPU chunk 的发射期 + 调度抖动（~286 帧 chunk → 384）。 */
-    static constexpr std::size_t kGpuResidentPoolBuffers = 384;
+    /*! GPU 驻留模式解码池：NVDEC 超前的硬上限。64 帧 ≈ 200MB@1080p ——
+     *  曾放大到 384（1.2GB）+ 上载池 645（2GB）叠加出 5.4GB 显存（用户
+     *  驳回）；存货需求由 prefetch 提前到达的包满足，池只需覆盖
+     *  解码-消费的短时水位差。 */
+    static constexpr std::size_t kGpuResidentPoolBuffers = 128;
     /*! \brief ready_ 落地队列字节预算（宿主 RAM 的硬边界） */
     /*! 宿主 RAM 预算（帧数 = 预算/frame_bytes）：GPU 解码超前的上限。
      *  chunk 交替时 NVDEC 需覆盖一个 CPU chunk 的发射期（~300 帧@1080p），
      *  1GiB 的 313 帧门控实测顶死（rdy 恒 320、包队列堆积 3000+）。
      *  3GiB ≈ 1000 帧@1080p。 */
-    static constexpr std::size_t kReadyMaxBytes = 3ull << 30;
+    static constexpr std::size_t kReadyMaxBytes = 1ull << 30;
     /*! \brief GPU 工作线程（Start/Stop 管理）：喂包 + 落地 */
     std::thread lander_;
     /*! \brief CPU 帧上载线程（仅 GPU 驻留模式启动）。与落地分离：
@@ -258,7 +262,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief GPU 驻留模式的落地预算（字节）：GPU 帧驻留显存直到按序
      *  消费，NVDEC 超前必须覆盖一个 CPU chunk 的发射期（~300 帧@1080p），
      *  1GiB 预算的 213 帧上限不够（实测 hevc 每 chunk 对损失 ~40ms）。 */
-    static constexpr std::size_t kReadyMaxBytesGpu = 4ull << 30;
+    static constexpr std::size_t kReadyMaxBytesGpu = 1ull << 30;
     /* GPU 驻留模式：CPU 侧已上载的显存帧队列（含 CPU drain marker），
      * 发射序保持。CPU 落地模式不用（CPU 帧直读子解码器）。 */
     std::deque<runtime::NDArray> cpu_ready_;
@@ -321,6 +325,8 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int64_t side_pending_[2] = {0, 0};   ///< 各侧已路由未发射帧数（真积压，
                                          ///< 含在途解码与存货，包粒度精确）
     int64_t last_chunk_frames_ = 0;      ///< 上一 chunk 帧数（新 chunk 估计）
+    int64_t est_chunk_frames_ = 0;       ///< chunk 帧数估计（份额累计用）
+    int64_t alloc_frames_[2] = {0, 0};   ///< 各侧累计分配帧数（份额均衡）
 
     std::vector<int64_t> gpu_frame_shape_;
 

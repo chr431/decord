@@ -88,7 +88,7 @@ static const int DECORD_PREFETCH_DEPTH_BASE = std::stoi(runtime::GetEnvironmentV
  *  CPU 包提前到达、在 CPU chunk 之间的窗口攒存货（frame_queue 512 深）。
  *  hybrid 的 Push 永不阻塞（GPU 包进宿主队列），深 prefetch 无纯 gpu
  *  路径的 demux/消费串联代价。 */
-static const int DECORD_PREFETCH_DEPTH_HYBRID = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_PREFETCH_DEPTH_HYBRID", "512"));
+static const int DECORD_PREFETCH_DEPTH_HYBRID = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_PREFETCH_DEPTH_HYBRID", "384"));
 
 
 VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol, int output_format)
