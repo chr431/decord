@@ -662,9 +662,10 @@ NDArray VideoReader::NextFrameImpl() {
     // never correctness.  Seek() clears the decoder queue and resets both
     // counters; SkipFramesImpl/CheckKeyFrame push/pop without accounting,
     // which likewise only under-prefetches afterwards.
-    const int prefetch_depth = IsHybridType(static_cast<int>(ctx_.device_type))
+    int prefetch_depth = IsHybridType(static_cast<int>(ctx_.device_type))
                                ? DECORD_PREFETCH_DEPTH_HYBRID
                                : DECORD_PREFETCH_DEPTH_BASE;
+    prefetch_depth = std::max(prefetch_depth, decoder_->SuggestPrefetchDepth());
     while (!eof_ && pkts_pushed_ - frames_popped_ < prefetch_depth - 1) {
         PushNext();
         if (!eof_) {

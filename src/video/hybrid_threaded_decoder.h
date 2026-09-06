@@ -81,7 +81,8 @@ class HybridGpuBufferPool {
     std::mutex mtx_;
     std::condition_variable cv_;
     std::deque<runtime::NDArray> free_;
-    std::size_t cap_ = 0;
+    std::size_t cap_ = 0;      ///< 当前允许的已建块数（耗尽翻倍）
+    std::size_t max_cap_ = 0;  ///< 自适应预算上限
     std::size_t created_ = 0;
     bool running_ = false;
     std::vector<int64_t> shape_;
@@ -205,6 +206,10 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     static std::vector<int64_t> FrameShapeFor(int fmt, int h, int w);
     /*! \brief ready_ 队列的帧数上限（由字节预算换算，随分辨率自适应） */
     std::size_t ReadyCap() const;
+    /*! \brief 硬件自适应预算计算（空闲显存/内存 → 各池深/队列/prefetch） */
+    void ComputeBudgets();
+    /*! demux 领先深度建议（自适应预算计算结果） */
+    int SuggestPrefetchDepth() const override { return prefetch_frames_; }
     /*! \brief 记录 chunk 发射速率（EWMA，供 ChooseSide） */
     void RecordChunkRate(const Chunk &ch);
 
@@ -227,12 +232,8 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief GPU 驻留模式解码池：GPU 帧驻留显存、消费后才归还，池大小
      *  = NVDEC 超前上限 —— 28 帧会迫使 NVDEC 频繁停等消费（实测 hevc
      *  0.76x），扩到 128 帧让硬件解跑满。 */
-    /*! GPU 驻留模式的解码池 = NVDEC 超前上限（帧驻留直到按序消费）。
-     *  须覆盖一个 CPU chunk 的发射期 + 调度抖动（~286 帧 chunk → 384）。 */
-    /*! GPU 驻留模式解码池：NVDEC 超前的硬上限。64 帧 ≈ 200MB@1080p ——
-     *  曾放大到 384（1.2GB）+ 上载池 645（2GB）叠加出 5.4GB 显存（用户
-     *  驳回）；存货需求由 prefetch 提前到达的包满足，池只需覆盖
-     *  解码-消费的短时水位差。 */
+    /*! GPU 驻留模式解码池的**下限**：实际池深由空闲显存自适应
+     *  （SetCodecContext 计算，有界、分配失败自动收缩转背压不 OOM）。 */
     static constexpr std::size_t kGpuResidentPoolBuffers = 128;
     /*! \brief ready_ 落地队列字节预算（宿主 RAM 的硬边界） */
     /*! 宿主 RAM 预算（帧数 = 预算/frame_bytes）：GPU 解码超前的上限。
@@ -329,6 +330,12 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int64_t alloc_frames_[2] = {0, 0};   ///< 各侧累计分配帧数（份额均衡）
 
     std::vector<int64_t> gpu_frame_shape_;
+    // ── 硬件自适应预算（SetCodecContext 计算；全部有界）──
+    int gpu_pool_frames_ = 128;    ///< GPU 解码池深（显存，按空闲量自适应）
+    int up_pool_frames_ = 96;      ///< 上载池深（显存，GPU 驻留模式）
+    int queue_frames_ = 384;       ///< CPU 存货队列深（RAM）
+    int ready_cap_frames_ = 341;   ///< ready_ 帧数上限（RAM/显存口径合一）
+    int prefetch_frames_ = 384;    ///< demux 领先深度建议（包）
 
     std::atomic<int64_t> frames_out_[2]{};
     std::atomic<bool> started_{false};

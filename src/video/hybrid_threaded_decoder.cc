@@ -51,6 +51,15 @@
 
 #include <dmlc/logging.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstring>
@@ -98,7 +107,9 @@ void HybridGpuBufferPool::Reset(
         free_.pop_front();
         arr.data_->manager_ctx = nullptr;
     }
-    cap_ = cap;
+    max_cap_ = cap;
+    cap_ = std::min<std::size_t>(cap, 64);  // 起步小池，耗尽翻倍增长
+    // （一次性 cudaMalloc 数百块的首帧开销实测 ≈15% 吞吐）
     shape_ = std::move(shape);
     dtype_ = dtype;
     dev_ = dev;
@@ -135,6 +146,9 @@ bool HybridGpuBufferPool::Acquire(runtime::NDArray *out) {
         *out = free_.front();
         free_.pop_front();
         return true;
+    }
+    if (running_ && created_ >= cap_ && cap_ < max_cap_) {
+        cap_ = std::min<std::size_t>(cap_ * 2, max_cap_);  // 耗尽翻倍
     }
     if (running_ && created_ < cap_) {
         // 池空且未建满：新建（总量受 cap_ 硬约束，显存边界）
@@ -198,6 +212,45 @@ void HybridGpuBufferPool::Deleter(runtime::NDArray::Container *ptr) {
 }
 #endif  // DECORD_USE_CUDA
 
+void HybridThreadedDecoder::ComputeBudgets() {
+    // adaptive: free VRAM/RAM -> bounded budgets; alloc failure = backpressure
+    double vram_budget = 768.0 * 1024 * 1024;
+    double ram_budget = 1536.0 * 1024 * 1024;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > 0)
+        vram_budget = static_cast<double>(free_b) * 0.45;
+#if defined(_WIN32)
+    { MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
+      if (GlobalMemoryStatusEx(&ms)) ram_budget = static_cast<double>(ms.ullAvailPhys) * 0.30; }
+#else
+    { long pages = sysconf(_SC_AVPHYS_PAGES); long ps = sysconf(_SC_PAGE_SIZE);
+      if (pages > 0 && ps > 0) ram_budget = static_cast<double>(pages) * ps * 0.30; }
+#endif
+    if (const char *e = getenv("DECORD_HYBRID_VRAM_BUDGET_MB"))
+        if (atof(e) > 0) vram_budget = atof(e) * 1024 * 1024;
+    if (const char *e = getenv("DECORD_HYBRID_RAM_BUDGET_MB"))
+        if (atof(e) > 0) ram_budget = atof(e) * 1024 * 1024;
+    const double fb = frame_bytes_ > 0 ? static_cast<double>(frame_bytes_) : 3.1e6;
+    auto clampi = [](double v, int lo, int hi) {
+        return static_cast<int>(std::max<double>(lo, std::min<double>(v, hi))); };
+    if (out_cuda_) {
+        gpu_pool_frames_ = clampi(vram_budget * 0.65 / fb, 96, 1024);
+        up_pool_frames_ = clampi(vram_budget * 0.35 / fb, 48, 512);
+    } else {
+        gpu_pool_frames_ = clampi(vram_budget * 0.65 / fb, 28, 128);
+        up_pool_frames_ = 0;
+    }
+    queue_frames_ = clampi(ram_budget * 0.45 / fb, 96, 768);
+    ready_cap_frames_ = clampi(ram_budget * 0.45 / fb, 96, 2048);
+    if (out_cuda_) ready_cap_frames_ = gpu_pool_frames_ + up_pool_frames_ + 64;
+    prefetch_frames_ = clampi(queue_frames_ * 2, 192, 1536);
+    if (getenv("DECORD_HYBRID_DEBUG")) {
+        fprintf(stderr, "[hybrid-budget] vram=%.0fMB ram=%.0fMB pool=%d up=%d queue=%d ready=%d prefetch=%d\n",
+                vram_budget / 1048576.0, ram_budget / 1048576.0,
+                gpu_pool_frames_, up_pool_frames_, queue_frames_,
+                ready_cap_frames_, prefetch_frames_); }
+}
+
 void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
                                              int height, int rotation,
                                              int output_format) {
@@ -210,7 +263,7 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
     // CPU 子解码器接管 VideoReader 打开的 ctx（内部 dec_ctx_.reset 持有）
     // 深存货队列：CPU chunk 的发射靠 cpu_ready_/cpu_ 内部存货瞬时完成，
     // 默认 32 帧背压会让每个 CPU chunk 退化为实时跟随解码（hevc 0.70x）。
-    cpu_.SetQueueDepth(384);  // 存货深度与 prefetch 匹配（~1.2GB RAM@1080p）
+    cpu_.SetQueueDepth(queue_frames_);  // 存货深度与 prefetch 匹配（~1.2GB RAM@1080p）
     cpu_.SetCodecContext(dec_ctx, width, height, rotation, output_format);
 #ifdef DECORD_USE_CUDA
     if (gpu_) {
@@ -232,7 +285,7 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
         gpu_frame_shape_ = GpuFrameShape();
         frame_bytes_ = 1;  // kUInt8
         for (int64_t d : gpu_frame_shape_) frame_bytes_ *= d;
-        gpu_pool_.Reset(out_cuda_ ? kGpuResidentPoolBuffers : kGpuPoolBuffers,
+        gpu_pool_.Reset(gpu_pool_frames_,
                         gpu_frame_shape_, kUInt8,
                         DLDevice{kDLCUDA, device_id_});
         // 事件驱动：子解码器产出 / 池回收 → 即时唤醒工作线程
@@ -243,7 +296,7 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
         if (out_cuda_) {
             // 上载池容量 = ready_ 预算的一半（帧数）：CPU chunk 的
             // 显存帧容器，独立于 GPU 解码池（防饿死）
-            up_pool_.Reset(ReadyCap() / 2, gpu_frame_shape_, kUInt8,
+            up_pool_.Reset(up_pool_frames_, gpu_frame_shape_, kUInt8,
                            DLDevice{kDLCUDA, device_id_});
         }
     }
@@ -298,6 +351,7 @@ std::vector<int64_t> HybridThreadedDecoder::GpuFrameShape() const {
 }
 
 std::size_t HybridThreadedDecoder::ReadyCap() const {
+    if (ready_cap_frames_ > 0) return static_cast<std::size_t>(ready_cap_frames_);
     // 字节预算 → 帧数上限（随分辨率自适应）。下限必须 > kGpuPoolBuffers：
     // FeedStep 的喂包闸门是 ready_ 余量 ≥ 池大小，下限过小会让 GPU 永远
     // 吃不到包（活锁）。GPU 驻留模式预算翻倍（帧驻留显存直到按序消费，
@@ -335,11 +389,11 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
         gpu_frame_shape_ = FrameShapeFor(output_format_, h, w);
         frame_bytes_ = 1;
         for (int64_t d : gpu_frame_shape_) frame_bytes_ *= d;
-        gpu_pool_.Reset(out_cuda_ ? kGpuResidentPoolBuffers : kGpuPoolBuffers,
+        gpu_pool_.Reset(gpu_pool_frames_,
                         gpu_frame_shape_, kUInt8,
                         DLDevice{kDLCUDA, device_id_});
         if (out_cuda_) {
-            up_pool_.Reset(ReadyCap() / 2, gpu_frame_shape_, kUInt8,
+            up_pool_.Reset(up_pool_frames_, gpu_frame_shape_, kUInt8,
                            DLDevice{kDLCUDA, device_id_});
         }
     }

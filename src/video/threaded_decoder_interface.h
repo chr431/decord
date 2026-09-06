@@ -48,6 +48,10 @@ class ThreadedDecoderInterface {
          *        which matters for the non-blocking GPU Pop().
          */
         virtual bool Drained() const = 0;
+        /*! 混合解码器建议的 demux 领先深度（包数；0 = 不建议）。
+         *  VideoReader 取 max(env 基线, 本值) —— 深度是离峰生产的前提，
+         *  由解码器按其自适应预算给出。 */
+        virtual int SuggestPrefetchDepth() const { return 0; }
         virtual void SuggestDiscardPTS(std::vector<int64_t> dts) = 0;
         virtual void ClearDiscardPTS() = 0;
         virtual ~ThreadedDecoderInterface() = default;
