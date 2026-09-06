@@ -330,6 +330,7 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
         frame_queue_->Push(tmp);
         ++frame_count_;
     }
+    if (on_output_) on_output_();
     // 生产速率段式 EWMA（混合解码调度用）：连续产出段（帧间隔 <50ms）
     // 内统计，段满 16 帧折算一次段速率并 EWMA；背压等待/断流重置段
     // 不计入 —— 与消费速率解耦，近似真实解码能力。
@@ -424,6 +425,7 @@ void FFMPEGThreadedDecoder::FilterWorkerThreadImpl() {
             empty.pts = item.pts;
             frame_queue_->Push(empty);
             ++frame_count_;
+            if (on_output_) on_output_();
             break;
         }
         case RawKind::Eof: {
@@ -439,6 +441,7 @@ void FFMPEGThreadedDecoder::FilterWorkerThreadImpl() {
                 frame_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
                 ++frame_count_;
             }
+            if (on_output_) on_output_();
             draining_.store(false);
             break;
         }

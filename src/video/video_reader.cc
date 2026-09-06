@@ -81,7 +81,14 @@ static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(
 // GPU: each in-flight packet holds one ndarray_pool_ buffer (pool = 22),
 // so 8 is safe (7 in flight + 1 cached + decoder internals).
 // Set DECORD_PREFETCH_DEPTH to override (0 = disable prefetch).
-static const int DECORD_PREFETCH_DEPTH = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_PREFETCH_DEPTH", "8"));
+static const int DECORD_PREFETCH_DEPTH_BASE = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_PREFETCH_DEPTH", "8"));
+/*! hybrid 的 demux 领先深度：消费驱动 demux（默认领先 8 包）下 CPU 包
+ *  到达即发射前夕，软解侧没有离峰生产机会 —— 混合的 CPU chunk 退化为
+ *  实时跟随解码速率（hevc 软解 ~700fps 直接封顶整体）。深 prefetch 让
+ *  CPU 包提前到达、在 CPU chunk 之间的窗口攒存货（frame_queue 512 深）。
+ *  hybrid 的 Push 永不阻塞（GPU 包进宿主队列），深 prefetch 无纯 gpu
+ *  路径的 demux/消费串联代价。 */
+static const int DECORD_PREFETCH_DEPTH_HYBRID = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_PREFETCH_DEPTH_HYBRID", "512"));
 
 
 VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol, int output_format)
@@ -655,7 +662,10 @@ NDArray VideoReader::NextFrameImpl() {
     // never correctness.  Seek() clears the decoder queue and resets both
     // counters; SkipFramesImpl/CheckKeyFrame push/pop without accounting,
     // which likewise only under-prefetches afterwards.
-    while (!eof_ && pkts_pushed_ - frames_popped_ < DECORD_PREFETCH_DEPTH - 1) {
+    const int prefetch_depth = IsHybridType(static_cast<int>(ctx_.device_type))
+                               ? DECORD_PREFETCH_DEPTH_HYBRID
+                               : DECORD_PREFETCH_DEPTH_BASE;
+    while (!eof_ && pkts_pushed_ - frames_popped_ < prefetch_depth - 1) {
         PushNext();
         if (!eof_) {
             ++pkts_pushed_;  // real packet; PushNext sets eof_ when it pushed the flush

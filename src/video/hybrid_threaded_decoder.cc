@@ -150,6 +150,22 @@ bool HybridGpuBufferPool::Acquire(runtime::NDArray *out) {
     return false;
 }
 
+void HybridGpuBufferPool::EnableReleaseSync() {
+    if (release_ev_ != nullptr) return;
+    cudaEvent_t ev = nullptr;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess) {
+        release_ev_ = ev;
+    }
+}
+
+void HybridGpuBufferPool::WaitRelease(void *stream) {
+    if (release_ev_ != nullptr) {
+        sync_stream_ = stream;
+        cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(stream),
+                            reinterpret_cast<cudaEvent_t>(release_ev_), 0);
+    }
+}
+
 void HybridGpuBufferPool::Deleter(runtime::NDArray::Container *ptr) {
     if (!ptr) return;
     if (ptr->manager_ctx == nullptr) {
@@ -170,6 +186,7 @@ void HybridGpuBufferPool::Deleter(runtime::NDArray::Container *ptr) {
             // 重新挂上池的 deleter，交回自由队列（NDArrayPool 同款手法）
             pool->free_.push_back(runtime::NDArray(ptr));
             pool->cv_.notify_all();
+            if (pool->on_release_) pool->on_release_();
             return;
         }
     }
@@ -191,6 +208,9 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
     codec_id_ = dec_ctx->codec_id;
     ResetRouting();
     // CPU 子解码器接管 VideoReader 打开的 ctx（内部 dec_ctx_.reset 持有）
+    // 深存货队列：CPU chunk 的发射靠 cpu_ready_/cpu_ 内部存货瞬时完成，
+    // 默认 32 帧背压会让每个 CPU chunk 退化为实时跟随解码（hevc 0.70x）。
+    cpu_.SetQueueDepth(512);
     cpu_.SetCodecContext(dec_ctx, width, height, rotation, output_format);
 #ifdef DECORD_USE_CUDA
     if (gpu_) {
@@ -215,6 +235,11 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
         gpu_pool_.Reset(out_cuda_ ? kGpuResidentPoolBuffers : kGpuPoolBuffers,
                         gpu_frame_shape_, kUInt8,
                         DLDevice{kDLCUDA, device_id_});
+        // 事件驱动：子解码器产出 / 池回收 → 即时唤醒工作线程
+        gpu_->SetOnOutput([this] { lcv_.notify_all(); });
+        cpu_.SetOnOutput([this] { lcv_.notify_all(); });
+        gpu_pool_.SetOnRelease([this] { lcv_.notify_all(); });
+        up_pool_.SetOnRelease([this] { lcv_.notify_all(); });
         if (out_cuda_) {
             // 上载池容量 = ready_ 预算的一半（帧数）：CPU chunk 的
             // 显存帧容器，独立于 GPU 解码池（防饿死）
@@ -381,8 +406,11 @@ void HybridThreadedDecoder::StopGpuWorker() {
 
 void HybridThreadedDecoder::Stop() {
     started_.store(false);
-    DLOG(INFO) << "[hybrid] chunks cpu=" << chunks_assigned_[0] << " gpu=" << chunks_assigned_[1]
-               << " frames cpu=" << frames_out_[0].load() << " gpu=" << frames_out_[1].load();
+    if (getenv("DECORD_HYBRID_DEBUG")) {
+        fprintf(stderr, "[hybrid] chunks cpu=%d gpu=%d frames cpu=%lld gpu=%lld\n",
+                chunks_assigned_[0], chunks_assigned_[1],
+                (long long)frames_out_[0].load(), (long long)frames_out_[1].load());
+    }
 #ifdef DECORD_USE_CUDA
     // 先停工作线程（它可能正持有 GPU 侧的包/缓冲），再停子解码器
     StopGpuWorker();
@@ -418,7 +446,7 @@ void HybridThreadedDecoder::ResetRouting() {
     emitted_upto_[0] = emitted_upto_[1] = 0;
     chunks_assigned_[0] = chunks_assigned_[1] = 0;
     emitted_total_ = 0;
-    assigned_rank_[0] = assigned_rank_[1] = 0;
+    side_pending_[0] = side_pending_[1] = 0;
     last_chunk_frames_ = 0;
 #ifdef DECORD_USE_CUDA
     {
@@ -437,6 +465,15 @@ void HybridThreadedDecoder::ResetRouting() {
 }
 
 HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
+    {/* 诊断/实验开关：DECORD_HYBRID_FORCE_SIDE=cpu|gpu 强制单侧路由 */
+        static const Side forced = [] {
+            const char *e = getenv("DECORD_HYBRID_FORCE_SIDE");
+            if (!e) return Side(-1);
+            return (strcmp(e, "gpu") == 0) ? SIDE_GPU : SIDE_CPU;
+        }();
+        if (forced == SIDE_GPU) return SIDE_GPU;
+        if (forced == SIDE_CPU) return IsIdrLikeCodec() ? SIDE_CPU : SIDE_GPU;
+    }
     if (!IsIdrLikeCodec()) {
         // kick 冲刷的前提是 "关键帧包解码输出的帧 pts == 包 pts 且帧独立"，
         // 只对 IDR 型（H.264/HEVC）成立。AV1 的 show_existing/时间戳映射
@@ -461,39 +498,45 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // 估计帧数) / 该侧速率(帧/秒)，给 t 小的侧。与"上次发射位置"无关
     // —— 用发射位置做距离会让正在发射的一侧 dist 恒小、调度自锁
     //（实测 GPU 被锁死在冷启动 chunk，util 17%）。
-    // CPU 用生产侧实测速率（解码能力），GPU 用落地段速率（NVDEC+D2H
-    // 能力）—— 两者都在产出点测量，与消费速率解耦。
-    double rate[2] = {cpu_.ProductionRate(),
+    // CPU 速率取发射侧 EWMA（积压的真实释放速率，min-max 的正确量纲）；
+    // GPU 用落地段速率。未学得时回退生产侧实测（解码能力上限）。
+    double r_cpu = rate_ewma_[SIDE_CPU] > 0
+                       ? rate_ewma_[SIDE_CPU]
+                       : cpu_.ProductionRate();
+    double rate[2] = {r_cpu,
                       gpu_rate_landed_.load(std::memory_order_relaxed)};
-    int64_t backlog[2];
-    for (int s = 0; s < 2; ++s) {
-        backlog[s] = assigned_rank_[s] > emitted_total_
-                         ? assigned_rank_[s] - emitted_total_
-                         : 0;
+    int64_t backlog[2] = {side_pending_[SIDE_CPU], side_pending_[SIDE_GPU]};
+    // 速率未测得（测量天然滞后于分配）：不给 CPU。消费驱动 demux 下
+    // CPU 包到达即发射前夕（仅 prefetch 领先），分给 CPU 的 chunk 必然
+    // 以实时解码速率发射 —— 未证明有益（rate_cpu >= 已知吞吐）的 CPU
+    // 份额只会拖慢整体。GPU 侧兜底（解码快到能自补，且 GPU 包经宿主
+    // 队列与消费解耦）。冷启动的 chunk2 强制 GPU 保证两侧速率都被测到。
+    if (rate[SIDE_CPU] <= 0) {
+        DLOG(INFO) << "[hybrid/sched] cpu-rate unknown -> GPU";
+        return SIDE_GPU;
     }
-    // 速率未测得（测量天然滞后于分配）时的中性回退：未测得的一侧按
-    // 另一侧实测速率估计（等能力假设）。不引入 NVDEC/CPU 先验比值 —
-    // 两侧速度比随机器/编码/分辨率变化大，固定先验会在错配机器上
-    // 系统性偏置分配。两侧都未测得视为等速，由积压差驱动交替；实测
-    // 学到后自动覆盖。CPU 速率取 filter 线程生产侧实测（与消费解耦）。
-    double eff[2] = {rate[0], rate[1]};
-    if (rate[SIDE_CPU] <= 0 && rate[SIDE_GPU] <= 0) {
-        eff[SIDE_CPU] = eff[SIDE_GPU] = 1.0;
-    } else if (rate[SIDE_CPU] <= 0) {
-        eff[SIDE_CPU] = rate[SIDE_GPU];
-    } else if (rate[SIDE_GPU] <= 0) {
-        eff[SIDE_GPU] = rate[SIDE_CPU];
+    if (rate[SIDE_GPU] <= 0) {
+        DLOG(INFO) << "[hybrid/sched] gpu-rate unknown -> CPU";
+        return SIDE_CPU;
     }
+    // min-max 目标：把新 chunk 分给 s 后，两侧"排空各自积压+新 chunk"的
+    // 完成时间的较大值 —— 两侧生产并行、发射互斥，均衡分配才能让快侧
+    // 在慢侧发射期间持续生产（T → r_c+r_g）。比较"各自排空时间"会让
+    // 快侧积压清得更快、恒被选中、包办到底（实测 h264 f_c=0.82、
+    // T=r_fast=1433，均衡后 1700+）。
     double t[2];
     for (int s = 0; s < 2; ++s) {
-        double work = static_cast<double>(backlog[s]) + last_chunk_frames_;
-        t[s] = work / eff[s];
+        int o = 1 - s;
+        double work_s = static_cast<double>(backlog[s]) + last_chunk_frames_;
+        double work_o = static_cast<double>(backlog[o]);
+        t[s] = std::max(work_s / rate[s], work_o / rate[o]);
     }
     Side chosen = t[SIDE_CPU] <= t[SIDE_GPU] ? SIDE_CPU : SIDE_GPU;
-    DLOG(INFO) << "[hybrid/sched] key=" << key_pts
-               << " t_cpu=" << t[SIDE_CPU] << " (eff=" << eff[SIDE_CPU] << ")"
-               << " t_gpu=" << t[SIDE_GPU] << " (eff=" << eff[SIDE_GPU] << ")"
-               << " pending=" << gpu_pending_ << " -> " << (chosen == SIDE_CPU ? "CPU" : "GPU");
+    if (getenv("DECORD_HYBRID_DEBUG")) {
+        fprintf(stderr, "[hybrid/sched] key=%lld t_cpu=%.3f(r=%.0f) t_gpu=%.3f(r=%.0f) pend=%lld -> %s\n",
+                (long long)key_pts, t[SIDE_CPU], rate[SIDE_CPU], t[SIDE_GPU], rate[SIDE_GPU],
+                (long long)gpu_pending_, chosen == SIDE_CPU ? "CPU" : "GPU");
+    }
     return chosen;
 }
 
@@ -520,7 +563,7 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                 Chunk last{cur_side_, cur_start_pts_, INT64_MAX, 0, 0, {}, false};
                 emit_queue_.push_back(last);
                 backlog_end_[cur_side_] = INT64_MAX;
-                assigned_rank_[cur_side_] = frame_count_;
+
             }
             eof_pushed_ = true;
         }
@@ -563,9 +606,6 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                 last.expected = ExpectedFrames(last.start_pts, pkt->pts);
                 if (last.expected > 0) last_chunk_frames_ = last.expected;
             }
-            // 被关闭 chunk 归属侧的积压上界推进到本关键帧
-            assigned_rank_[emit_queue_.empty() ? cur_side_ : emit_queue_.back().side]
-                = RankOfPts(pkt->pts);
             Side old_side = cur_side_;
             Side s = ChooseSide(pkt->pts);
             if (s != old_side) {
@@ -577,8 +617,7 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
             Chunk c{s, pkt->pts, INT64_MAX, 0, 0, {}, false};
             emit_queue_.push_back(c);
             ++chunks_assigned_[s];
-            // 新 chunk 起点即该侧积压下界（末端未知，随关闭推进）
-            assigned_rank_[s] = std::max(assigned_rank_[s], RankOfPts(pkt->pts));
+
         } else {
             // 非 key 包：按 pts 归属路由。解码序与 pts 序不一致的码流
             //（重排帧的包迟到）仍属于更早的 chunk，必须喂给那侧。
@@ -598,9 +637,13 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                 cur_route_override_ = cur_side_;
             }
         }
-        // GPU 待发射帧计数（包粒度，1 包 = 1 帧）：kick 包与本包
-        if (need_flush && flush_side == SIDE_GPU) ++gpu_pending_;
-        if ((is_key ? cur_side_ : cur_route_override_) == SIDE_GPU) ++gpu_pending_;
+        // 各侧待发射帧计数（包粒度，1 包 = 1 帧；含在途解码与存货）：
+        // kick 包与本包。gpu_pending_ 保留作 GPU 字节预算依据。
+        if (need_flush && flush_side == SIDE_GPU) { ++gpu_pending_; ++side_pending_[SIDE_GPU]; }
+        else if (need_flush && flush_side == SIDE_CPU) { ++side_pending_[SIDE_CPU]; }
+        Side tgt = (is_key ? cur_side_ : cur_route_override_);
+        ++side_pending_[tgt];
+        if (tgt == SIDE_GPU) ++gpu_pending_;
     }
     if (need_flush) {
         // kick（锁外执行）。与原型"块尾多解一帧"同型：克隆新 chunk 的
@@ -681,6 +724,7 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
             if (cpu_ready_.empty()) return false;
             *f = std::move(cpu_ready_.front());
             cpu_ready_.pop_front();
+            lcv_.notify_all();  // 槽位/预算释放：即时唤醒喂包/上载线程
             return f->defined();
         }
 #endif
@@ -692,6 +736,7 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
     if (ready_.empty()) return false;
     *f = std::move(ready_.front());
     ready_.pop_front();
+    lcv_.notify_all();  // 槽位/预算释放：即时唤醒喂包线程
     return f->defined();
 #else
     return false;
@@ -738,6 +783,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         if (f.pts < ch.start_pts) {
             // 陈旧帧（kick 边界帧在 expected 补齐后残留等）：丢弃
             std::lock_guard<std::mutex> lk(mtx_);
+            --side_pending_[s];
             if (s == SIDE_GPU) --gpu_pending_;
             continue;
         }
@@ -762,7 +808,8 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     front.first_pop = std::chrono::steady_clock::now();
                 }
                 ++front.emitted;
-                if (front.expected > 0 && front.emitted >= front.expected
+                static const bool no_exp = getenv("DECORD_HYBRID_NO_EXPECTED") != nullptr;
+                if (!no_exp && front.expected > 0 && front.emitted >= front.expected
                         && front.end_pts != INT64_MAX) {
                     // 补满 expected 且非末 chunk：关闭。stash 里的越界帧
                     // 轮到该侧下一 chunk 时先出（pts 落在其区间或陈旧丢弃）
@@ -770,6 +817,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     emit_queue_.pop_front();
                 }
             }
+            --side_pending_[s];
             if (s == SIDE_GPU) --gpu_pending_;
             emitted_upto_[s] = f.pts;
             ++emitted_total_;

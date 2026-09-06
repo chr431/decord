@@ -17,6 +17,7 @@
 #include "../threaded_decoder_interface.h"
 
 #include <condition_variable>
+#include <functional>
 #include <thread>
 #include <mutex>
 #include <memory>
@@ -57,6 +58,10 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         void Push(AVPacketPtr pkt, NDArray buf);
         bool Pop(NDArray *frame);
         bool Drained() const override;
+        /*! 产出回调（display 线程调用）：混合解码器用它即时唤醒
+         *  落地/喂包线程（替代 1ms 轮询，hevc ~1800fps 下轮询延迟
+         *  直接封顶吞吐）。 */
+        void SetOnOutput(std::function<void()> cb) { on_output_ = std::move(cb); }
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~CUThreadedDecoder();
@@ -133,6 +138,7 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         std::atomic<bool> deferred_valid_{false};
         std::atomic<bool> tail_unsynced_{false};
         std::mutex pkt_room_mutex_;
+        std::function<void()> on_output_;
         std::condition_variable pkt_room_cv_;
 
     DISALLOW_COPY_AND_ASSIGN(CUThreadedDecoder);

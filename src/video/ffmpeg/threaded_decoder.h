@@ -12,6 +12,7 @@
 #include <decord/runtime/ndarray.h>
 
 #include <chrono>
+#include <functional>
 #include <thread>
 #include <unordered_set>
 #include <mutex>
@@ -56,6 +57,9 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         void Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf);
         bool Pop(runtime::NDArray *frame);
         bool Drained() const override;
+        /*! 产出回调（filter 线程调用）：混合解码器用它即时唤醒上载
+         *  线程（替代 1ms 轮询）。 */
+        void SetOnOutput(std::function<void()> cb) { on_output_ = std::move(cb); }
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~FFMPEGThreadedDecoder();
@@ -63,6 +67,11 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
          *  发射速率是消费驱动的（慢消费会把能力低估数倍）；本速率只在
          *  连续产出段（帧间隔 <50ms）内统计，背压等待/断流重置段不计
          *  —— 近似真实解码能力，与消费速率解耦。供混合解码调度用。 */
+        /*! 混合解码器用：放大 frame_queue_ 背压深度。默认 32 帧 —— 混合
+         *  管线里 CPU chunk 的发射靠 cpu_ready_ 存货瞬时完成，存货攒不到
+         *  一个 chunk 帧数（~286）就会退化为实时跟随解码速率
+         *  （hevc CPU 侧 ~700fps，实测整体被拖到 0.70x）。 */
+        void SetQueueDepth(int n) { max_queue_frames_ = n; }
         double ProductionRate() const {
             return prod_rate_.load(std::memory_order_relaxed);
         }
@@ -102,6 +111,7 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         std::atomic<bool> error_status_;
         std::string error_message_;
         int max_queue_frames_;
+        std::function<void()> on_output_;
         // ── 生产侧速率（仅 filter 线程访问，除原子速率外）──
         std::atomic<double> prod_rate_{0.0};
         std::chrono::steady_clock::time_point last_prod_tp_{};

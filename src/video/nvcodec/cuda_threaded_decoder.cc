@@ -308,6 +308,7 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
     if (skip) {
         // skip frame processing
         reorder_queue_->Push(arr);
+        if (on_output_) on_output_();
         return 1;
     }
 
@@ -346,6 +347,7 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
     deferred_valid_.store(true);
     tail_unsynced_.store(true);
     reorder_queue_->Push(arr);
+    if (on_output_) on_output_();
     return 1;
 }
 
@@ -497,6 +499,7 @@ void CUThreadedDecoder::LaunchThreadImpl() {
             for (int i = 0; i < ThreadedDecoderInterface::kDrainMarkerCount; ++i) {
                 reorder_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
             }
+            if (on_output_) on_output_();
         }
     }
 }
