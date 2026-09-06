@@ -1499,14 +1499,20 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
         if (indices[i] - indices[i - 1] != ap_gap) is_arith_prog = false;
     }
     if (is_arith_prog && ap_gap > 1) {
+        // ── 原生 stride（分频采样）流式路径 ──
+        // 等差索引 = 每 ap_gap 帧取一帧。一次连续解码走完整个区间：
+        // SkipFramesImpl 推进到各采样帧（跳过帧解码后 pop 丢弃，不产出/
+        // 不转换/不拷贝），采样帧走正常 NextFrameImpl + ROI + 批内拷贝。
+        // 与旧实现（逐采样帧 SkipFrames+NextFrame）的差异只在消除批间
+        // 重复的 Start/上下文与 NextFrameImpl 的 prefetch 循环开销。
+        // 曾试过 discard-PTS（跳过帧在解码器转换层丢弃）：实测反而慢
+        // 7.8x —— GPU 的 skip 帧仍占满 decode→display→pop→empty-push
+        // 串行链（免的只是 improc kernel），且叠加 pts 集合查找。
         for (std::size_t i = 0; i < indices.size(); ++i) {
             int64_t pos = indices[i];
             CHECK_LT(pos, frame_count);
             CHECK_GE(pos, 0);
             if (curr_frame_ < pos) {
-                // 顺序前跳：解码 (pos - curr_frame_) 帧并丢弃，只推进帧号。
-                // 与通用路径每索引 SeekAccurate 结果一致（都从当前流位置
-                // 顺序解码到目标帧），但避免反复 seek 的开销。
                 SkipFramesImpl(pos - curr_frame_);
             } else if (curr_frame_ != pos) {
                 SeekAccurate(pos);
