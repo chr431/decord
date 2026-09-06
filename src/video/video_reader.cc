@@ -1572,7 +1572,13 @@ bool VideoReader::FetchCachedFrame(NDArray &frame, int64_t pos) {
   if (!use_cached_frame_) return false;
   if (cached_frame_.Size() <= 1) return false;
   if (!frame.defined() || frame.Size() != cached_frame_.Size()) {
-      frame = NDArray::Empty(FrameShape(height_, width_), kUInt8, out_ctx_);
+      // 以缓存帧自身形状分配：ROI-first 下缓存帧是 ROI 尺寸（混合解码
+      // 驻留显存模式还直接引用解码器池缓冲），固定全帧形状会在 CopyFrom
+      // 时尺寸失配（test6_hevc 实测 3740 vs 2073600 崩溃）。
+      const DLTensor &ct = cached_frame_.data_->dl_tensor;
+      frame = NDArray::Empty(
+          std::vector<int64_t>(ct.shape, ct.shape + ct.ndim),
+          ct.dtype, out_ctx_);
   }
   frame.CopyFrom(cached_frame_);
   failed_idx_.insert(pos);

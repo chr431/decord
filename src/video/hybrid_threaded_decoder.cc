@@ -524,6 +524,15 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
         DLOG(INFO) << "[hybrid/sched] gpu-rate unknown -> CPU";
         return SIDE_CPU;
     }
+    // 慢侧弃用闸：CPU 包到达即发射前夕（消费驱动 demux），无法离峰生产，
+    // 分给 CPU 的 chunk 以实时解码速率发射 —— 当 CPU 实测速率低于 GPU 时，
+    // 任何 CPU 份额都是净拖累（test6_hevc 长视频实测 0.88x：water-filling
+    // 仍按比例给 CPU 26% 份额）。两个速率都是产出点实测（软解 filter 线程
+    // / NVDEC 落地段），口径可比。h264（软解 ~1200 > NVDEC ~975）不受影响，
+    // 互补保留（长视频实测 1.77x）。
+    if (rate[SIDE_CPU] < rate[SIDE_GPU]) {
+        return SIDE_GPU;
+    }
     // 份额均衡（water-filling 计数器）：目标份额 ∝ 实测速率，按"实际分配
     // 帧数与理想份额的差"决策。deficit 精确、无 tie 陷阱 —— min-max 在
     // 积压钳制成对称后两侧 work 恒等、t 恒 tie，tie->CPU 使 f_c 漂移到 1
