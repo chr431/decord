@@ -154,6 +154,18 @@ NDArray NDArray::Empty(std::vector<int64_t> shape,
   return ret;
 }
 
+NDArray NDArray::FromRecycled(void* data, std::vector<int64_t> shape,
+                              DLDataType dtype, DLDevice ctx,
+                              void (*deleter)(Container*), void* manager_ctx) {
+  NDArray ret = Internal::Create(shape, dtype, ctx);
+  // 块来自外部（池回收），生命周期归 deleter：引用归零时 deleter 收回块
+  // 并负责 delete container。
+  ret.data_->dl_tensor.data = data;
+  ret.data_->deleter = deleter;
+  ret.data_->manager_ctx = manager_ctx;
+  return ret;
+}
+
 NDArray NDArray::FromDLPack(DLManagedTensor* tensor) {
   NDArray::Container* data = new NDArray::Container();
   data->deleter = Internal::DLPackDeleter;

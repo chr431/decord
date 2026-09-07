@@ -13,6 +13,7 @@
 
 #include <string>
 #include <vector>
+#include <memory>
 
 #include <decord/base.h>
 #include <dmlc/concurrency.h>
@@ -109,6 +110,9 @@ class VideoReader : public VideoReaderInterface {
         std::vector<int64_t> GetKeyIndicesVector() const;
     private:
         void IndexKeyframes();
+        /*! \brief get_batch 批缓冲池（前向声明，video_reader.cc 定义）：
+         *  删除器还池复用，免每批大缓冲的首触缺页税。 */
+        class BatchBlockPool;
         /*! \brief Try to load the frame/keyframe index from the on-disk
          *  index cache (keyed by file size + mtime).  Returns true on a
          *  fresh hit; the caller falls back to IndexKeyframes(). */
@@ -182,6 +186,7 @@ class VideoReader : public VideoReaderInterface {
         int64_t pkts_pushed_ = 0;
         int64_t frames_popped_ = 0;
         NDArrayPool ndarray_pool_;
+        std::shared_ptr<BatchBlockPool> batch_pool_;  // 惰性建，见 BatchBlockPool
         std::unique_ptr<ffmpeg::AVIOBytesContext> io_ctx_;  // avio context for raw memory access
         std::string filename_;  // file name if from file directly, can be empty if from bytes
         NDArray cached_frame_;  // last valid frame, for error tolerance

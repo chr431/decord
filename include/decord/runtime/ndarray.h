@@ -189,6 +189,21 @@ class NDArray {
                                DLDataType dtype,
                                DLDevice ctx);
   /*!
+   * \brief Wrap an externally managed memory block into an NDArray.
+   * \param data Pre-allocated memory block (e.g. recycled from a pool).
+   * \param shape The shape of the new array.
+   * \param dtype The data type of the new array.
+   * \param ctx The context of the Array.
+   * \param deleter Invoked when the last reference dies; it owns `data`
+   *  from then on (typically returns the block to a pool) and must
+   *  delete the container itself.
+   * \param manager_ctx Opaque context handed back to `deleter`.
+   * \return The created Array.
+   */
+  DECORD_DLL static NDArray FromRecycled(
+      void* data, std::vector<int64_t> shape, DLDataType dtype,
+      DLDevice ctx, void (*deleter)(Container*), void* manager_ctx);
+  /*!
    * \brief Create a NDArray backed by a dlpack tensor.
    *
    * This allows us to create a NDArray using the memory

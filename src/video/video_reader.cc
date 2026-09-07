@@ -17,7 +17,9 @@
 #endif
 #include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #ifdef _WIN32
 #include <direct.h>
@@ -87,6 +89,153 @@ static const int DECORD_PREFETCH_DEPTH_BASE = std::stoi(runtime::GetEnvironmentV
  *  hybrid 的 Push 永不阻塞（GPU 包进宿主队列），深 prefetch 无纯 gpu
  *  路径的 demux/消费串联代价。 */
 static const int DECORD_PREFETCH_DEPTH_HYBRID = std::stoi(runtime::GetEnvironmentVariableOrDefault("DECORD_PREFETCH_DEPTH_HYBRID", "384"));
+
+// ── 消费端批组装解锁：批缓冲池 + 批拷贝工作池 ─────────────────────────
+// 剖析（2026-09-08，test3/h264/yuv420）：get_batch 串行路径是
+// "逐帧 Pop(等生产) + CopyTo(~3.1MB ≈ 0.4ms)" 的串联流水，且每批
+// NDArray::Empty 新建 ~0.8GB 缓冲 —— Windows 大块分配 + 首触缺页把
+// 有效拷贝带宽压到 ~8GB/s（复用后 ~24GB/s）。两者叠加把所有管线
+// （纯 CPU / hybrid / NVDEC）盖在 ~1150fps：CPU 模式产率 1300 够不着，
+// hybrid 的 rc+rg(~1800) 更永远够不到。两件套：
+//   1. BatchBlockPool：批缓冲删除器把块还池，同尺寸批直接复用；
+//   2. BatchCopyPool：逐帧拷贝派发后台线程，与 Pop/解码重叠。
+// 两者均 env 可关（DECORD_BATCH_BUF_POOL=0 / DECORD_BATCH_COPY_WORKERS=0）。
+class VideoReader::BatchBlockPool
+        : public std::enable_shared_from_this<BatchBlockPool> {
+    public:
+        struct Block { void* ptr; std::size_t bytes; };
+        explicit BatchBlockPool(DLDevice dev) : dev_(dev) {
+            max_free_ = std::stoi(runtime::GetEnvironmentVariableOrDefault(
+                "DECORD_BATCH_BUF_POOL_MAX", "2"));
+        }
+        ~BatchBlockPool() {
+            for (auto &b : free_) {
+                runtime::DeviceAPI::Get(dev_)->FreeDataSpace(dev_, b.ptr);
+            }
+        }
+        static bool Enabled() {
+            static const bool on = std::stoi(runtime::GetEnvironmentVariableOrDefault(
+                "DECORD_BATCH_BUF_POOL", "1")) != 0;
+            return on;
+        }
+        runtime::NDArray Acquire(std::vector<int64_t> shape, DLDataType dtype) {
+            std::size_t elems = 1;
+            for (auto d : shape) elems *= static_cast<std::size_t>(d);
+            const std::size_t bytes =
+                elems * (static_cast<std::size_t>(dtype.bits) * dtype.lanes + 7) / 8;
+            void *p = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                for (auto it = free_.begin(); it != free_.end(); ++it) {
+                    if (it->bytes == bytes) {
+                        p = it->ptr;
+                        free_.erase(it);
+                        break;
+                    }
+                }
+            }
+            if (p == nullptr) {
+                p = runtime::DeviceAPI::Get(dev_)->AllocDataSpace(
+                    dev_, bytes, runtime::kAllocAlignment, dtype);
+            }
+            // 持池引用的上下文随 NDArray 存活：批缓冲比 reader 后死也安全
+            Holder *h = new Holder{shared_from_this(), bytes};
+            return runtime::NDArray::FromRecycled(
+                p, std::move(shape), dtype, dev_, &ReturnDeleter, h);
+        }
+    private:
+        struct Holder {
+            std::shared_ptr<BatchBlockPool> pool;
+            std::size_t bytes;
+        };
+        static void ReturnDeleter(runtime::NDArray::Container *self) {
+            auto *h = static_cast<Holder *>(self->manager_ctx);
+            h->pool->Return(self->dl_tensor.data, h->bytes);
+            delete h;
+            delete self;
+        }
+        void Return(void *p, std::size_t bytes) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (static_cast<int>(free_.size()) < max_free_) {
+                free_.push_back(Block{p, bytes});
+            } else {
+                runtime::DeviceAPI::Get(dev_)->FreeDataSpace(dev_, p);
+            }
+        }
+        DLDevice dev_;
+        int max_free_ = 3;
+        std::mutex mtx_;
+        std::vector<Block> free_;
+};
+
+// 逐帧批拷贝工作池：把 CopyTo 从 Pop 串行链上摘下来与解码重叠。
+// 只服务 CPU→CPU（hybrid CPU-out / 纯 CPU）；CUDA 目标走原路径。
+class BatchCopyPool {
+    public:
+        static BatchCopyPool* Get() {
+            static BatchCopyPool inst;
+            return inst.n_ > 0 ? &inst : nullptr;
+        }
+        void Submit(runtime::NDArray src, runtime::NDArray dst) {
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                q_.push_back(Task{std::move(src), std::move(dst)});
+                ++pending_;
+            }
+            cv_.notify_one();
+        }
+        void WaitIdle() {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_done_.wait(lk, [this] { return pending_ == 0; });
+        }
+    private:
+        struct Task { runtime::NDArray src, dst; };
+        BatchCopyPool() {
+            int hw = static_cast<int>(std::thread::hardware_concurrency());
+            if (hw <= 0) hw = 8;
+            n_ = std::stoi(runtime::GetEnvironmentVariableOrDefault(
+                "DECORD_BATCH_COPY_WORKERS",
+                std::to_string(std::max(2, std::min(4, hw / 8)))));
+            for (int i = 0; i < n_; ++i) {
+                ts_.emplace_back([this] {
+                    for (;;) {
+                        Task t;
+                        {
+                            std::unique_lock<std::mutex> lk(mtx_);
+                            cv_.wait(lk, [this] { return stop_ || !q_.empty(); });
+                            if (stop_ && q_.empty()) return;
+                            t = std::move(q_.front());
+                            q_.pop_front();
+                        }
+                        runtime::NDArray::CopyFromTo(
+                            const_cast<DLTensor *>(t.src.operator->()),
+                            const_cast<DLTensor *>(t.dst.operator->()), nullptr);
+                        bool done = false;
+                        {
+                            std::lock_guard<std::mutex> lk(mtx_);
+                            done = (--pending_ == 0);
+                        }
+                        if (done) cv_done_.notify_all();
+                    }
+                });
+            }
+        }
+        ~BatchCopyPool() {
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                stop_ = true;
+            }
+            cv_.notify_all();
+            for (auto &t : ts_) t.join();
+        }
+        int n_ = 0;
+        bool stop_ = false;
+        std::size_t pending_ = 0;
+        std::mutex mtx_;
+        std::condition_variable cv_, cv_done_;
+        std::deque<Task> q_;
+        std::vector<std::thread> ts_;
+};
 
 
 VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread, int io_type, std::string fault_tol, int output_format)
@@ -1524,8 +1673,21 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
         std::vector<int64_t> buf_shape = {
             static_cast<int64_t>(bs), frame_shape[0], frame_shape[1]};
         if (frame_shape.size() == 3) buf_shape.push_back(frame_shape[2]);
-        buf = NDArray::Empty(buf_shape, kUInt8, out_ctx_);
+        bool pool_on = out_ctx_.device_type == kDLCPU
+                       && VideoReader::BatchBlockPool::Enabled();
+        if (pool_on) {
+            if (!batch_pool_) {
+                batch_pool_ = std::make_shared<VideoReader::BatchBlockPool>(out_ctx_);
+            }
+            buf = batch_pool_->Acquire(buf_shape, kUInt8);
+        } else {
+            buf = NDArray::Empty(buf_shape, kUInt8, out_ctx_);
+        }
     }
+    // 逐帧拷贝与解码重叠（仅 CPU→CPU；env 可关）。批末 WaitIdle 保证
+    // 返回前所有派发完成 —— 调用方拿到 buf 即数据完整。
+    BatchCopyPool *copy_pool =
+        out_ctx_.device_type == kDLCPU ? BatchCopyPool::Get() : nullptr;
     // LOG(INFO) << height_ << " "  << width_ << " Buf size: " << bs << " total: " << bs * height_ * width_ * 3;
     int64_t frame_count = GetFrameCount();
     uint64_t offset = 0;
@@ -1569,8 +1731,13 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
                 LOG(FATAL) << "Error getting frame at: " << pos << " with total frames: " << frame_count;
             }
             auto view = buf.CreateOffsetView(frame_shape, frame.data_->dl_tensor.dtype, &offset);
-            frame.CopyTo(view);
+            if (copy_pool) {
+                copy_pool->Submit(std::move(frame), std::move(view));
+            } else {
+                frame.CopyTo(view);
+            }
         }
+        if (copy_pool) copy_pool->WaitIdle();
         return buf;
     }
     for (std::size_t i = 0; i < indices.size(); ++i) {
@@ -1580,6 +1747,9 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
             // not the first occurance of frame, try to copy from buffer rather than load from video
             CHECK(i > it->second);
             CHECK(i > 0);
+            // 槽位依赖：源槽可能还在拷贝工作池的在途任务里，先排空再
+            // 做批内复制（重复索引罕见，一次全量同步可接受）。
+            if (copy_pool) copy_pool->WaitIdle();
             uint64_t old_offset = offset / i * it->second;
             auto old_view = buf.CreateOffsetView(frame_shape, kUInt8, &old_offset);
             auto view = buf.CreateOffsetView(frame_shape, kUInt8, &offset);
@@ -1602,9 +1772,14 @@ NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
             // copy frame to buffer
             // LOG(INFO) << "index: " << i << ", size: " << height_ * width_ * 3 * i <<  ", offset: " << offset << " Curr frame: " << frame.data_->dl_tensor.shape[0] << " x " << frame.data_->dl_tensor.shape[1] << " x " << frame.data_->dl_tensor.shape[2] << " Frame size: " << frame.Size();
             auto view = buf.CreateOffsetView(frame_shape, frame.data_->dl_tensor.dtype, &offset);
-            frame.CopyTo(view);
+            if (copy_pool) {
+                copy_pool->Submit(std::move(frame), std::move(view));
+            } else {
+                frame.CopyTo(view);
+            }
         }
     }
+    if (copy_pool) copy_pool->WaitIdle();
     return buf;
 }
 
