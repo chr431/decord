@@ -67,8 +67,6 @@
 namespace decord {
 
 namespace {
-/*! 冷启动阶段交替分配（前两个 chunk 各来一次，让两路速率都可测） */
-constexpr int kColdStartChunks = 2;
 /*! 调度粘性：同侧最少连续分配的 chunk 数（块状分配，防流水线冷启动） */
 constexpr int kStickyMinChunks = 4;
 }  // namespace
@@ -547,6 +545,7 @@ void HybridThreadedDecoder::ResetRouting() {
     chunks_assigned_[0] = chunks_assigned_[1] = 0;
     emitted_total_ = 0;
     sticky_frames_ = 0;
+    sched_initialized_ = false;
     side_pending_[0] = side_pending_[1] = 0;
 #ifdef DECORD_USE_CUDA
     {
@@ -583,54 +582,44 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     if (!IsIdrLikeCodec()) {
         return SIDE_GPU;
     }
-    // AV1 与 IDR 型走统一 min-max 贪心：实测 racelog AV1 流 has_b_frames=0
-    // 且包 pts==dts（解码序=显示序），跨侧切换无重排残留、不需要 kick
-    // （kick 的 show_existing 映射反而造成双发错位）。重排流的安全网见
-    // Pop 的 force-close。
-    // 冷启动：前 kColdStartChunks 个 chunk 交替分配，采集两侧速率
-    int total = chunks_assigned_[0] + chunks_assigned_[1];
-    if (total < kColdStartChunks) {
-        return total == 0 ? SIDE_CPU : SIDE_GPU;
-    }
+    // AV1 与 IDR 型走统一 water-filling：首包 GPU（见 Push），rc 由
+    // 首个 CPU chunk 采样、rg 由首包落地采样，两侧速率就绪后进入
+    // 弃用闸/份额均衡。重排流的安全网见 Pop 的 force-close。
     // （GPU 待发射字节硬预算已移除）总在途由 demux prefetch 窗口 +
     // ready_ 预算 + 池深三重硬上限兜底。旧的 kGpuAheadBytes 预算把
     // "CPU 块实时发射期 GPU 存货正常偏斜"误判为调度失衡并强制切给
     // 慢侧 CPU —— GPU 越快越早触发，恶性循环锁死在 CPU 实时速率
     // （av1 全量实测 654fps vs 全 GPU 1520）。
     // 积压排空贪心 → 已被 water-filling 份额计数器取代（见下）。
-    // CPU 速率取生产侧实测（filter 线程产出 EWMA）：与 GPU 落地速率
-    // 同为"解码能力"口径。发射速率（rate_ewma_）在有存货时等于消费
-    // 速率，会让 CPU 份额虚高（实测 h264 拿 64% 而能力只占 47%，
-    // 过量 CPU chunk 以实时解码速率发射、直接拖慢整体）。
+    // CPU 速率取生产侧实测（filter 线程产出 EWMA，NV12 直出后的有效
+    // 供给口径）：与 GPU 落地速率同口径可比。
     double rate[2] = {cpu_.ProductionRate(),
                       gpu_rate_landed_.load(std::memory_order_relaxed)};
-    // 速率未测得（测量天然滞后于分配）：不给 CPU。消费驱动 demux 下
-    // 未证明速率的 CPU 份额只会拖慢整体（冷启动的 chunk2 强制 GPU
-    // 保证两侧速率都被测到）。
-    // 速率未学得（决策发生在 demux 推包时，毫秒级领先于真实解码）。
-    // rg 未知而 rc 已知（chunk0=CPU 生产 16 帧即有值，NVDEC 落地慢一拍）：
-    // 用 rc 相对 NVDEC 典型能力（~1000fps@1080p）做先验 —— CPU 实测快
-    // （低复杂度 h264 软解 8 核 1000+）时交替试探（h264 1.78x），否则
-    // 押 GPU（hevc/av1 软解 500-750 远低于 NVDEC，交替会把发射绑死在
-    // CPU 实时速率，实测 0.65-0.71x）。
+    // rc 未学得：仅 h264 给一个 CPU chunk 采样（其混跑有净收益，
+    // water-filling 需要 rc；该 chunk 与 chunk0 的 GPU 发射重叠，且
+    // GPU-first 下盲决策全落 GPU，采样安全）。hevc/av1 的 gate 判决
+    // 恒为全 GPU，无需 rc —— 盲给 CPU 反而把整条流钉死在软解速率
+    // （hevc GPU-first+盲CPU 实测 669fps）。其余兜底 GPU（NVDEC 平价）。
     if (rate[SIDE_CPU] <= 0) {
+        Side pick = codec_id_ == AV_CODEC_ID_H264 ? SIDE_CPU : SIDE_GPU;
         if (getenv("DECORD_HYBRID_DEBUG")) {
-            fprintf(stderr, "[hybrid-sched] key=%lld rc-unknown -> GPU\n",
-                    (long long)key_pts);
+            fprintf(stderr, "[hybrid-sched] key=%lld rc-unknown -> %d\n",
+                    (long long)key_pts, (int)pick);
         }
-        return SIDE_GPU;
+        return pick;
     }
     if (rate[SIDE_GPU] <= 0) {
-        // rg 未学得：CPU 承接（基线语义）。除学习窗口考虑外，这天然
-        // 节流了 GPU 的深度超前 —— NVDEC 输出边界（跨侧切换处）存在
-        // 既有竞态，GPU 从首块起持续深超前会把偶发损坏变成高概率
-        // （av1+ROI 实测 rg-unknown->GPU 版本 294 帧起错位 ~90%）。
-        // rc 很快（>1000，h264 类）时交替试探 —— GPU 慢的码流混合
-        // 收益大，值得早期给 GPU 采样。
-        Side pick = rate[SIDE_CPU] > 1000.0
-                        ? (chunks_assigned_[SIDE_CPU] <= chunks_assigned_[SIDE_GPU]
-                               ? SIDE_CPU : SIDE_GPU)
-                        : SIDE_CPU;
+        // rg 未学得（决策跑在解码前面）：h264 类（软解通常 ≥ NVDEC，
+        // 混跑收益大）交替试探 —— 盲阶段提前给 CPU 份额让 water-filling
+        // 从对称起点再平衡（否则粘性 + 单边 alloc 让混跑退化到全 GPU
+        // 节奏，h264 实测 1.0x）。注意盲阶段两路争核，hevc/h264 的 rc
+        // 都在 ~1124（数值不可分），故用 codec 先验而非速率阈值。
+        // hevc/av1（软解 < NVDEC）直接 GPU 承接（NVDEC 平价是安全默认）。
+        bool fast_soft_codec = codec_id_ == AV_CODEC_ID_H264;
+        Side pick = (fast_soft_codec
+                         && chunks_assigned_[SIDE_CPU] <= chunks_assigned_[SIDE_GPU])
+                        ? SIDE_CPU
+                        : SIDE_GPU;
         if (getenv("DECORD_HYBRID_DEBUG")) {
             fprintf(stderr, "[hybrid-sched] key=%lld rg-unknown rc=%.0f -> %d\n",
                     (long long)key_pts, rate[SIDE_CPU], (int)pick);
@@ -642,16 +631,21 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // 慢侧弃用闸（v2，生产口径）：CPU 解码能力不足 GPU 的 0.6 倍时，
     // CPU 份额的边际贡献低于块交替发射的固有损耗（CPU 块实时跟随期
     // 挡住 GPU 存货发射 + 速率学习波动），整体劣化且方差大 —— av1
-    // （dav1d ~520 vs NVDEC 1600）混合实测 0.67-0.96x 摆动、hevc（0.47）
-    // 0.72-1.01x 摆动，均不如 NVDEC 平价稳定。h264（1.4x）互补保留
-    // （混合稳定 1.7x+）。v1 闸（2026-09 移除）因发射口径虚高误伤
-    // h264 —— 本闸用解码线程产出速率，量纲正确。
+    // （dav1d ~520 vs NVDEC 1600）与 hevc（NV12 后 rc~1300 vs rg~1860，
+    // 比值 0.70）混跑实测均劣于全 GPU（hevc 1280 vs 1845：rc 是隔离
+    // 产率，混跑时软解线程与消费/喂包线程抢核，有效供给远低于隔离值，
+    // 且发射交替有固有损耗）。h264（1.3x）互补保留（混合稳定 1.3x+）。
+    // v1 闸（2026-09 移除）因发射口径虚高误伤 h264 —— 本闸用 filter
+    // 后产出速率（NV12 直出），量纲正确。阈值为 1.0（rc ≥ rg 才混）：
+    // rc 是隔离产率，混跑时软解与消费/喂包抢核导致有效供给缩水，
+    // 实测比值 0.7-0.8 的混跑在 1258-1779 间抛硬币。阈值 0.75：hevc
+    // （NV12 后 0.70）稳定走全 GPU，h264（1.3+）保留混跑。
     if (getenv("DECORD_HYBRID_DEBUG")) {
         fprintf(stderr, "[hybrid-sched] key=%lld rc=%.0f rg=%.0f gate-check %.2f\n",
                 (long long)key_pts, rate[SIDE_CPU], rate[SIDE_GPU],
                 rate[SIDE_CPU] / std::max(rate[SIDE_GPU], 1.0));
     }
-    if (rate[SIDE_CPU] < 0.7 * rate[SIDE_GPU]) {
+    if (rate[SIDE_CPU] < 0.8 * rate[SIDE_GPU]) {
         return SIDE_GPU;
     }
     // 份额均衡（water-filling 计数器）：目标份额 ∝ 实测速率，按"实际分配
@@ -660,6 +654,16 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     //（test6 全量实测 6000 帧后断崖跌到 529fps、CPU 独占、GPU 闲置）。
     // 积压安全由 GPU 字节预算 + 池耗尽背压独立兜底。
     const double est = static_cast<double>(est_chunk_frames_);
+    if (!sched_initialized_) {
+        // 首次双侧速率就绪：重置份额计数。盲决策阶段（速率未学得）
+        // 的分配全部落 GPU，若计入 water-filling 的 alloc 基数，GPU 的
+        // 巨额"存款"会让后期混跑失去再平衡能力（h264 实测 alloc
+        // 549/3204、CPU 只拿到 14% 份额，混跑退化到 1.0x）。重置后
+        // 份额从对称起点按实测速率分配。
+        sched_initialized_ = true;
+        alloc_frames_[0] = est_chunk_frames_;
+        alloc_frames_[1] = est_chunk_frames_;
+    }
     if (getenv("DECORD_HYBRID_DEBUG")) {
         fprintf(stderr, "[hybrid-sched] key=%lld rc=%.0f rg=%.0f alloc=%lld/%lld sticky=%lld\n",
                 (long long)key_pts, rate[SIDE_CPU], rate[SIDE_GPU],
@@ -746,11 +750,13 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (!routing_active_) {
-            // 首包：IDR 型首 chunk 固定 CPU（首帧延迟优先 + CPU 速率
-            // 学习）。AV1 首包直接 GPU（CPU 块的 dav1d 断流滞留见
-            // ChooseSide 注释 —— 零 CPU 块）。
+            // 首包一律 GPU：NVDEC 平价起步，chunk0 的 CPU 串行解码
+            // （~0.3s @ 软解速率，hevc 全量 0.3/1.7s ≈ 15% 纯损耗）完全
+            // 消除。rc 采样仅 h264 有意义（混跑有净收益）——由 rc-unknown
+            // 分支按 codec 给一个 CPU chunk 采样（与 chunk0 的 GPU 发射
+            // 重叠）；hevc/av1 的 gate 判决恒为全 GPU，永远不需要 rc。
             routing_active_ = true;
-            cur_side_ = IsIdrLikeCodec() ? SIDE_CPU : SIDE_GPU;
+            cur_side_ = SIDE_GPU;
             cur_start_pts_ = pkt->pts;
             Chunk c{cur_side_, pkt->pts, INT64_MAX, 0, 0};
             emit_queue_.push_back(c);
@@ -1199,12 +1205,26 @@ bool HybridThreadedDecoder::FeedStep() {
     }
     {
         std::lock_guard<std::mutex> lk(rmtx_);
-        // ready_ 接近预算即暂停喂包：GPU 解码超前被限制在
-        // ready_ 余量 + 池缓冲内，越界的包留在宿主队列（RAM）
-        if (ready_.size() + kGpuPoolBuffers >= ReadyCap()) {
-            std::lock_guard<std::mutex> lk2(lcv_mtx_);
-            if (has_pkt) gpu_pkt_q_.push_front(std::move(pkt));
-            return false;
+        // ready_ 接近上限即暂停喂包，越界的包留在宿主队列（RAM）。
+        // GPU 驻留模式：ready_ 帧本身持有池缓冲，物理上限 = 池深
+        // （预留 NVDEC 在途 surface）；旧公式把整个池重复计入
+        // （ready+pool ≥ ReadyCap → ready 到 ReadyCap-pool 即停喂），
+        // CPU 块发射期 NVDEC 有效产出被压到 ~1200fps（hevc/h264 混跑
+        // 的主要损耗源）。CPU-out：ready_ 是宿主帧，池缓冲仅在途
+        // （D2H 环 + surface ≈ kGpuPoolBuffers），上限仍是 ReadyCap。
+        {
+            const std::size_t cap = out_cuda_
+                ? static_cast<std::size_t>(std::max(gpu_pool_frames_, 1))
+                : ReadyCap();
+            const std::size_t reserve = out_cuda_
+                ? static_cast<std::size_t>(
+                      ThreadedDecoderInterface::kMaxOutputSurfaces + 8)
+                : kGpuPoolBuffers;
+            if (ready_.size() + reserve >= cap) {
+                std::lock_guard<std::mutex> lk2(lcv_mtx_);
+                if (has_pkt) gpu_pkt_q_.push_front(std::move(pkt));
+                return false;
+            }
         }
     }
     if (!has_pkt) {

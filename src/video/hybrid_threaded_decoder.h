@@ -343,6 +343,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int64_t est_chunk_frames_ = 0;       ///< chunk 帧数估计（份额累计用）
     int64_t sticky_frames_ = 0;          ///< 当前侧已连续分配的帧数（粘性）
     int64_t alloc_frames_[2] = {0, 0};   ///< 各侧累计分配帧数（份额均衡）
+    bool sched_initialized_ = false;     ///< 双侧速率首次就绪后已重置 alloc
 
     std::vector<int64_t> gpu_frame_shape_;
     // ── 硬件自适应预算（SetCodecContext 计算；全部有界）──

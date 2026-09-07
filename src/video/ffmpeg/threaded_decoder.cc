@@ -142,7 +142,12 @@ void FFMPEGThreadedDecoder::BuildFilterGraph() {
     // （色度上采样在裁剪边界需要窗口外的色度样本，与旧全帧转换逐像素
     // 不一致），保持旧路径。
     // 旋转非 0 或用户缩放时同样保持旧行为（全帧转换 + 调用方裁剪）。
-    const char *fmt = output_format_ == 2 ? "yuv420p"
+    // yuv420 输出直出 NV12（sws SIMD 交错）而非 yuv420p：输出布局同为
+    // packed 2D（Y 行 + 交错 UV 行），但 CopyToNDArray 的打包从"逐字节
+    // U/V 交错标量循环"（~518K 次/帧@1080p，是 CPU 侧有效供给的主成本）
+    // 变成两次整块 memcpy —— 软解侧供给 800 → 1000+fps（hybrid 调度的
+    // 速率口径与慢侧弃用闸均按 filter 后口径）。
+    const char *fmt = output_format_ == 2 ? "nv12"
                       : (output_format_ == 1 ? "gray" : "rgb24");
     bool user_scale = (out_w_ > 0 && out_h_ > 0
                        && (out_w_ != orig_w_ || out_h_ != orig_h_));
@@ -303,19 +308,14 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
     }
     pf_f_filter.start();
     graph->Push(frame.get());
-    // 生产速率段式 EWMA（混合解码调度用）：有效供给 = filter 后的帧
-    // （raw 产出绕过 YUV 打包成本，hevc 实测 raw 1333 vs 有效 ~800，
-    // 调度据 raw 过配 CPU 份额致整体 0.68x）。存货完全满（消费瓶颈
-    // 期）的产出不计 —— 那是 filter 倾泻脉冲而非供给节奏（h264 曾
-    // 学到 1134 > 12 线程纯跑）；浅水位照常统计保证学习及时性。
+    // 生产速率段式 EWMA（混合解码调度用）：统计 filter 后的帧产出
+    // 节奏（NV12 直出后 filter 成本 ≈ 解码成本，产出口径即有效供给）。
+    // 注意不可按存货水位拒计样本 —— GPU-first 冷启动下 CPU 解码器
+    // 恒处深存货状态（包永远充足），水位门控会把 rc 永久屏蔽
+    // （实测 hevc 16 chunks 全部 rc-unknown，退化为 CPU 主导 667fps）。
     {
-        bool count_it = !frame_queue_ || max_queue_frames_ <= 0
-            || frame_queue_->Size() < static_cast<size_t>(max_queue_frames_);
         auto now = std::chrono::steady_clock::now();
-        if (!count_it) {
-            prod_seg_frames_ = 0;
-            prod_seg_secs_ = 0.0;
-        } else if (last_prod_tp_.time_since_epoch().count() != 0) {
+        if (last_prod_tp_.time_since_epoch().count() != 0) {
             double dt = std::chrono::duration<double>(now - last_prod_tp_).count();
             if (dt > 0.05) {
                 prod_seg_frames_ = 0;
@@ -648,13 +648,47 @@ NDArray FFMPEGThreadedDecoder::CopyToNDArray(AVFramePtr p) {
     CHECK(p) << "Error: converting empty AVFrame to DLTensor";
     CHECK(AVPixelFormat(p->format) == AV_PIX_FMT_RGB24
           || AVPixelFormat(p->format) == AV_PIX_FMT_GRAY8
-          || AVPixelFormat(p->format) == AV_PIX_FMT_YUV420P)
-        << "Only support RGB24/GRAY8/YUV420P image to NDArray conversion, given: "
+          || AVPixelFormat(p->format) == AV_PIX_FMT_YUV420P
+          || AVPixelFormat(p->format) == AV_PIX_FMT_NV12)
+        << "Only support RGB24/GRAY8/YUV420P/NV12 image to NDArray conversion, given: "
         << AVPixelFormat(p->format);
     DLDevice ctx;
     CHECK(!p->hw_frames_ctx) << "Not supported hw_frames_ctx";
     ctx = kCPU;
     auto device_api = runtime::DeviceAPI::Get(ctx);
+    if (AVPixelFormat(p->format) == AV_PIX_FMT_NV12) {
+        // packed 2D 输出（与 yuv420p 分支同布局）：Y 平面 + 交错 UV 平面
+        // 各为连续行 —— 两次 memcpy（linesize==w 时整块），无逐字节交错。
+        int h = p->height;
+        int w = p->width;
+        int rows = h + (h + 1) / 2;
+        NDArray arr = NDArray::Empty({rows, w}, kUInt8, ctx);
+        uint8_t *to_ptr = static_cast<uint8_t *>(arr.data_->dl_tensor.data);
+        const uint8_t *y_src = p->data[0];
+        int uv_h = h / 2;
+        if (p->linesize[0] == w) {
+            std::memcpy(to_ptr, y_src, static_cast<size_t>(h) * w);
+        } else {
+            for (int y = 0; y < h; ++y) {
+                std::memcpy(to_ptr + static_cast<int64_t>(y) * w,
+                            y_src + static_cast<int64_t>(y) * p->linesize[0],
+                            static_cast<size_t>(w));
+            }
+        }
+        const uint8_t *uv_src = p->data[1];
+        uint8_t *uv_dst = to_ptr + static_cast<int64_t>(h) * w;
+        if (p->linesize[1] == w && uv_h > 0) {
+            std::memcpy(uv_dst, uv_src, static_cast<size_t>(uv_h) * w);
+        } else {
+            for (int y = 0; y < uv_h; ++y) {
+                std::memcpy(uv_dst + static_cast<int64_t>(y) * w,
+                            uv_src + static_cast<int64_t>(y) * p->linesize[1],
+                            static_cast<size_t>(w));
+            }
+        }
+        arr.pts = p->pts;
+        return arr;
+    }
     if (AVPixelFormat(p->format) == AV_PIX_FMT_YUV420P) {
         // packed 2D 输出：前 h 行原始 Y，随后 ceil(h/2) 行 interleaved
         // U/V（原始 4:2:0，按 MPEG-2 siting 打包）。Y 不做 range 展开：
@@ -715,9 +749,11 @@ static void AVFrameManagerDeleter(DLManagedTensor *manager) {
 }
 
 NDArray FFMPEGThreadedDecoder::AsNDArray(AVFramePtr p) {
-    if (AVPixelFormat(p->format) == AV_PIX_FMT_YUV420P) {
-        // YUV420P 有三个平面（Y/U/V），无法零拷贝单个 DLPack tensor ——
+    if (AVPixelFormat(p->format) == AV_PIX_FMT_YUV420P
+            || AVPixelFormat(p->format) == AV_PIX_FMT_NV12) {
+        // YUV420P 三平面 / NV12 双平面无法零拷贝单个 DLPack tensor ——
         // 打包成 NV12 布局的 2D 数组并拷贝（ROI-first 下只拷 ROI 尺寸）。
+        // NV12 显式路由：双平面落进通用 compact-wrap 会缺 UV 行。
         return CopyToNDArray(p);
     }
     if (p->linesize[0] % p->width != 0) {
