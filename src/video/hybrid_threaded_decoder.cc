@@ -900,6 +900,29 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         runtime::NDArray f;
         if (!PopSide(s, &f)) {
             static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
+            if (dbg) {
+                // 连续取空诊断：头部 chunk 与两侧队列状态（D 类问题定位用）。
+                // 只嵌 rmtx_ 读队列长度；chunk/pend 字段按本文件既有调试
+                // 打印惯例无锁读取（仅诊断，不保证精确快照）。
+                static thread_local int fail_streak = 0;
+                if (++fail_streak % 2000 == 0) {
+                    std::size_t crdy, rdy;
+                    {
+                        std::lock_guard<std::mutex> lk(rmtx_);
+                        crdy = cpu_ready_.size();
+                        rdy = ready_.size();
+                    }
+                    fprintf(stderr,
+                            "\n[pop-stall] side=%d crdy=%zu rdy=%zu "
+                            "head=(side%d,%lld,end=%lld,exp=%lld,em=%lld) "
+                            "pend=%d/%d\n",
+                            (int)s, crdy, rdy,
+                            (int)ch.side, (long long)ch.start_pts,
+                            (long long)ch.end_pts, (long long)ch.expected,
+                            (long long)ch.emitted, (int)side_pending_[0],
+                            (int)side_pending_[1]);
+                }
+            }
             if (dbg) fprintf(stderr, "[hybrid-p] empty side=%d emitted_total=%lld\n", (int)s, (long long)emitted_total_);
             return false;
         }
