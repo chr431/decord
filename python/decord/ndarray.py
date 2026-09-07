@@ -51,7 +51,13 @@ def gpu(dev_id=0):
     return DECORDContext(2, dev_id)
 
 def hybrid_gpu(dev_id=0):
-    """Construct a GPU-resident hybrid decoding context.
+    """Construct a GPU-resident hybrid decoding context (EXPERIMENTAL).
+
+    .. warning::
+        **Experimental API.** The hybrid decoding pipeline is under active
+        development: scheduling behaviour, performance characteristics and
+        memory bounds may change between releases without notice.  For
+        production use prefer :func:`gpu` (NVDEC) or :func:`cpu`.
 
     Same chunk routing as :func:`hybrid`, but merged output frames stay
     in GPU memory (device_type 101): GPU chunks pass through with zero
@@ -64,7 +70,13 @@ def hybrid_gpu(dev_id=0):
 
 
 def hybrid(dev_id=0):
-    """Construct a hybrid CPU+GPU decoding context
+    """Construct a hybrid CPU+GPU decoding context (EXPERIMENTAL).
+
+    .. warning::
+        **Experimental API.** The hybrid decoding pipeline is under active
+        development: scheduling behaviour, performance characteristics and
+        memory bounds may change between releases without notice.  For
+        production use prefer :func:`gpu` (NVDEC) or :func:`cpu`.
 
     VideoReader(ctx=hybrid(dev)) decodes one demux stream split at keyframe
     chunk boundaries between the CPU software decoder and the NVDEC hardware

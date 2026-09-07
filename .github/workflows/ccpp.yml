@@ -43,12 +43,12 @@ jobs:
     - uses: actions/setup-python@v5
       with:
         python-version: '3.12'
-    - name: Download FFmpeg 8.1 (shared, BtbN)
+    - name: Download FFmpeg 9.0 (shared, BtbN)
       shell: pwsh
       run: |
-        curl -L -o ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip
+        curl -L -o ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip
         Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg
-        $ffdir = (Resolve-Path "ffmpeg/ffmpeg-n8.1-latest-win64-gpl-shared-8.1").Path
+        $ffdir = (Resolve-Path "ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0").Path
         echo "FFMPEG_DIR=$ffdir" >> $env:GITHUB_ENV
         echo "$ffdir/bin" >> $env:GITHUB_PATH
     - name: install test dependencies
@@ -60,7 +60,7 @@ jobs:
       run: |
         # loader resolves dependencies from the DLL's own directory first —
         # same layout as the release zip (decord.dll + FFmpeg DLLs together)
-        Copy-Item "ffmpeg/ffmpeg-n8.1-latest-win64-gpl-shared-8.1/bin/*.dll" `
+        Copy-Item "ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0/bin/*.dll" `
           -Destination "$env:pythonLocation\Lib\site-packages\decord\"
         Get-ChildItem "$env:pythonLocation\Lib\site-packages\decord" | Select-Object Name
     - name: unit tests

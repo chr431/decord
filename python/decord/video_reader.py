@@ -2,6 +2,7 @@
 from __future__ import absolute_import
 
 import ctypes
+import warnings
 import numpy as np
 
 from ._ffi.base import c_array, c_str
@@ -13,6 +14,9 @@ from .ndarray import cpu, gpu
 from .bridge import bridge_out
 
 VideoReaderHandle = ctypes.c_void_p
+
+# device_type >= 100: hybrid decoding contexts (see decord.ndarray.hybrid).
+_HYBRID_DEVICE_TYPE = 100
 
 
 class VideoReader(object):
@@ -64,6 +68,13 @@ class VideoReader(object):
             raise ValueError("output_format must be 'rgb', 'gray' or 'yuv420'")
         self._output_format = 1 if output_format == 'gray' else (2 if output_format == 'yuv420' else 0)
         assert isinstance(ctx, DECORDContext)
+        if ctx.device_type >= _HYBRID_DEVICE_TYPE:
+            warnings.warn(
+                "hybrid decoding contexts (decord.hybrid / decord.hybrid_gpu) "
+                "are EXPERIMENTAL: scheduling, performance and memory bounds "
+                "may change between releases without notice. Prefer "
+                "decord.gpu() (NVDEC) or decord.cpu() for production use.",
+                UserWarning, stacklevel=2)
         fault_tol = str(fault_tol)
         if hasattr(uri, 'read'):
             ba = bytearray(uri.read())

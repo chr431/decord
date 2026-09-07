@@ -277,6 +277,14 @@ print('numpy frames:', batch.asnumpy())
 
 ```
 
+### Hybrid decoding (EXPERIMENTAL)
+
+`decord.hybrid(ctx)` / `decord.hybrid_gpu(ctx)` split one demux stream at
+keyframe boundaries between the CPU software decoder and NVDEC. These
+contexts are **experimental**: scheduling, performance and memory bounds
+may change between releases without notice. Prefer `cpu()` / `gpu()` for
+production use.
+
 ### VideoLoader
 
 VideoLoader is designed for training deep learning models with tons of video files.

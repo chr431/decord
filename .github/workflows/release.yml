@@ -2,12 +2,12 @@
 #
 # 手动触发（Actions → Release → Run workflow），输入版本号即完成：
 #   1. 校验版本格式 + 确认 tag 不存在
-#   2. 安装 CUDA Toolkit + 下载 FFmpeg 8.1（BtbN shared build）
+#   2. 安装 CUDA Toolkit + 下载 FFmpeg 9.0（BtbN shared build）
 #   3. CMake GPU 构建 decord.dll（USE_CUDA=ON）
 #   4. 若 libinfo.py / pyproject.toml 版本 != 输入版本：两文件同步升版本 → commit → push 到目标分支
 #   5. 打 tag v<版本> 并 push
 #   6. 打包 zip（布局 = RaceVideoToLog 的 _decord_build/，解压即用）：
-#        decord.dll + FFmpeg 8.1 DLLs + ffprobe.exe + python/decord/
+#        decord.dll + FFmpeg 9.0 DLLs + ffprobe.exe + python/decord/
 #   7. 创建 GitHub Release（notes = 自上一 tag 的 commit 列表）+ 上传 zip
 #
 # 只监听 workflow_dispatch（push/tag 不会二次触发）。构建失败时不会产生
@@ -77,10 +77,10 @@ jobs:
           cuda: '13.3.1'
           method: 'network'
 
-      - name: Download FFmpeg 8.1 (shared)
+      - name: Download FFmpeg 9.0 (shared)
         shell: pwsh
         run: |
-          $ffmpegZip = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+          $ffmpegZip = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip"
           curl -L -o ffmpeg.zip $ffmpegZip
           Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg
           Get-ChildItem ffmpeg
@@ -90,7 +90,7 @@ jobs:
         run: |
           # CUDA 路径必须正斜杠（CMake 反斜杠转义坑，本地验证过）
           $cudaFwd = "$env:CUDA_PATH".Replace('\', '/')
-          $ffmpegDir = (Resolve-Path "ffmpeg/ffmpeg-n8.1-latest-win64-gpl-shared-8.1").Path
+          $ffmpegDir = (Resolve-Path "ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0").Path
           Write-Host "CUDA:   $cudaFwd"
           Write-Host "FFMPEG: $ffmpegDir"
           cmake -S . -B build -DUSE_CUDA="$cudaFwd" -DFFMPEG_DIR="$ffmpegDir" -DCMAKE_BUILD_TYPE=Release
@@ -164,7 +164,7 @@ jobs:
             $log = git log --oneline --no-merges -50
           }
           $sha = "$env:GITHUB_SHA".Substring(0, 7)
-          $body = "decord fork v${{ inputs.version }}（GPU NVDEC + CPU 解码，FFmpeg 8.1）`n`n" +
+          $body = "decord fork v${{ inputs.version }}（GPU NVDEC + CPU 解码，FFmpeg 9.0）`n`n" +
                   "构建源: ${{ inputs.ref }} @ $sha`n`n## Commits`n$log"
           [System.IO.File]::WriteAllText("notes.md", $body, (New-Object System.Text.UTF8Encoding($false)))
 
@@ -172,7 +172,7 @@ jobs:
         shell: pwsh
         run: |
           $ver = "${{ inputs.version }}"
-          $ffmpegBin = "ffmpeg/ffmpeg-n8.1-latest-win64-gpl-shared-8.1/bin"
+          $ffmpegBin = "ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0/bin"
           # 布局 = RaceVideoToLog 的 _decord_build/（setup_venv.bat 直接解压拷贝）
           $stage = "_decord_build"
           New-Item -ItemType Directory -Path "$stage/python" -Force | Out-Null
