@@ -32,6 +32,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/version.h>
 #include <libavutil/dict.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/display.h>
 #include <libavutil/file.h>
 #include <libswresample/swresample.h>

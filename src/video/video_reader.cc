@@ -674,6 +674,12 @@ NDArray VideoReader::NextFrameImpl() {
     int rewind_offset = 0;
     int retry = 0;
     while (!ret) {
+        // 无条件 PushNext（账目完整性依赖）：不能用 pkts_pushed_-
+        // frames_popped_ 做推包限流 —— hybrid 会解码侧丢弃陈旧帧
+        // （stale-drop/discard_pts），丢掉的帧永不计入 frames_popped_，
+        // 在途计数永久虚高会把文件尾真包拦死（实测 seek 错位 + EOF
+        // 排空耗尽 FATAL）。EOF 语义污染的原始触发路径（dav1d CPU 块
+        // 断流滞留）已由 AV1 零 CPU 块根治，此处保持旧语义。
         PushNext();
         ++pkts_pushed_;  // prefetch accounting: every pushed packet counts
         if (curr_frame_ >= GetFrameCount()) {

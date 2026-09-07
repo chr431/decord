@@ -573,18 +573,15 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
         if (forced == SIDE_GPU) return SIDE_GPU;
         if (forced == SIDE_CPU) return IsIdrLikeCodec() ? SIDE_CPU : SIDE_GPU;
     }
-    // AV1 固定路由：一律 GPU（零 CPU 块）。dav1d 的帧并行是异步任务
-    // 队列（send 不阻塞），任何 CPU 块的输入断流都会让块尾帧滞留
-    // 解码器内部 —— 等待经重试循环演变成 EOF 语义污染/内容错位
-    // （CPU 块尾实测 8-12 帧错位，时序相关高概率复现）。av1 混合
-    // 无益（dav1d ~520 << NVDEC ~1500），纯 GPU 零切换即最优且与
-    // 纯 gpu 路径同形态。
-    if (!IsIdrLikeCodec()) {
-        return SIDE_GPU;
-    }
-    // AV1 与 IDR 型走统一 water-filling：首包 GPU（见 Push），rc 由
-    // 首个 CPU chunk 采样、rg 由首包落地采样，两侧速率就绪后进入
-    // 弃用闸/份额均衡。重排流的安全网见 Pop 的 force-close。
+    // 设计决策（用户拍板，2026-09-07）：所有 codec 统一按实测速率比例
+    // 分配（water-filling），**不做慢侧自动回退** —— hybrid 是实验性
+    // 接口，用户已被告知可能更慢；内部尊重用户选择（decord.hybrid 显式
+    // 选它 = 明确要求 CPU+GPU 混跑），即使 hevc/av1 混跑实测劣于全 GPU
+    // （rc 是隔离产率，混跑时软解与消费/喂包线程抢核致有效供给缩水 +
+    // 块交替发射固有损耗；自动回退会让"选了 hybrid"静默变成"跑 gpu"，
+    // 实验语义失真）。后续优化方向是压低混跑损耗而非代用户跳过。
+    // （历史：AV1 曾因 dav1d CPU 块尾滞留 + kGpuAheadBytes 门锁死而走
+    // 零 CPU 块回避；两者均已移除/修复，AV1 恢复标准混跑路径。）
     // （GPU 待发射字节硬预算已移除）总在途由 demux prefetch 窗口 +
     // ready_ 预算 + 池深三重硬上限兜底。旧的 kGpuAheadBytes 预算把
     // "CPU 块实时发射期 GPU 存货正常偏斜"误判为调度失衡并强制切给
@@ -595,75 +592,45 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // 供给口径）：与 GPU 落地速率同口径可比。
     double rate[2] = {cpu_.ProductionRate(),
                       gpu_rate_landed_.load(std::memory_order_relaxed)};
-    // rc 未学得：仅 h264 给一个 CPU chunk 采样（其混跑有净收益，
-    // water-filling 需要 rc；该 chunk 与 chunk0 的 GPU 发射重叠，且
-    // GPU-first 下盲决策全落 GPU，采样安全）。hevc/av1 的 gate 判决
-    // 恒为全 GPU，无需 rc —— 盲给 CPU 反而把整条流钉死在软解速率
-    // （hevc GPU-first+盲CPU 实测 669fps）。其余兜底 GPU（NVDEC 平价）。
+    // rc 未学得：给一个 CPU chunk 采样（所有 codec —— water-filling 需要
+    // rc）。该 chunk 与 chunk0 的 GPU 发射重叠，且 GPU-first 下盲决策全落
+    // GPU，采样安全（旧版曾因水位门控屏蔽速率学习把整条流钉死 CPU）。
     if (rate[SIDE_CPU] <= 0) {
-        Side pick = codec_id_ == AV_CODEC_ID_H264 ? SIDE_CPU : SIDE_GPU;
         if (getenv("DECORD_HYBRID_DEBUG")) {
-            fprintf(stderr, "[hybrid-sched] key=%lld rc-unknown -> %d\n",
-                    (long long)key_pts, (int)pick);
+            fprintf(stderr, "[hybrid-sched] key=%lld rc-unknown -> CPU-sample\n",
+                    (long long)key_pts);
         }
-        return pick;
+        return SIDE_CPU;
     }
     if (rate[SIDE_GPU] <= 0) {
-        // rg 未学得（决策跑在解码前面）：h264 类（软解通常 ≥ NVDEC，
-        // 混跑收益大）交替试探 —— 盲阶段提前给 CPU 份额让 water-filling
-        // 从对称起点再平衡（否则粘性 + 单边 alloc 让混跑退化到全 GPU
-        // 节奏，h264 实测 1.0x）。注意盲阶段两路争核，hevc/h264 的 rc
-        // 都在 ~1124（数值不可分），故用 codec 先验而非速率阈值。
-        // hevc/av1（软解 < NVDEC）直接 GPU 承接（NVDEC 平价是安全默认）。
-        bool fast_soft_codec = codec_id_ == AV_CODEC_ID_H264;
-        Side pick = (fast_soft_codec
-                         && chunks_assigned_[SIDE_CPU] <= chunks_assigned_[SIDE_GPU])
-                        ? SIDE_CPU
-                        : SIDE_GPU;
+        // rg 未学得（决策跑在解码前面，NVDEC 落地慢一拍）：交替试探，
+        // 让两侧份额从对称起点再平衡（盲阶段单边灌满 alloc 会让
+        // water-filling 失去再平衡能力）。
+        Side pick = chunks_assigned_[SIDE_CPU] <= chunks_assigned_[SIDE_GPU]
+                        ? SIDE_CPU : SIDE_GPU;
         if (getenv("DECORD_HYBRID_DEBUG")) {
             fprintf(stderr, "[hybrid-sched] key=%lld rg-unknown rc=%.0f -> %d\n",
                     (long long)key_pts, rate[SIDE_CPU], (int)pick);
         }
         return pick;
     }
+    if (!sched_initialized_) {
+        // 首次双侧速率就绪：重置份额计数（盲决策阶段的单边分配不计入
+        // alloc 基数，否则 GPU 的巨额"存款"让后期混跑失去再平衡能力）。
+        sched_initialized_ = true;
+        alloc_frames_[0] = est_chunk_frames_;
+        alloc_frames_[1] = est_chunk_frames_;
+    }
     // 两侧并行生产、发射吃存货，稳态吞吐 ≈ r_cpu + r_gpu（块交替的
-    // 发射损耗见下方弃用闸与粘性的约束）。
-    // 慢侧弃用闸（v2，生产口径）：CPU 解码能力不足 GPU 的 0.6 倍时，
-    // CPU 份额的边际贡献低于块交替发射的固有损耗（CPU 块实时跟随期
-    // 挡住 GPU 存货发射 + 速率学习波动），整体劣化且方差大 —— av1
-    // （dav1d ~520 vs NVDEC 1600）与 hevc（NV12 后 rc~1300 vs rg~1860，
-    // 比值 0.70）混跑实测均劣于全 GPU（hevc 1280 vs 1845：rc 是隔离
-    // 产率，混跑时软解线程与消费/喂包线程抢核，有效供给远低于隔离值，
-    // 且发射交替有固有损耗）。h264（1.3x）互补保留（混合稳定 1.3x+）。
-    // v1 闸（2026-09 移除）因发射口径虚高误伤 h264 —— 本闸用 filter
-    // 后产出速率（NV12 直出），量纲正确。阈值为 1.0（rc ≥ rg 才混）：
-    // rc 是隔离产率，混跑时软解与消费/喂包抢核导致有效供给缩水，
-    // 实测比值 0.7-0.8 的混跑在 1258-1779 间抛硬币。阈值 0.75：hevc
-    // （NV12 后 0.70）稳定走全 GPU，h264（1.3+）保留混跑。
-    if (getenv("DECORD_HYBRID_DEBUG")) {
-        fprintf(stderr, "[hybrid-sched] key=%lld rc=%.0f rg=%.0f gate-check %.2f\n",
-                (long long)key_pts, rate[SIDE_CPU], rate[SIDE_GPU],
-                rate[SIDE_CPU] / std::max(rate[SIDE_GPU], 1.0));
-    }
-    if (rate[SIDE_CPU] < 0.8 * rate[SIDE_GPU]) {
-        return SIDE_GPU;
-    }
+    // 发射损耗见粘性约束；不做慢侧自动回退，见函数头设计决策）。
+    // （慢侧弃用闸已按用户决策移除：曾实测 hevc/av1 混跑劣于全 GPU 而
+    // 自动改道 —— 但这让 hybrid 静默退化为 gpu，实验语义失真。）
     // 份额均衡（water-filling 计数器）：目标份额 ∝ 实测速率，按"实际分配
     // 帧数与理想份额的差"决策。deficit 精确、无 tie 陷阱 —— min-max 在
     // 积压钳制成对称后两侧 work 恒等、t 恒 tie，tie->CPU 使 f_c 漂移到 1
     //（test6 全量实测 6000 帧后断崖跌到 529fps、CPU 独占、GPU 闲置）。
     // 积压安全由 GPU 字节预算 + 池耗尽背压独立兜底。
     const double est = static_cast<double>(est_chunk_frames_);
-    if (!sched_initialized_) {
-        // 首次双侧速率就绪：重置份额计数。盲决策阶段（速率未学得）
-        // 的分配全部落 GPU，若计入 water-filling 的 alloc 基数，GPU 的
-        // 巨额"存款"会让后期混跑失去再平衡能力（h264 实测 alloc
-        // 549/3204、CPU 只拿到 14% 份额，混跑退化到 1.0x）。重置后
-        // 份额从对称起点按实测速率分配。
-        sched_initialized_ = true;
-        alloc_frames_[0] = est_chunk_frames_;
-        alloc_frames_[1] = est_chunk_frames_;
-    }
     if (getenv("DECORD_HYBRID_DEBUG")) {
         fprintf(stderr, "[hybrid-sched] key=%lld rc=%.0f rg=%.0f alloc=%lld/%lld sticky=%lld\n",
                 (long long)key_pts, rate[SIDE_CPU], rate[SIDE_GPU],

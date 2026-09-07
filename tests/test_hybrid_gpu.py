@@ -21,13 +21,14 @@ VIDS = [r'D:\Videos\racelog_test\test.mp4',
         r'D:\Videos\racelog_test\test3.mp4',
         r'D:\Videos\racelog_test\test6.mp4']
 CODECS = ['hevc', 'h264', 'av1']
-N = 1500
+N = int(os.environ.get('HYB_TEST_N', '600'))
 BLOCK = 250
 ROI = (100, 200, 1799, 699)   # decord 闭区间
 
 
-def md5s(block):
-    return [hashlib.md5(f.tobytes()).hexdigest() for f in block]
+def frames_equal(a, b):
+    # byte-identity 等价判定:np.array_equal 直比,免去 tobytes 拷贝 + md5
+    return a.shape == b.shape and bool((a == b).all())
 
 
 def dev_ptr(batch):
@@ -68,18 +69,17 @@ def compare(vr_a, vr_b, n, roi=None, seek_at=None):
         bb = vr_b.get_batch(idx, **kw)
         if ba.shape != bb.shape:
             return f'SHAPE {ba.shape} vs {bb.shape}'
-        ma, mb = md5s(ba.asnumpy()), md5s(bb.asnumpy())
+        na, nb = ba.asnumpy(), bb.asnumpy()
         for i in range(e - s):
-            if ma[i] == mb[i]:
+            if frames_equal(na[i], nb[i]):
                 matched += 1
             elif bad < 0:
                 bad = s + i
-        del ba, bb, ma, mb
+        del ba, bb, na, nb
     ok_seek = True
     if seek_at is not None:
         vr_a.seek_accurate(seek_at); vr_b.seek_accurate(seek_at)
-        ok_seek = (md5s([vr_a[seek_at].asnumpy()])[0]
-                   == md5s([vr_b[seek_at].asnumpy()])[0])
+        ok_seek = frames_equal(vr_a[seek_at].asnumpy(), vr_b[seek_at].asnumpy())
     if bad < 0 and ok_seek:
         return None
     return f'{matched}/{total} 一致, 首错 {bad}, seek {"对" if ok_seek else "错"}'

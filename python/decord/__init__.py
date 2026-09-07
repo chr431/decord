@@ -15,5 +15,13 @@ from .video_reader import VideoReader
 from .video_loader import VideoLoader
 from .audio_reader import AudioReader
 from .av_reader import AVReader
+from .video_reader import probe, get_ffmpeg_version
+
+# 实际加载的 FFmpeg 版本（见 get_ffmpeg_version 文档）。'unknown' = 原生库
+# 早于该 API，或进程内 FFmpeg DLL 撞车且无法报告 —— 部署校验用它。
+try:
+    __ffmpeg_version__ = get_ffmpeg_version()
+except Exception:  # pragma: no cover - FFI 层异常一律降级
+    __ffmpeg_version__ = 'unknown'
 
 logging.set_level(logging.ERROR)

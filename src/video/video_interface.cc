@@ -15,6 +15,9 @@
 #include <dlpack/dlpack.h>
 #include <dmlc/logging.h>
 
+#include "ffmpeg/ffmpeg_common.h"
+#include <libavutil/avutil.h>  // av_version_info
+
 namespace decord {
 
 VideoReaderPtr GetVideoReader(std::string fn, DLDevice ctx, int width, int height, int nb_thread,
@@ -260,6 +263,71 @@ DECORD_REGISTER_GLOBAL("video_loader._CAPI_VideoLoaderFree")
     VideoLoaderInterfaceHandle handle = args[0];
     auto p = static_cast<VideoLoaderInterface*>(handle);
     if (p) delete p;
+  });
+
+// 加载中的 decord DLL 实际链接的 FFmpeg 版本（av_version_info，构建级描述
+// 串，如 "n9.0-latest"）。用途：Windows 上同名 FFmpeg DLL 先到先得，
+// decord 可能加载到宿主进程里别的 FFmpeg —— 版本串不符即碰撞信号
+// （借鉴 Nelux 的 __ffmpeg_version__ 语义；无法返回时报 'unknown'）。
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_GetFFmpegVersion")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    const char *info = av_version_info();
+    *rv = std::string(info ? info : "unknown");
+  });
+
+// 免解码元数据探测（ffprobe 最小集）：只 avformat_open_input +
+// find_stream_info，不开解码器、不分配帧缓冲、不跑索引全扫描。
+// 返回 JSON 字符串（Python 侧 json.loads 成 dict）。
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_ProbeVideoInfo")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    std::string fn = args[0];
+    AVFormatContext *fmt = nullptr;
+    int ret = avformat_open_input(&fmt, fn.c_str(), nullptr, nullptr);
+    CHECK_GE(ret, 0) << "probe: avformat_open_input failed for " << fn;
+    CHECK_GE(avformat_find_stream_info(fmt, nullptr), 0)
+        << "probe: avformat_find_stream_info failed for " << fn;
+    int video_idx = -1, audio_cnt = 0, sub_cnt = 0;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        auto *st = fmt->streams[i];
+        if (!st) continue;
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && video_idx < 0)
+            video_idx = static_cast<int>(i);
+        else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) ++audio_cnt;
+        else if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) ++sub_cnt;
+    }
+    char buf[1024];
+    double duration_s = fmt->duration > 0
+        ? fmt->duration / static_cast<double>(AV_TIME_BASE) : -1.0;
+    std::string json;
+    if (video_idx >= 0) {
+        auto *st = fmt->streams[video_idx];
+        auto *par = st->codecpar;
+        AVRational fr = av_guess_frame_rate(fmt, st, nullptr);
+        double fps = fr.den > 0 ? static_cast<double>(fr.num) / fr.den : -1.0;
+        const char *pix = av_get_pix_fmt_name(static_cast<AVPixelFormat>(par->format));
+        const char *codec = avcodec_get_name(par->codec_id);
+        std::snprintf(buf, sizeof(buf),
+            "{\"duration_s\": %.3f, \"bit_rate\": %lld, \"nb_frames\": %lld, "
+            "\"video_codec\": \"%s\", \"width\": %d, \"height\": %d, "
+            "\"pix_fmt\": \"%s\", \"avg_fps\": %.4f, "
+            "\"audio_streams\": %d, \"subtitle_streams\": %d}",
+            duration_s,
+            fmt->bit_rate > 0 ? static_cast<long long>(fmt->bit_rate) : -1LL,
+            st->nb_frames > 0 ? static_cast<long long>(st->nb_frames) : -1LL,
+            codec ? codec : "unknown", par->width, par->height,
+            pix ? pix : "unknown", fps, audio_cnt, sub_cnt);
+        json = buf;
+    } else {
+        std::snprintf(buf, sizeof(buf),
+            "{\"duration_s\": %.3f, \"bit_rate\": %lld, \"nb_frames\": -1, "
+            "\"video_codec\": null, \"audio_streams\": %d, \"subtitle_streams\": %d}",
+            duration_s,
+            fmt->bit_rate > 0 ? static_cast<long long>(fmt->bit_rate) : -1LL,
+            audio_cnt, sub_cnt);
+        json = buf;
+    }
+    avformat_close_input(&fmt);
+    *rv = json;
   });
 }  // namespace runtime
 }  // namespace decord

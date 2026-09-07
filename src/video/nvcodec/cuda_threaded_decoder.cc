@@ -179,6 +179,7 @@ void CUThreadedDecoder::Start() {
     }
     // Push() uses cuCtxSetCurrent (no stack); the main-thread current setting
     // does not affect the decode thread (current is thread-local), no pop needed.
+    CreateEventRing();
     run_.store(true);
     // launch worker threads
     auto launcher_t = std::thread{&CUThreadedDecoder::LaunchThread, this};
@@ -199,6 +200,8 @@ void CUThreadedDecoder::Stop() {
     if (launcher_t_.joinable()) {
         launcher_t_.join();
     }
+    // parser 线程已停，无并发 record —— 事件环可安全销毁（下次 Start 重建）
+    DestroyEventRing();
 }
 
 void CUThreadedDecoder::Clear() {
@@ -278,7 +281,62 @@ void CUThreadedDecoder::FlushDeferred() {
         }
         deferred_frame_.reset();
     }
-    tail_unsynced_.store(false);
+}
+
+// 事件环：预建 cudaEventDisableTiming 事件，display 回调轮转 record。
+// 容量 64 >> 在途上限（reorder 深度由 surface 数 + drain marker 决定，
+// ~25），RecordFrameEvent 的 CHECK 保证永不复用到仍待消费的槽位。
+void CUThreadedDecoder::CreateEventRing() {
+    if (!ev_ring_.empty()) return;
+    ev_ring_.resize(64, nullptr);
+    for (auto &ev : ev_ring_) {
+        if (!CHECK_CUDA_CALL(cudaEventCreateWithFlags(
+                reinterpret_cast<cudaEvent_t *>(&ev), cudaEventDisableTiming))) {
+            ev = nullptr;
+        }
+    }
+    ev_ring_next_ = 0;
+}
+
+void CUThreadedDecoder::DestroyEventRing() {
+    {
+        std::lock_guard<std::mutex> lk(ev_mtx_);
+        frame_events_.clear();
+    }
+    for (auto &ev : ev_ring_) {
+        if (ev != nullptr) {
+            cudaEventDestroy(reinterpret_cast<cudaEvent_t>(ev));
+            ev = nullptr;
+        }
+    }
+    ev_ring_.clear();
+    ev_ring_next_ = 0;
+}
+
+void CUThreadedDecoder::RecordFrameEvent() {
+    cudaEvent_t ev = nullptr;
+    if (!ev_ring_.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(ev_mtx_);
+            CHECK_LT(frame_events_.size(), ev_ring_.size())
+                << "frame event ring exhausted: consumer stalled too long";
+        }
+        ev = reinterpret_cast<cudaEvent_t>(ev_ring_[ev_ring_next_ % ev_ring_.size()]);
+        ++ev_ring_next_;
+        cudaEventRecord(ev, stream_);
+    }
+    {
+        std::lock_guard<std::mutex> lk(ev_mtx_);
+        frame_events_.push_back(ev);
+    }
+}
+
+cudaEvent_t CUThreadedDecoder::PopFrameEvent() {
+    std::lock_guard<std::mutex> lk(ev_mtx_);
+    if (frame_events_.empty()) return nullptr;
+    cudaEvent_t ev = reinterpret_cast<cudaEvent_t>(frame_events_.front());
+    frame_events_.pop_front();
+    return ev;
 }
 
 int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
@@ -306,7 +364,9 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
       skip = discard_pts_.find(disp_info->timestamp) != discard_pts_.end();
     }
     if (skip) {
-        // skip frame processing
+        // skip frame processing（无转换 kernel 入队，事件即刻满足——
+        // 仅保持与 reorder 出队序 1:1）
+        RecordFrameEvent();
         reorder_queue_->Push(arr);
         if (on_output_) on_output_();
         return 1;
@@ -339,13 +399,13 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
                      output_format_, color_range_);
     }
     // No per-frame sync anymore: the tail sync moves to consumer-side Pop
-    // (tail_unsynced_) and the unmap moves to the next display callback
+    // (per-frame event) and the unmap moves to the next display callback
     // (FlushDeferred). The parser thread returns immediately and keeps
     // submitting packets; NVDEC decode and conversion kernels pipeline
     // back-to-back on stream_.
     deferred_frame_.reset(new CUMappedFrame(std::move(frame)));
     deferred_valid_.store(true);
-    tail_unsynced_.store(true);
+    RecordFrameEvent();
     reorder_queue_->Push(arr);
     if (on_output_) on_output_();
     return 1;
@@ -402,16 +462,18 @@ bool CUThreadedDecoder::Pop(NDArray *frame) {
     CheckErrorStatus();
     if (!ret) return false;
     --frame_count_;
-    // Sync EVERY popped frame.  The old single tail_unsynced_ flag had a
-    // clear-on-the-wrong-frame race: display callback for frame k sets
-    // the flag, pop of frame k-1 exchanges it away, then pop of frame k
-    // skips the sync and the consumer can read a half-written conversion
-    // kernel output (observed as rare nondeterministic frame corruption
-    // right after a hybrid GPU chunk boundary).  The sync is cheap when
-    // the stream is idle and correctness beats the microsecond saved.
-    tail_unsynced_.store(false);
-    if (!CHECK_CUDA_CALL(cudaStreamSynchronize(stream_))) {
-        LOG(FATAL) << "Error synchronize cuda stream";
+    // Wait for THIS frame's conversion event (per-frame event ring).  The
+    // old per-pop full-stream cudaStreamSynchronize had a real correctness
+    // reason (the single tail_unsynced_ flag raced clear-on-the-wrong-frame
+    // and consumers read half-written kernels — observed as rare frame
+    // corruption after hybrid GPU chunk boundaries) but it also waited for
+    // conversions of NOT-YET-CONSUMED later frames, serialising the
+    // consumer against the producer's whole decode-ahead.  Waiting the
+    // popped frame's own event keeps the exact guarantee (pixels complete
+    // before read) without the over-wait.
+    cudaEvent_t ev = PopFrameEvent();
+    if (ev && !CHECK_CUDA_CALL(cudaEventSynchronize(ev))) {
+        LOG(FATAL) << "Error synchronize frame event";
         return 0;
     }
     return true;
@@ -497,6 +559,8 @@ void CUThreadedDecoder::LaunchThreadImpl() {
             // same way the CPU decoder does, so NextFrameImpl can fall back
             // to cached frames / rewind recovery instead of spinning.
             for (int i = 0; i < ThreadedDecoderInterface::kDrainMarkerCount; ++i) {
+                // marker 无需等待：配对空事件保持与 reorder 出队序 1:1
+                { std::lock_guard<std::mutex> lk(ev_mtx_); frame_events_.push_back(nullptr); }
                 reorder_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
             }
             if (on_output_) on_output_();

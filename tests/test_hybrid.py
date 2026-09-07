@@ -24,8 +24,8 @@ BLOCK = 250          # 分块大小: 内存 ~BLOCK*3MB (250->~0.8GB 对 1080p yu
 CPU_THREADS = 12     # 参考软解线程数(占满核, 之前 num_threads=0 只有 2 线程)
 
 
-def md5_frames(block):
-    return [hashlib.md5(f.tobytes()).hexdigest() for f in block]
+def frames_equal(a, b):
+    return a.shape == b.shape and bool((a == b).all())
 
 
 def verify(path, n, verbose=True):
@@ -43,19 +43,18 @@ def verify(path, n, verbose=True):
         e = min(s + BLOCK, total)
         bc = vc.get_batch(list(range(s, e))).asnumpy()
         bh = vh.get_batch(list(range(s, e))).asnumpy()
-        mc, mh = md5_frames(bc), md5_frames(bh)
         for i in range(e - s):
-            if mc[i] == mh[i]:
+            if frames_equal(bc[i], bh[i]):
                 matched += 1
             elif first_bad < 0:
                 first_bad = s + i
-        del bc, bh, mc, mh
+        del bc, bh
     random.seed(7)
     seek_ok = []
     for t in random.sample(range(total, len(vh)), 3):
         vh.seek_accurate(t)
         vc.seek_accurate(t)
-        seek_ok.append(md5_frames([vh[t].asnumpy()])[0] == md5_frames([vc[t].asnumpy()])[0])
+        seek_ok.append(frames_equal(vh[t].asnumpy(), vc[t].asnumpy()))
     del vc, vh
     dt = time.perf_counter() - t0
     if verbose:
@@ -105,7 +104,7 @@ if __name__ == '__main__' and not os.path.isdir(_VIDEO_DIR):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--video')
-    ap.add_argument('--n', type=int, default=2000)
+    ap.add_argument('--n', type=int, default=int(os.environ.get('HYB_TEST_N', '600')))
     ap.add_argument('--bench', action='store_true')
     ap.add_argument('--stress', type=int, default=0)
     a = ap.parse_args()

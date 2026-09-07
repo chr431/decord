@@ -21,6 +21,8 @@
 #include <thread>
 #include <mutex>
 #include <memory>
+#include <deque>
+#include <vector>
 
 #include <decord/runtime/ndarray.h>
 #include <dmlc/concurrency.h>
@@ -136,7 +138,20 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         // all CUDA calls remain on the parser thread.
         std::unique_ptr<CUMappedFrame> deferred_frame_;
         std::atomic<bool> deferred_valid_{false};
-        std::atomic<bool> tail_unsynced_{false};
+        /*! \brief 每帧转换完成事件环：display 回调在转换 kernel 入队后
+         *  record，Pop 按出队序等待"自己这一帧"的事件 —— 替代旧的全流
+         *  cudaStreamSynchronize（它会连尚未消费的后续帧转换一起等，
+         *  消费者被生产超前深度串行化）。事件序 = reorder 出队序，与
+         *  reorder_queue_ 严格 1:1（drain marker 对应空事件）。 */
+        std::mutex ev_mtx_;
+        std::deque<void *> frame_events_;   // cudaEvent_t，nullptr = 无需等待
+        std::vector<void *> ev_ring_;       // 预建事件池（Start 创建，Stop 销毁）
+        size_t ev_ring_next_ = 0;           // 仅 parser 线程推进
+        /*! \brief 事件环管理 + 每帧事件 record/wait（见成员注释） */
+        void CreateEventRing();
+        void DestroyEventRing();
+        void RecordFrameEvent();
+        cudaEvent_t PopFrameEvent();
         std::mutex pkt_room_mutex_;
         std::function<void()> on_output_;
         std::condition_variable pkt_room_cv_;

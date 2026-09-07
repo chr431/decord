@@ -477,4 +477,43 @@ class VideoReader(object):
         assert num > 0
         _CAPI_VideoReaderSkipFrames(self._handle, num)
 
+def get_ffmpeg_version():
+    """Return the FFmpeg version string of the loaded decord native library.
+
+    Reports what ``av_version_info()`` says inside the loaded DLL — on
+    Windows the first FFmpeg DLL of a given soname loaded into the process
+    serves every consumer, so an unexpected value (or ``'unknown'``) means
+    another library won the load and decord is *not* running the FFmpeg it
+    was built with.
+    """
+    try:
+        return _CAPI_GetFFmpegVersion()
+    except AttributeError:
+        return 'unknown'  # native library predates this API
+
+
+def probe(uri):
+    """Return container/stream metadata without opening a decoder.
+
+    Equivalent to a minimal ``ffprobe``: opens the container, reads stream
+    headers, closes.  No decoder is created, no frame buffers allocated, no
+    full-file index scan performed — cost is O(find_stream_info), typically
+    milliseconds.
+
+    Parameters
+    ----------
+    uri : str
+        Path of video/audio file (bytes-like objects are not supported).
+
+    Returns
+    -------
+    info : dict
+        Keys: ``duration_s``, ``bit_rate``, ``nb_frames`` (container value,
+        ``-1`` when absent), ``video_codec``, ``width``, ``height``,
+        ``pix_fmt``, ``avg_fps``, ``audio_streams``, ``subtitle_streams``.
+        Video keys are ``None`` when the file has no video stream.
+    """
+    import json
+    return json.loads(_CAPI_ProbeVideoInfo(str(uri)))
+
 _init_api("decord.video_reader")

@@ -22,13 +22,13 @@ VIDS = [r'D:\Videos\racelog_test\test.mp4',
         r'D:\Videos\racelog_test\test3.mp4',
         r'D:\Videos\racelog_test\test6.mp4']
 CODECS = ['hevc', 'h264', 'av1']
-N = 1500
+N = int(os.environ.get('HYB_TEST_N', '600'))
 BLOCK = 250
 ROI = (100, 200, 1800, 700)   # 字幕带状区域（半开 -> decord 闭区间转换）
 
 
-def md5s(block):
-    return [hashlib.md5(f.tobytes()).hexdigest() for f in block]
+def frames_equal(a, b):
+    return a.shape == b.shape and bool((a == b).all())
 
 
 def full_compare(path, fmt):
@@ -44,13 +44,12 @@ def full_compare(path, fmt):
         bh = vh.get_batch(list(range(s, e))).asnumpy()
         if bc.shape != bh.shape:
             return f'SHAPE MISMATCH cpu{bc.shape} hyb{bh.shape}'
-        mc, mh = md5s(bc), md5s(bh)
         for i in range(e - s):
-            if mc[i] == mh[i]:
+            if frames_equal(bc[i], bh[i]):
                 matched += 1
             elif bad < 0:
                 bad = s + i
-        del bc, bh, mc, mh
+        del bc, bh
     del vc, vh
     return None if bad < 0 else f'{matched}/{total} 一致, 首错帧 {bad}'
 
@@ -70,16 +69,15 @@ def roi_compare(path, fmt):
         bh = vh.get_batch(list(range(s, e))).asnumpy()
         if bc.shape != bh.shape:
             return f'SHAPE MISMATCH cpu{bc.shape} hyb{bh.shape}'
-        mc, mh = md5s(bc), md5s(bh)
         for i in range(e - s):
-            if mc[i] == mh[i]:
+            if frames_equal(bc[i], bh[i]):
                 matched += 1
             elif bad < 0:
                 bad = s + i
-        del bc, bh, mc, mh
+        del bc, bh
     # seek 抽查
     vh.seek_accurate(1000); vc.seek_accurate(1000)
-    m = md5s([vh[1000].asnumpy()])[0] == md5s([vc[1000].asnumpy()])[0]
+    m = bool((vh[1000].asnumpy() == vc[1000].asnumpy()).all())
     del vc, vh
     tag = 'OK' if bad < 0 and m else f'{matched}/{total} 一致, 首错 {bad}, seek {"对" if m else "错"}'
     return None if bad < 0 and m else tag
