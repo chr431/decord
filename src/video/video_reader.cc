@@ -503,8 +503,12 @@ int64_t VideoReader::LocateKeyframe(int64_t pos) {
 bool VideoReader::SeekAccurate(int64_t pos) {
     if (!fmt_ctx_) return false;
     if (curr_frame_ == pos) return true;
+    static const bool s_dbg = getenv("DECORD_SEEK_DEBUG") != nullptr;
     int64_t key_pos = LocateKeyframe(pos);
     int64_t curr_key_pos = LocateKeyframe(curr_frame_);
+    if (s_dbg) fprintf(stderr, "[seek-dbg] pos=%lld key_pos=%lld curr=%lld curr_key=%lld\n",
+                       (long long)pos, (long long)key_pos,
+                       (long long)curr_frame_, (long long)curr_key_pos);
     overrun_ = false;
     if (key_pos != curr_key_pos || pos < curr_frame_) {
         // need to seek to keyframes first.
@@ -516,15 +520,21 @@ bool VideoReader::SeekAccurate(int64_t pos) {
         // +267 frames off.  Backward lands at-or-before, so the anchor is
         // the target keyframe and the forward skip is exact.
         bool ret = Seek(key_pos, /*force_backward=*/true);
+        if (s_dbg) fprintf(stderr, "[seek-dbg] Seek(%lld) -> %d curr=%lld\n",
+                           (long long)key_pos, (int)ret, (long long)curr_frame_);
         if (!ret) return false;
         // double check if keyframe was jumpped correctly
         if(CheckKeyFrame()){
+            if (s_dbg) fprintf(stderr, "[seek-dbg] CheckKeyFrame OK, SkipFramesImpl(%lld)\n",
+                               (long long)(pos - curr_frame_));
             if(pos - key_pos > 0){
                 SkipFramesImpl(pos - curr_frame_);
             } else if(pos - key_pos == 0){
                 overrun_ = true;
             }
         } else {
+            if (s_dbg) fprintf(stderr, "[seek-dbg] CheckKeyFrame FAIL, curr=%lld Skip(%lld)\n",
+                               (long long)curr_frame_, (long long)(pos - curr_frame_));
             if(curr_frame_ < pos){
                 SkipFramesImpl(pos - curr_frame_);
             } else {
@@ -536,25 +546,41 @@ bool VideoReader::SeekAccurate(int64_t pos) {
         }
     } else {
         // no need to seek to keyframe, since both current and seek position belong to same keyframe
+        if (s_dbg) fprintf(stderr, "[seek-dbg] same-GOP Skip(%lld)\n", (long long)(pos - curr_frame_));
         SkipFramesImpl(pos - curr_frame_);
     }
 
-    // ── Landing verification (frame-counted correction) ──
-    // Decode one frame at the claimed position and match its PTS against
-    // the index (tolerance +-2 time-base ticks: best-effort PTS rounding).
-    // CheckKeyFrame can wrongly accept a mis-landed keyframe when the
-    // decoded PTS misses pts_frame_map_, leaving the forward skip anchored
-    // at the wrong keyframe; this corrects the residual in one exact
-    // frame-counted skip (or re-emits the verified frame for NextFrame).
+    // ── Landing verification (pts-anchored, self-healing) ──
+    // 单发校验可被多种失败路径绕过（CheckKeyFrame 的剧烈副作用、计数
+    // 跳过欠冲）：hybrid ctx 对 test.mp4 seek_accurate(2117) 曾以 ~60%
+    // 概率返回关键帧+25 处的帧（1831）。改为有界自愈循环：逐帧解码并
+    // 把 pts 对回索引 ——
+    //   命中 pos   → 交付该帧（overrun 机制还给 NextFrame，防 off-by-one）
+    //   落点 < pos → 欠冲，继续向前逐帧
+    //   落点 > pos → 过冲，回退目标关键帧重新逼近
+    //   pts 查不到 → 继续向前（VFR 抖动会自然收敛）
+    // 上界 2048 次 Pop（≈ 2 个常见 GOP）防 EOF 死循环。
     {
         decoder_->Start();
         NDArray vf;
-        bool got = false;
-        while (!got && !eof_) {
+        int reanchors = 0;
+        for (int guard = 0; guard < 4096; ++guard) {
             PushNext();
-            got = decoder_->Pop(&vf);
-        }
-        if (got && vf.pts >= 0 && vf.Size() > 1) {
+            bool got = decoder_->Pop(&vf);
+            if (!got) {
+                if (eof_ && decoder_->Drained()) {
+                    // demux 真耗尽而目标未命中：重锚定到目标关键帧重新
+                    // 逼近（CheckKeyFrame 的通配 demux 会把 eof_ 带进来，
+                    // 陈旧 eof_ 不应让着陆校验失效）。重锚超限放弃。
+                    if (++reanchors > 3) break;
+                    key_pos = LocateKeyframe(pos);
+                    Seek(key_pos, /*force_backward=*/true);
+                    continue;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            if (vf.pts < 0 || vf.Size() <= 1) continue;  // marker/跳过帧
             auto lo = pts_frame_map_.lower_bound(vf.pts - 2);
             auto hi = pts_frame_map_.upper_bound(vf.pts + 2);
             int64_t best_idx = -1;
@@ -567,34 +593,27 @@ bool VideoReader::SeekAccurate(int64_t pos) {
                     best_idx = it->second;
                 }
             }
-            if (best_idx >= 0 && best_idx != pos) {
-                if (best_idx < pos) {
-                    // stream is one past the popped (wrong) frame: reset
-                    // bookkeeping to the actual position, then count the
-                    // residual skip exactly (clamp uses curr_frame_).
-                    curr_frame_ = best_idx + 1;
-                    SkipFramesImpl(pos - curr_frame_);
-                } else {
-                    // overshoot (backward-flagged seek should prevent it):
-                    // rewind to the keyframe and re-skip; drop any stale
-                    // cached frame so NextFrame does not return it twice
-                    key_pos = LocateKeyframe(pos);
-                    Seek(key_pos, /*force_backward=*/true);
-                    SkipFramesImpl(pos - key_pos);
-                    overrun_ = false;
-                }
-            } else {
-                // best_idx == pos (verified target) or lookup inconclusive
-                // (PTS jitter beyond +-2 ticks): hand the popped frame back
-                // to NextFrame either way — the verify must never consume
-                // a frame without returning it (off-by-one).  Advance the
-                // bookkeeping past the cached frame so a following
-                // sequential access (get_batch) short-circuits without a
-                // re-seek.
+            if (best_idx == pos) {
+                // verified: hand the frame back to NextFrame (off-by-one
+                // guard) — the verify must never consume a frame without
+                // returning it.
                 overrun_ = true;
                 tmp_key_frame_ = vf;
                 curr_frame_ = pos + 1;
+                break;
             }
+            if (best_idx > pos) {
+                // overshoot: rewind to the target keyframe and re-approach
+                key_pos = LocateKeyframe(pos);
+                Seek(key_pos, /*force_backward=*/true);
+                continue;
+            }
+            if (best_idx >= 0) {
+                // undershoot: stream is one past best_idx; bookkeeping
+                // follows so the next pop is best_idx+1's frame.
+                curr_frame_ = best_idx + 1;
+            }
+            // inconclusive（pts 不在索引 ±2 内）：继续向前，VFR 抖动自然收敛
         }
     }
     return true;
@@ -1411,6 +1430,9 @@ void VideoReader::SkipFramesImpl(int64_t num)
     decoder_->Start();
     bool ret = false;
     const int64_t initial_num = num;
+    static const bool s_dbg = getenv("DECORD_SEEK_DEBUG") != nullptr;
+    if (s_dbg) fprintf(stderr, "[skip-dbg] entry curr=%lld num=%lld\n",
+                       (long long)curr_frame_, (long long)num);
     while (num > 0) {
         PushNext();
         ret = decoder_->Pop(&frame);
@@ -1442,6 +1464,9 @@ void VideoReader::SkipFramesImpl(int64_t num)
         // LOG(INFO) << "skip: " << num;
         --num;
     }
+    if (s_dbg) fprintf(stderr, "[skip-dbg] exit curr=%lld skipped=%lld\n",
+                       (long long)curr_frame_,
+                       (long long)(initial_num - num));
 }
 
 NDArray VideoReader::GetBatch(std::vector<int64_t> indices, NDArray buf,
