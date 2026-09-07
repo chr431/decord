@@ -87,6 +87,9 @@ def bench(path, n):
 
 def stress(rounds):
     """多 reader 交替开关压力: 验证显存/内存无泄漏式增长(配合 nvidia-smi)."""
+_VIDEO_DIR = 'D:/Videos/racelog_test'
+if __name__ == '__main__' and not os.path.isdir(_VIDEO_DIR):
+    sys.exit('skip: test videos not available on this machine: ' + _VIDEO_DIR)
     vids = [r'D:\Videos\racelog_test\test.mp4',
             r'D:\Videos\racelog_test\test3.mp4',
             r'D:\Videos\racelog_test\test6.mp4']

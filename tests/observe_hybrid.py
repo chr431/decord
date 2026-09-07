@@ -10,6 +10,10 @@ import sys
 import threading
 import time
 
+_VIDEO_DIR = 'D:/Videos/racelog_test'
+if __name__ == '__main__' and not os.path.isdir(_VIDEO_DIR):
+    sys.exit('skip: test videos not available on this machine: ' + _VIDEO_DIR)
+
 os.environ.setdefault('DECORD_LIBRARY_PATH',
                       r'D:/Repo/decord/build-cuda13/Release')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))

@@ -14,6 +14,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 from decord import VideoReader, gpu, hybrid_gpu  # noqa: E402
 
+_VIDEO_DIR = 'D:/Videos/racelog_test'
+if __name__ == '__main__' and not os.path.isdir(_VIDEO_DIR):
+    sys.exit('skip: test videos not available on this machine: ' + _VIDEO_DIR)
 VIDS = [r'D:\Videos\racelog_test\test.mp4',
         r'D:\Videos\racelog_test\test3.mp4',
         r'D:\Videos\racelog_test\test6.mp4']
