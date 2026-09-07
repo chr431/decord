@@ -16,6 +16,9 @@
 #include <thread>
 #include <unordered_set>
 #include <mutex>
+#include <map>
+#include <atomic>
+#include <vector>
 
 #include <dmlc/concurrency.h>
 
@@ -36,12 +39,13 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         AVFramePtr frame;
         RawKind kind;
         int64_t pts;
+        uint64_t seq;   // 解码序（转换扇出池乱序完成 → 按序发射）
         // explicit ctors: NSDMI + brace-init would make this a non-aggregate
         // under C++11 (aggregate NSDMI needs C++14); MSVC accepts it as an
         // extension but GCC/clang reject RawItem{...} — keep C++11 portable.
-        RawItem() : frame(nullptr), kind(RawKind::Frame), pts(0) {}
+        RawItem() : frame(nullptr), kind(RawKind::Frame), pts(0), seq(0) {}
         RawItem(AVFramePtr f, RawKind k, int64_t p)
-            : frame(std::move(f)), kind(k), pts(p) {}
+            : frame(std::move(f)), kind(k), pts(p), seq(0) {}
     };
     using RawFrameQueue = dmlc::ConcurrentBlockingQueue<RawItem>;
     using RawFrameQueuePtr = std::unique_ptr<RawFrameQueue>;
@@ -80,6 +84,26 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         void WorkerThreadImpl();
         void FilterWorkerThread();
         void FilterWorkerThreadImpl();
+        // ── RGB 转换扇出池（convert_workers_ > 1 时启用）──
+        // 帧级并行：解码单线程，转换分发到 N 个 worker（各持独立
+        // filter graph/sws 实例），完成项按解码序重排后入 frame_queue_。
+        // 仅 RGB 输出启用（转换占主导）；yuv420/gray 走单线程旧路径，
+        // hybrid（yuv420/gray）行为零变化。
+        void StartConvertPool();
+        void StopConvertPool();
+        void ConvertWorkerLoop();
+        void EmitOrdered(uint64_t seq, std::vector<NDArray> &&outs,
+                         bool call_on_output, bool clear_draining);
+        std::vector<std::thread> convert_worker_threads_;
+        std::mutex reorder_mu_;
+        std::mutex bp_mutex_;           // 背压 cv（解码/转换线程 ↔ 消费者 Pop）
+        std::condition_variable bp_cv_;
+        std::map<uint64_t, std::vector<NDArray> > reorder_map_;
+        uint64_t reorder_next_ = 0;
+        uint64_t raw_seq_ = 0;      // 仅解码线程推进
+        int convert_workers_ = 1;
+        std::string graph_descr_;   // BuildFilterGraph 描述串快照
+        std::atomic<int> graph_gen_{0};
         void EnqueueRawFrame(AVFramePtr frame);
         void RecordInternalError(std::string message);
         void CheckErrorStatus();

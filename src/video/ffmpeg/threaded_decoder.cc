@@ -90,6 +90,16 @@ void FFMPEGThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width, 
     out_h_ = height;
     rotation_ = rotation;
     output_format_ = output_format;
+    // 转换扇出池：默认关闭（单线程旧路径）。实测 RGB 吞吐瓶颈在 get_batch
+    // 的批组装拷贝与解码，转换已被解码时间掩盖（workers 1/4/8 均为
+    // ~810-840fps，无扩展）—— Nelux 的转换扇出收益来自其零拷贝 tensor
+    // 迭代消费，与我们的批组装 API 不同。池保留给 4K/缩放输出等转换
+    // 主导场景：DECORD_CONVERT_WORKERS=N 显式启用。yuv420/gray 恒单线程。
+    convert_workers_ = 1;
+    if (output_format_ == 0) {
+        if (const char *e = getenv("DECORD_CONVERT_WORKERS"))
+            convert_workers_ = std::max(1, atoi(e));
+    }
     color_range_ = (dec_ctx->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
     // AV1（dav1d）批量解码模式标记：dav1d 帧并行需要多 packet 在途
     codec_is_av1_ = (dec_ctx->codec_id == AV_CODEC_ID_AV1);
@@ -180,6 +190,10 @@ void FFMPEGThreadedDecoder::BuildFilterGraph() {
         dec_ctx_->time_base = time_base_;
     }
     filter_graph_ = FFMPEGFilterGraphPtr(new FFMPEGFilterGraph(descr, dec_ctx_.get(), output_format_));
+    // 扇出池：快照描述串并推进代数 —— 各 worker 在处理下一帧时按代数
+    // 重建自己的本地 graph（SetRoi 热切换对池同样生效）。
+    graph_descr_ = descr;
+    ++graph_gen_;
 }
 
 void FFMPEGThreadedDecoder::Start() {
@@ -192,8 +206,12 @@ void FFMPEGThreadedDecoder::Start() {
         run_.store(true);
         auto t = std::thread(&FFMPEGThreadedDecoder::WorkerThread, this);
         std::swap(t_, t);
-        auto ft = std::thread(&FFMPEGThreadedDecoder::FilterWorkerThread, this);
-        std::swap(filter_t_, ft);
+        if (convert_workers_ > 1) {
+            StartConvertPool();
+        } else {
+            auto ft = std::thread(&FFMPEGThreadedDecoder::FilterWorkerThread, this);
+            std::swap(filter_t_, ft);
+        }
     }
 }
 
@@ -212,6 +230,7 @@ void FFMPEGThreadedDecoder::Stop() {
         if (frame_queue_) {
             frame_queue_->SignalForKill();
         }
+        bp_cv_.notify_all();  // 唤醒仍等背压的解码/转换线程
     }
     if (t_.joinable()) {
         // LOG(INFO) << "joining";
@@ -220,6 +239,27 @@ void FFMPEGThreadedDecoder::Stop() {
     if (filter_t_.joinable()) {
         filter_t_.join();
     }
+    StopConvertPool();
+}
+
+void FFMPEGThreadedDecoder::StartConvertPool() {
+    StopConvertPool();  // 防御：残留线程先清
+    for (int i = 0; i < convert_workers_; ++i) {
+        convert_worker_threads_.emplace_back(&FFMPEGThreadedDecoder::ConvertWorkerLoop, this);
+    }
+}
+
+void FFMPEGThreadedDecoder::StopConvertPool() {
+    if (!convert_worker_threads_.empty()) {
+        for (auto &w : convert_worker_threads_) {
+            if (w.joinable()) w.join();
+        }
+        convert_worker_threads_.clear();
+    }
+    std::lock_guard<std::mutex> lk(reorder_mu_);
+    reorder_map_.clear();
+    reorder_next_ = 0;
+    raw_seq_ = 0;
 }
 
 void FFMPEGThreadedDecoder::Clear() {
@@ -284,6 +324,8 @@ bool FFMPEGThreadedDecoder::Pop(runtime::NDArray *frame) {
 
     if (ret) {
         --frame_count_;
+        // 消费腾出槽位：唤醒等背压的解码线程（EnqueueRawFrame）
+        bp_cv_.notify_all();
     }
     return (ret && frame->data_);
 }
@@ -345,10 +387,11 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
     // than the decoder produces them.  0 (max_queue_frames_ default) or
     // negative disables backpressure entirely.
     if (max_queue_frames_ > 0) {
-        while (frame_queue_->Size() >= static_cast<size_t>(max_queue_frames_)
-               && run_.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
+        std::unique_lock<std::mutex> blk(bp_mutex_);
+        bp_cv_.wait(blk, [&] {
+            return !run_.load()
+                   || frame_queue_->Size() < static_cast<size_t>(max_queue_frames_);
+        });
     }
     if (!run_.load()) return;
     pf_f_filter.stop();
@@ -388,6 +431,7 @@ void FFMPEGThreadedDecoder::EnqueueRawFrame(AVFramePtr frame) {
     item.frame = frame;
     item.pts = frame->pts;
     item.kind = skip ? RawKind::Skip : RawKind::Frame;
+    item.seq = raw_seq_++;
     // Backpressure: the decode thread must not run ahead of the filter /
     // consumer.  raw_queue_ and frame_queue_ are the decoded-frame buffers;
     // without a bound here they grow without limit when the consumer is
@@ -396,11 +440,15 @@ void FFMPEGThreadedDecoder::EnqueueRawFrame(AVFramePtr frame) {
     // way back to Push(), bounding total memory.  Applied for every kind so
     // even the tiny markers can't starve the pipeline at the tail.
     if (max_queue_frames_ > 0) {
+        // 条件变量背压（替代 1ms 睡眠轮询）：睡眠量子会把解码节流到
+        // ~1ms/帧上限（rgb 实测 803fps 封顶）。Pop 侧唤醒，精确随消费
+        // 步进；内存上界不变。
         size_t cap = static_cast<size_t>(max_queue_frames_ + DECORD_RAW_SLACK_FRAMES);
-        while (run_.load()
-               && raw_queue_->Size() + frame_queue_->Size() >= cap) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+        std::unique_lock<std::mutex> lk(bp_mutex_);
+        bp_cv_.wait(lk, [&] {
+            return !run_.load()
+                   || raw_queue_->Size() + frame_queue_->Size() < cap;
+        });
         if (!run_.load()) return;
     }
     raw_queue_->Push(item);
@@ -460,6 +508,102 @@ void FFMPEGThreadedDecoder::FilterWorkerThreadImpl() {
             break;
         }
         }
+    }
+}
+
+void FFMPEGThreadedDecoder::ConvertWorkerLoop() {
+    // 线程本地 filter graph：各 worker 独立 sws 实例（扇出并行的前提）。
+    // graph_gen_ 变化（SetRoi/SetCodecContext 热切换）时按快照描述串重建。
+    std::shared_ptr<FFMPEGFilterGraph> local_graph;
+    int local_gen = -1;
+    while (run_.load()) {
+        RawItem item;
+        if (!raw_queue_->Pop(&item)) return;
+        std::vector<NDArray> outs;
+        bool call_on_output = false;
+        bool clear_draining = false;
+        switch (item.kind) {
+        case RawKind::Skip: {
+            // 保留历史空 marker（NextFrameImpl 的重试逻辑依赖）
+            NDArray empty = NDArray::Empty({1}, kUInt8, kCPU);
+            empty.pts = item.pts;
+            outs.push_back(empty);
+            call_on_output = true;
+            break;
+        }
+        case RawKind::Eof: {
+            outs.push_back(NDArray());
+            break;
+        }
+        case RawKind::DrainEnd: {
+            for (int cnt = 0; cnt < ThreadedDecoderInterface::kDrainMarkerCount; ++cnt)
+                outs.push_back(NDArray::Empty({1}, kInt64, kCPU));
+            call_on_output = true;
+            clear_draining = true;
+            break;
+        }
+        case RawKind::Frame: {
+            {
+                std::lock_guard<std::mutex> lk(filter_mutex_);
+                if (local_gen != graph_gen_.load() && dec_ctx_) {
+                    // 同 BuildFilterGraph：先恢复流时基（Clear/flush 会把
+                    // dec_ctx->time_base 冲成 0/1，buffersrc 拒绝）
+                    dec_ctx_->time_base = time_base_;
+                    local_graph.reset(new FFMPEGFilterGraph(
+                        graph_descr_, dec_ctx_.get(), output_format_));
+                    local_gen = graph_gen_.load();
+                }
+            }
+            if (!local_graph) continue;
+            pf_f_filter.start();
+            local_graph->Push(item.frame.get());
+            AVFramePtr out_frame = AVFramePool::Get()->Acquire();
+            AVFrame *out_frame_p = out_frame.get();
+            CHECK(local_graph->Pop(&out_frame_p)) << "Error fetch filtered frame.";
+            NDArray tmp = AsNDArray(out_frame);
+            if (max_queue_frames_ > 0) {
+                while (frame_queue_->Size() >= static_cast<size_t>(max_queue_frames_)
+                       && run_.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }
+            if (!run_.load()) return;
+            pf_f_filter.stop();
+            outs.push_back(tmp);
+            call_on_output = true;
+            break;
+        }
+        }
+        EmitOrdered(item.seq, std::move(outs), call_on_output, clear_draining);
+    }
+}
+
+void FFMPEGThreadedDecoder::EmitOrdered(uint64_t seq, std::vector<NDArray> &&outs,
+                                        bool call_on_output, bool clear_draining) {
+    // 重排发射：持锁完成"插入完成项 + 连续段出队 + 背压等待 + 入队"，
+    // 保证 frame_queue_ 严格按解码序（锁内背压睡眠安全 —— 消费者不取
+    // 此锁，不会有其他 worker 越序插入）。
+    std::lock_guard<std::mutex> lk(reorder_mu_);
+    reorder_map_.emplace(seq, std::move(outs));
+    while (reorder_map_.count(reorder_next_)) {
+        auto it = reorder_map_.find(reorder_next_);
+        std::vector<NDArray> batch = std::move(it->second);
+        reorder_map_.erase(it);
+        ++reorder_next_;
+        for (auto &a : batch) {
+            if (max_queue_frames_ > 0) {
+                std::unique_lock<std::mutex> blk(bp_mutex_);
+                bp_cv_.wait(blk, [&] {
+                    return !run_.load()
+                           || frame_queue_->Size() < static_cast<size_t>(max_queue_frames_);
+                });
+            }
+            if (!run_.load()) return;
+            frame_queue_->Push(a);
+            ++frame_count_;
+        }
+        if (call_on_output && on_output_) on_output_();
+        if (clear_draining) draining_.store(false);
     }
 }
 
