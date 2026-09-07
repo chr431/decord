@@ -326,6 +326,47 @@ class VideoReader(object):
         self._frames_read += len(indices)
         return bridge_out(arr)
 
+    def get_batch_stream(self, indices, roi=None, batch=250):
+        """Chunk-granularity streaming fetch: prefetch the next batch in a
+        background thread while the consumer processes the current one;
+        deliver each batch as soon as decoding finishes (chunk-ordered,
+        cross-batch completion order).
+
+        Semantics contract: within a batch frames are in `indices` order;
+        across batches delivery order is decode-completion order.  The
+        consumer must either be order-agnostic or reassemble by frame
+        index (the OCR engine's差分链 uses prev-frame within batch +
+        reassembly at boundaries).
+
+        Returns a generator yielding (start_pos, batch_ndarray).
+        """
+        assert self._handle is not None
+        indices = list(self._validate_indices(indices))
+        import threading as _threading
+        import queue as _queue
+        q = _queue.Queue(maxsize=2)
+
+        def worker():
+            for s0 in range(0, len(indices), batch):
+                chunk = indices[s0:s0 + batch]
+                try:
+                    arr = self.get_batch(chunk, roi=roi)
+                except BaseException as e:  # noqa: BLE001
+                    q.put(e)
+                    return
+                q.put((chunk[0], arr))
+            q.put(None)
+
+        th = _threading.Thread(target=worker, daemon=True)
+        th.start()
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
     def get_key_indices(self):
         """Get list of key frame indices.
 
