@@ -47,24 +47,22 @@ static const int EOF_RETRY_MAX = std::stoi(runtime::GetEnvironmentVariableOrDefa
 static const float DUPLICATE_WARNING_THRESHOLD = std::stof(runtime::GetEnvironmentVariableOrDefault("DECORD_DUPLICATE_WARNING_THRESHOLD", "0.25"));
 // Number of FFmpeg decode threads.  Default 4: measured on a 16-core
 // machine (7945HX) with test5 (7223 frames) in the CPU decode + ONNX CPU
-// inference pipeline — 2 threads: decode 18.1s (399fps) / total 23.6s;
-// 4 threads: decode 11.6s (621fps) / total 16.9s; 6 threads: no further
-// decode gain (616fps) and inference slows.  Auto (=0, all cores) competes
-// with the ONNX threads and slows both down badly.  The frame_queue_
-// backpressure (DECORD_CPU_FRAME_QUEUE_SIZE) prevents unbounded memory
-// growth regardless of thread count.
-// Set DECORD_FFMPEG_THREAD_COUNT to override (e.g. =0 for full-core decode
-// when the reader is used without OCR, =1 to minimise latency).
-//
-// Default scales with the logical CPU count (batch decode measured on
-// 16-core/32-thread: 8 threads = best; 4-core machines get 2, 8-core get
-// 4, 32-core caps at 8): ffmpeg frame threads parallelise batch decoding
-// but must leave cores for the OCR inference threads on the same machine.
+// Batch decode (FFmpeg 9 + NV12 直出 build, 16C/32T measured): 8 threads
+// 687-995fps vs 16 threads 921-1151fps (+16-34% across h264/hevc/av1) —
+// ffmpeg frame threads scale with physical cores now that the per-frame
+// pack is two memcpys (NV12) instead of a scalar interleave loop.
+// DECORD-pipelined OCR note (historical, pre-NV12 measurement): with 6+
+// decode threads the ONNX inference stage slowed more than decode gained
+// (2 threads: decode 399fps / total 399fps-equivalent 23.6s; 6 threads: no
+// decode gain, inference slower).  If you run inference concurrently with
+// decoding, cap via DECORD_FFMPEG_THREAD_COUNT (e.g. =2..4) or num_threads.
+// The frame_queue_ backpressure (DECORD_CPU_FRAME_QUEUE_SIZE) bounds memory
+// regardless of thread count.
 static int DefaultFFmpegThreads() {
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 8;
-    int n = static_cast<int>(hw) / 4;   // ≈ half the physical cores
-    return std::max(2, std::min(n, 8));
+    int n = static_cast<int>(hw) / 2;   // ≈ physical cores
+    return std::max(2, std::min(n, 16));
 }
 static const int DECORD_FFMPEG_THREAD_COUNT = std::stoi(
     runtime::GetEnvironmentVariableOrDefault(
