@@ -1400,6 +1400,12 @@ bool VideoReader::CheckKeyFrame()
     auto iter = pts_frame_map_.find(frame.pts);
     if (iter != pts_frame_map_.end())
         cf = iter->second;
+    if (getenv("DECORD_SEEK_DEBUG")) {
+        auto lo = pts_frame_map_.lower_bound(frame.pts - 2);
+        fprintf(stderr, "[ckf-dbg] consumed pts=%lld map=%s\n",
+                (long long)frame.pts,
+                iter != pts_frame_map_.end() ? "exact" : (lo != pts_frame_map_.end() ? "near" : "miss"));
+    }
     if (curr_frame_ != cf)
     {
         curr_frame_ = cf + 1;
@@ -1461,7 +1467,16 @@ void VideoReader::SkipFramesImpl(int64_t num)
             continue;
         }
         ++curr_frame_;
-        // LOG(INFO) << "skip: " << num;
+        if (s_dbg) {
+            auto it = pts_frame_map_.find(frame.pts);
+            if (it == pts_frame_map_.end()) {
+                auto lo2 = pts_frame_map_.lower_bound(frame.pts - 2);
+                it = lo2;
+            }
+            fprintf(stderr, "[skip-dbg] pop#%lld pts=%lld -> idx=%lld\n",
+                    (long long)(initial_num - num), (long long)frame.pts,
+                    it == pts_frame_map_.end() ? -1LL : (long long)it->second);
+        }
         --num;
     }
     if (s_dbg) fprintf(stderr, "[skip-dbg] exit curr=%lld skipped=%lld\n",

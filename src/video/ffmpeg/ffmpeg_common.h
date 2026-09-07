@@ -22,6 +22,9 @@ extern "C" {
 #endif
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(63, 0, 0)
+#error "decord requires FFmpeg 9.0+ (avcodec 63). FFmpeg 7.x/8.x support was removed: cross-version keyframe indexing and seek-landing behaviour caused subtle correctness bugs (D4). Pin the BtbN n9.0 shared build."
+#endif
 #include <libavformat/avformat.h>
 #include <libavformat/avio.h>
 #include <libavfilter/avfilter.h>
