@@ -140,6 +140,18 @@ jobs:
           } else {
             Write-Host "pyproject.toml 已是 $ver，无需 bump"
           }
+          # C API 版本串与 libinfo 同步（此前漏更，三源漂移到 0.7.10 vs 0.7.14）
+          $capi = "include/decord/runtime/c_runtime_api.h"
+          $capiContent = [System.IO.File]::ReadAllText((Resolve-Path $capi))
+          $capiCur = [regex]::Match($capiContent, 'DECORD_VERSION "(\d+\.\d+\.\d+)"').Groups[1].Value
+          if ($capiCur -ne $ver) {
+            $capiContent = $capiContent -replace 'DECORD_VERSION "\d+\.\d+\.\d+"', "DECORD_VERSION `"$ver`""
+            [System.IO.File]::WriteAllText((Resolve-Path $capi), $capiContent, (New-Object System.Text.UTF8Encoding($false)))
+            git add $capi
+            $changed = $true
+          } else {
+            Write-Host "c_runtime_api.h 已是 $ver，无需 bump"
+          }
           if ($changed) {
             git commit -m "release: v$ver"
             git push origin "HEAD:${{ inputs.ref }}"
