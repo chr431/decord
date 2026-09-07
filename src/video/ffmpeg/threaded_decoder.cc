@@ -303,6 +303,38 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
     }
     pf_f_filter.start();
     graph->Push(frame.get());
+    // 生产速率段式 EWMA（混合解码调度用）：有效供给 = filter 后的帧
+    // （raw 产出绕过 YUV 打包成本，hevc 实测 raw 1333 vs 有效 ~800，
+    // 调度据 raw 过配 CPU 份额致整体 0.68x）。存货完全满（消费瓶颈
+    // 期）的产出不计 —— 那是 filter 倾泻脉冲而非供给节奏（h264 曾
+    // 学到 1134 > 12 线程纯跑）；浅水位照常统计保证学习及时性。
+    {
+        bool count_it = !frame_queue_ || max_queue_frames_ <= 0
+            || frame_queue_->Size() < static_cast<size_t>(max_queue_frames_);
+        auto now = std::chrono::steady_clock::now();
+        if (!count_it) {
+            prod_seg_frames_ = 0;
+            prod_seg_secs_ = 0.0;
+        } else if (last_prod_tp_.time_since_epoch().count() != 0) {
+            double dt = std::chrono::duration<double>(now - last_prod_tp_).count();
+            if (dt > 0.05) {
+                prod_seg_frames_ = 0;
+                prod_seg_secs_ = 0.0;
+            } else if (dt > 1e-6) {
+                prod_seg_frames_++;
+                prod_seg_secs_ += dt;
+                if (prod_seg_frames_ >= 16) {
+                    double r = prod_seg_frames_ / prod_seg_secs_;
+                    double prev = prod_rate_.load(std::memory_order_relaxed);
+                    prod_rate_.store(prev > 0 ? 0.5 * prev + 0.5 * r : r,
+                                     std::memory_order_relaxed);
+                    prod_seg_frames_ = 0;
+                    prod_seg_secs_ = 0.0;
+                }
+            }
+        }
+        last_prod_tp_ = now;
+    }
     AVFramePtr out_frame = AVFramePool::Get()->Acquire();
     AVFrame *out_frame_p = out_frame.get();
     CHECK(graph->Pop(&out_frame_p)) << "Error fetch filtered frame.";
@@ -331,31 +363,6 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
         ++frame_count_;
     }
     if (on_output_) on_output_();
-    // 生产速率段式 EWMA（混合解码调度用）：连续产出段（帧间隔 <50ms）
-    // 内统计，段满 16 帧折算一次段速率并 EWMA；背压等待/断流重置段
-    // 不计入 —— 与消费速率解耦，近似真实解码能力。
-    {
-        auto now = std::chrono::steady_clock::now();
-        if (last_prod_tp_.time_since_epoch().count() != 0) {
-            double dt = std::chrono::duration<double>(now - last_prod_tp_).count();
-            if (dt > 0.05) {
-                prod_seg_frames_ = 0;
-                prod_seg_secs_ = 0.0;
-            } else if (dt > 1e-6) {
-                prod_seg_frames_++;
-                prod_seg_secs_ += dt;
-                if (prod_seg_frames_ >= 16) {
-                    double r = prod_seg_frames_ / prod_seg_secs_;
-                    double prev = prod_rate_.load(std::memory_order_relaxed);
-                    prod_rate_.store(prev > 0 ? 0.5 * prev + 0.5 * r : r,
-                                     std::memory_order_relaxed);
-                    prod_seg_frames_ = 0;
-                    prod_seg_secs_ = 0.0;
-                }
-            }
-        }
-        last_prod_tp_ = now;
-    }
     pf_f_push.stop();
     if (DECORD_PROFILE && pf_f_filter.n % 3000 == 2999) {
         std::cerr << "[P2] d_send=" << pf_d_send.acc / pf_d_send.n

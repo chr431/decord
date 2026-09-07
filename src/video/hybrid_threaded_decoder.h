@@ -25,8 +25,8 @@
  * 消费者线程的 Pop（非阻塞）都永不阻塞；GPU 工作线程内部全部非阻塞
  * 轮询（池 TryAcquire / CU Pop），唯一可能阻塞的是 CU Push 的包队列
  * 背压等待（由解析线程独立排空，自解）与同步 D2H（必然完成）。
- * ChooseSide 另有 GPU 待发射帧字节预算（kGpuAheadBytes）硬上限，
- * 防止调度失衡时压缩包队列无界增长。
+ * 总在途由 demux prefetch 窗口（消费驱动）+ ready_ 预算 + 池深三重
+ * 硬上限兜底，调度失衡时压缩包队列不会无界增长。
  */
 
 #ifndef DECORD_VIDEO_HYBRID_THREADED_DECODER_H_
@@ -148,8 +148,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
         int64_t end_pts;     ///< 下一关键帧 pts；最后一个 chunk 为 INT64_MAX
         int64_t expected;    ///< 该 chunk 应发射的帧数（kf rank 差；0=未知）
         int64_t emitted;     ///< 已发射帧数
-        std::chrono::steady_clock::time_point first_pop;  ///< 首帧弹出时刻（测速）
-        bool timed = false;
     };
 
     /*! \brief 重置路由/合并状态（Seek/Clear 时调用；保留速率 EWMA 与 kf 索引） */
@@ -179,7 +177,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool FeedStep();
     /*! \brief 上载一步（仅 GPU 驻留模式）：CPU 侧帧 H2D 入 cpu_ready_。
      *  先取池缓冲再取帧（帧不可回退入 CPU 解码器，必须不滞留）；
-     *  marker 直通不拷贝。返回是否做了实际工作。 */
+     *  marker 直通前先冲刷在途环（保序）。返回是否做了实际工作。 */
     bool UploadStep();
     /*! \brief 上载线程主循环（GPU 驻留模式） */
     void UploaderLoop();
@@ -193,6 +191,35 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     void *up_staging_[4] = {nullptr, nullptr, nullptr, nullptr};
     std::size_t up_stage_bytes_ = 0;
     int up_stage_idx_ = 0;
+    /*! \brief H2D 提交事件（每槽一个）：滞后 4 帧收割 —— 提交后不立即
+     *  同步，槽轮转复用时才等事件。每帧同步等待（~0.4-1ms）曾把 CPU
+     *  chunk 的发射压到实时跟随（上载 ~1000fps 上限）。收割（事件同步
+     *  后 push cpu_ready_）保证消费者拿到的帧 H2D 必已完成。 */
+    void *up_ev_[4] = {nullptr, nullptr, nullptr, nullptr};
+    runtime::NDArray up_buf_[4];   ///< 在途上载的目标显存帧（保活）
+    bool up_valid_[4] = {false, false, false, false};
+    /*! \brief D2H 异步中转环（仅 CPU-out 模式，工作线程访问）：GPU 帧
+     *  cudaMemcpyAsync 到 pinned 槽，滞后 kD2HRingSlots 帧收割（事件
+     *  已远，零等待）+ memcpy 到宿主 NDArray 入 ready_。此前同步 D2H
+     *  串行在 LandStep（每帧 ~0.5-1ms），GPU 侧落地被压到 ~1200fps。 */
+    static constexpr int kD2HRingSlots = 8;
+    void *d2h_staging_[kD2HRingSlots] = {};
+    void *d2h_ev_[kD2HRingSlots] = {};          ///< cudaEvent_t
+    runtime::NDArray d2h_host_[kD2HRingSlots];  ///< 目标宿主帧（保活）
+    runtime::NDArray d2h_gpu_[kD2HRingSlots];   ///< 源 GPU 帧（事件前不回池）
+    bool d2h_valid_[kD2HRingSlots] = {};
+    int64_t d2h_seq_ = 0;
+    std::size_t d2h_bytes_ = 0;
+    void *d2h_stream_ = nullptr;   ///< D2H 专用非阻塞流（与 NVDEC 流并行）
+    /*! \brief 冲刷 D2H 环（marker 前保序 / Stop 前）：收割全部在途帧
+     *  入 ready_。ready_ 满时容忍越界（软限，仅 EOF 尾部发生）。 */
+    void FlushD2H();
+    /*! \brief 收割一个 D2H 槽（ready 有余量为前提），失败返回 false */
+    bool HarvestD2H(int k);
+    /*! \brief 同步并丢弃在途 D2H/H2D（Clear/ROI 重建用） */
+    void AbortInflight();
+    /*! \brief 冲刷 H2D 在途环（marker 保序）：事件同步后按提交序 push */
+    void FlushUpload();
     /*! \brief 停止并回收 GPU 工作线程（Stop/Clear 共用） */
     void StopGpuWorker();
 #endif
@@ -210,8 +237,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     void ComputeBudgets();
     /*! demux 领先深度建议（自适应预算计算结果） */
     int SuggestPrefetchDepth() const override { return prefetch_frames_; }
-    /*! \brief 记录 chunk 发射速率（EWMA，供 ChooseSide） */
-    void RecordChunkRate(const Chunk &ch);
 
 #ifdef DECORD_USE_CUDA
     /*! \brief GPU 输出缓冲池（有界，阻塞 Acquire）。声明在 gpu_ 之前：
@@ -279,15 +304,8 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int64_t land_seg_frames_ = 0;
     double land_seg_secs_ = 0.0;
 #endif
-    /*! \brief GPU 待发射帧字节预算：超过即强制 CPU 承接新 chunk
-     *  （调度失衡时 GPU 包队列与在途帧的总量上限；非 CUDA 构建不触发） */
-    static constexpr int64_t kGpuAheadBytes = 16ll << 30;
-    // 等效 16GiB ≈ 5160 帧@1080p。注意它限制的真实资源只是宿主
-    // 压缩包队列（~17KB/帧 → 上限 ~90MB RAM）；显存（池 28 帧）与
-    // ready_（1GiB）各有独立预算。预算过小会让冷启动的 GPU chunk
-    // 立即顶格、此后全部强制 CPU（实测 13:5 分配锁死）。
     /*! \brief 已路由到 GPU、尚未发射/丢弃的帧数（包粒度精确计数；
-     *  ChooseSide 的硬预算依据） */
+     *  诊断用途） */
     int64_t gpu_pending_ = 0;
 
     ffmpeg::FFMPEGThreadedDecoder cpu_;
@@ -317,16 +335,13 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool has_stash_[2] = {false, false};
     bool eof_pushed_ = false;
 
-    // ── 速率感知（pts 单位/秒；跨 Clear 保留）──
-    double rate_ewma_[2] = {0.0, 0.0};  ///< 各侧 chunk 发射速率 EWMA
-    int64_t backlog_end_[2] = {0, 0};   ///< 各侧已分配到的 pts 上界
-    int64_t emitted_upto_[2] = {0, 0};  ///< 各侧已发射到的 pts
+    // ── 速率感知（跨 Clear 保留）──
     int chunks_assigned_[2] = {0, 0};
     int64_t emitted_total_ = 0;          ///< 全局已发射帧数（消费位置）
     int64_t side_pending_[2] = {0, 0};   ///< 各侧已路由未发射帧数（真积压，
                                          ///< 含在途解码与存货，包粒度精确）
-    int64_t last_chunk_frames_ = 0;      ///< 上一 chunk 帧数（新 chunk 估计）
     int64_t est_chunk_frames_ = 0;       ///< chunk 帧数估计（份额累计用）
+    int64_t sticky_frames_ = 0;          ///< 当前侧已连续分配的帧数（粘性）
     int64_t alloc_frames_[2] = {0, 0};   ///< 各侧累计分配帧数（份额均衡）
 
     std::vector<int64_t> gpu_frame_shape_;
