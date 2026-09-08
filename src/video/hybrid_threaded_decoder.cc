@@ -212,17 +212,22 @@ void HybridGpuBufferPool::Deleter(runtime::NDArray::Container *ptr) {
 
 void HybridThreadedDecoder::ComputeBudgets() {
     // adaptive: free VRAM/RAM -> bounded budgets; alloc failure = backpressure
+    // 库存份额 0.45（2026-09-08 从 0.30 上调）：块交替调度下，两侧库存帽
+    // （CPU queue / GPU ready·池）必须 ≥ 相位帧量，否则值日方的生产在对
+    // 方值日里被背压闸住（产能闲置）—— hevc 显存池 2132→4500MB 实测
+    // 引擎口径 1848→2041（每轮 >2000，超纯 NVDEC 9%）。仍按空闲量自适应，
+    // env 可覆盖。
     double vram_budget = 768.0 * 1024 * 1024;
     double ram_budget = 1536.0 * 1024 * 1024;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > 0)
-        vram_budget = static_cast<double>(free_b) * 0.30;
+        vram_budget = static_cast<double>(free_b) * 0.45;
 #if defined(_WIN32)
     { MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
-      if (GlobalMemoryStatusEx(&ms)) ram_budget = static_cast<double>(ms.ullAvailPhys) * 0.30; }
+      if (GlobalMemoryStatusEx(&ms)) ram_budget = static_cast<double>(ms.ullAvailPhys) * 0.45; }
 #else
     { long pages = sysconf(_SC_AVPHYS_PAGES); long ps = sysconf(_SC_PAGE_SIZE);
-      if (pages > 0 && ps > 0) ram_budget = static_cast<double>(pages) * ps * 0.30; }
+      if (pages > 0 && ps > 0) ram_budget = static_cast<double>(pages) * ps * 0.45; }
 #endif
     if (const char *e = getenv("DECORD_HYBRID_VRAM_BUDGET_MB"))
         if (atof(e) > 0) vram_budget = atof(e) * 1024 * 1024;
@@ -232,14 +237,16 @@ void HybridThreadedDecoder::ComputeBudgets() {
     auto clampi = [](double v, int lo, int hi) {
         return static_cast<int>(std::max<double>(lo, std::min<double>(v, hi))); };
     if (out_cuda_) {
-        gpu_pool_frames_ = clampi(vram_budget * 0.65 / fb, 96, 1024);
-        up_pool_frames_ = clampi(vram_budget * 0.35 / fb, 48, 512);
+        gpu_pool_frames_ = clampi(vram_budget * 0.65 / fb, 96, 1536);
+        up_pool_frames_ = clampi(vram_budget * 0.35 / fb, 48, 768);
     } else {
         gpu_pool_frames_ = clampi(vram_budget * 0.65 / fb, 28, 128);
         up_pool_frames_ = 0;
     }
-    queue_frames_ = clampi(ram_budget * 0.45 / fb, 96, 768);
-    ready_cap_frames_ = clampi(ram_budget * 0.45 / fb, 96, 2048);
+    // queue 钳制 768→1536（库存帽 ≥ 相位帧量的前提；RAM 预算不足时仍被
+    // 预算压低，钳制只是不再先于预算生效）
+    queue_frames_ = clampi(ram_budget * 0.45 / fb, 96, 1536);
+    ready_cap_frames_ = clampi(ram_budget * 0.45 / fb, 96, 2560);
     if (out_cuda_) ready_cap_frames_ = gpu_pool_frames_ + up_pool_frames_ + 64;
     // demux 领先必须同时覆盖两路存货（CPU queue + GPU ready）+ 余量：
     // 否则两路分食领先窗口互相饿（CPU 块发射期 GPU 拿不到包只能空转，
@@ -616,8 +623,29 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     }
     if (!sched_initialized_) {
         // 首次双侧速率就绪：解除盲阶段（NeedsPackets 的窄窗口门控随之
-        // 放开）。份额由下方的库存迟滞自发给出，无收敛过程。
+        // 放开），并按产率比分账两侧库存帽（仅 CPU-out；引擎口径的
+        // ready 由显存池决定不可动）。相位帧量 ∝ 产率：GPU 主导码流
+        // （hevc: rg≈2×rc）的 GPU 相位更长、ready 需要更深，45/45 均分
+        // 会把 ready 压浅（实测 hevc CPU-out ready 1141 时 1645 中位，
+        // ready 1745 时 1756）。分账只重排 RAM 帽，窗口/硬顶公式随动。
         sched_initialized_ = true;
+        if (!out_cuda_) {
+            const int64_t total_inv =
+                static_cast<int64_t>(queue_frames_) + ready_cap_frames_;
+            const double rr = rate[SIDE_CPU]
+                / std::max(rate[SIDE_CPU] + rate[SIDE_GPU], 1.0);
+            int64_t q = static_cast<int64_t>(total_inv * rr);
+            q = std::max<int64_t>(q, 96);
+            int64_t rd = std::max<int64_t>(total_inv - q, 96);
+            queue_frames_ = static_cast<int>(q);
+            ready_cap_frames_ = static_cast<int>(rd);
+            cpu_.SetQueueDepth(queue_frames_);
+            if (getenv("DECORD_HYBRID_DEBUG")) {
+                fprintf(stderr, "\n[hybrid-sched] inv-split rc=%.0f rg=%.0f -> queue=%d ready=%d\n",
+                        rate[SIDE_CPU], rate[SIDE_GPU], queue_frames_,
+                        ready_cap_frames_);
+            }
+        }
     }
     // ── 最少剩余工作量调度（least-remaining-work）──
     // 每次决策把新 chunk 分给"剩余解码时间"更小的一侧：剩余 = 该侧
