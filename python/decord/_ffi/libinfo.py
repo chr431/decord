@@ -90,4 +90,4 @@ def find_lib_path(name=None, search_path=None, optional=False):
 # Bump it as part of the release process (see README "Releases" section) or
 # via tools/update_version.py; pyproject.toml (pip wheel 元数据) and
 # python/decord/__init__.py derive from here.
-__version__ = "0.8.1"
+__version__ = "0.8.2"
