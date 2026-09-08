@@ -12,7 +12,7 @@ run tests/test_hybrid_gpu.py > /tmp/t_gpu.log 2>&1 &
 P1=$!
 run tests/test_hybrid_formats.py > /tmp/t_fmt.log 2>&1 &
 P2=$!
-( HYB_TEST_N=$HYB_TEST_N python tests/test_hybrid.py --n "$HYB_TEST_N" > /tmp/t_md5.log 2>&1; python tests/test_hybrid_stream.py >> /tmp/t_md5.log 2>&1; python tests/test_hybrid_stride.py >> /tmp/t_md5.log 2>&1 ) &
+( HYB_TEST_N=$HYB_TEST_N python tests/test_hybrid.py --n "$HYB_TEST_N" > /tmp/t_md5.log 2>&1; python tests/test_hybrid_stream.py >> /tmp/t_md5.log 2>&1; python tests/test_hybrid_stride.py >> /tmp/t_md5.log 2>&1; python tests/test_hybrid_lockstep.py 600 >> /tmp/t_md5.log 2>&1 ) &
 P3=$!
 wait $P1; R1=$?
 wait $P2; R2=$?
