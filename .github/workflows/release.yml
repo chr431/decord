@@ -2,15 +2,16 @@
 #
 # 手动触发（Actions → Release → Run workflow），输入版本号即完成：
 #   1. 校验版本格式 + 确认 tag 不存在
-#   2. 安装 CUDA Toolkit + 下载 FFmpeg 9.0（BtbN shared build）
+#   2. 下载 FFmpeg 9.0（BtbN shared build）
 #   3. CMake GPU 构建 decord.dll（USE_CUDA=ON）
 #   4. 若 libinfo.py / pyproject.toml 版本 != 输入版本：两文件同步升版本 → commit → push 到目标分支
 #   5. 打 tag v<版本> 并 push
-#   6. 构建 pip wheel（scikit-build-core，bump 之后跑以拿到正确版本号；
-#      内容 = decord.dll + FFmpeg 导入闭包 6 DLL，自动安装规则见 CMakeLists）
-#   7. 打包 zip（布局 = RaceVideoToLog 的 _decord_build/，解压即用）：
+#   6. 打包 zip（布局 = RaceVideoToLog 的 _decord_build/，解压即用）：
 #        decord.dll + FFmpeg 9.0 DLLs + ffprobe.exe + python/decord/
-#   8. 创建 GitHub Release（notes = 自上一 tag 的 commit 列表）+ 上传 zip 与 wheel
+#   7. wheels job：Python 3.9–3.14 矩阵并行构建 pip wheel（checkout 已推送的
+#      tag，scikit-build-core，DLL 闭包自检）
+#   8. publish job：汇总 zip + 全部 wheel 创建 GitHub Release
+#      （notes = 自上一 tag 的 commit 列表）
 #
 # 只监听 workflow_dispatch（push/tag 不会二次触发）。构建失败时不会产生
 # 任何 commit / tag / release（commit+tag 在构建成功后才执行）。
@@ -40,11 +41,13 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+env:
+  # 与 FindFFmpeg/CMakeLists 的 FFmpeg 闭包安装规则配套;各 job 内转换成正斜杠使用
+  FFMPEG_SUBDIR: ffmpeg-n9.0-latest-win64-gpl-shared-9.0
+
 jobs:
   release:
     # windows-2022（VS 2022）而非 windows-latest：锁定镜像避免 runner VS 版本漂移。
-    # CUDA 13.3 的 VS 集成同时支持 VS 2022 与 VS 18 2026（本地已用 VS 18 2026 验证过
-    # CMake 构建，windows-latest 也能过），但发布流水线用固定镜像更可复现。
     # decord.dll 的 CUDA（cudart/NVDEC/NVML/驱动 API）全部运行时动态加载（nv_gpu_dyn），
     # 构建工具链版本不影响产物 —— 导入表只有 FFmpeg + VC 运行库。
     runs-on: windows-2022
@@ -86,7 +89,7 @@ jobs:
         run: |
           # 0.8.1：无 CUDA Toolkit —— USE_CUDA=ON 仅启用混合解码（驱动 API
           # 运行时动态加载 + 内嵌 PTX kernel），不再需要 CUDA_PATH。
-          $ffmpegDir = (Resolve-Path "ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0").Path
+          $ffmpegDir = (Resolve-Path "ffmpeg/$env:FFMPEG_SUBDIR").Path -replace '\\', '/'
           Write-Host "FFMPEG: $ffmpegDir"
           cmake -S . -B build -DUSE_CUDA=ON -DFFMPEG_DIR="$ffmpegDir" -DCMAKE_BUILD_TYPE=Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -158,34 +161,6 @@ jobs:
           git push origin "v$ver"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # wheel 必须在版本 bump 之后构建，文件名/元数据才是 v<版本>。
-      # scikit-build-core 走 PEP 517 隔离构建（自动拉 scikit-build-core/cmake/ninja）；
-      # Ninja 生成器需要 cl 在 PATH，msvc-dev-cmd 负责注入 vcvars 环境。
-      # [tool.scikit-build] 在 SKBUILD+WIN32 下默认 USE_CUDA=ON，无需显式传。
-      - name: Setup MSVC for pip wheel
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Build pip wheel
-        shell: pwsh
-        env:
-          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0
-        run: |
-          # github.workspace 是反斜杠路径,混入 CMake install 字符串会被当
-          # 转义序列("Invalid character escape '\a'"),统一转正斜杠
-          $env:FFMPEG_DIR = $env:FFMPEG_DIR -replace '\\', '/'
-          pip wheel . --no-deps -w dist
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Get-ChildItem dist
-          # 闭包自检：wheel 内必须恰好是 decord.dll + 6 个 FFmpeg DLL，
-          # 不允许 avdevice/ffprobe/其它大版本系列混入
-          $names = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path "dist/*.whl")).Entries.FullName
-          $dlls = $names | Where-Object { $_ -match '^decord/[^/]+\.dll$' } | ForEach-Object { Split-Path $_ -Leaf } | Sort-Object
-          $expected = @('avcodec-63.dll','avfilter-12.dll','avformat-63.dll','avutil-61.dll','decord.dll','swresample-7.dll','swscale-10.dll')
-          if ((Compare-Object $dlls $expected).Count -ne 0) {
-            Write-Error "wheel DLL 闭包与预期不符: $($dlls -join ', ')"
-            exit 1
-          }
-
       - name: Generate release notes
         id: notes
         shell: pwsh
@@ -207,7 +182,7 @@ jobs:
         shell: pwsh
         run: |
           $ver = "${{ inputs.version }}"
-          $ffmpegBin = "ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0/bin"
+          $ffmpegBin = "ffmpeg/$env:FFMPEG_SUBDIR/bin"
           # 布局 = RaceVideoToLog 的 _decord_build/（setup_venv.bat 直接解压拷贝）
           $stage = "_decord_build"
           New-Item -ItemType Directory -Path "$stage/python" -Force | Out-Null
@@ -219,12 +194,119 @@ jobs:
           Write-Host "zip contents:"
           Get-ChildItem -Recurse $stage | ForEach-Object { $_.FullName.Replace("$PWD\", "") }
 
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-zip
+          path: decord-${{ inputs.version }}-win64-gpu.zip
+          retention-days: 1
+
+      - name: Upload notes artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes.md
+          retention-days: 1
+
+  wheels:
+    # pip wheel 矩阵：checkout release job 已推送的 tag(与 zip 完全同源)。
+    # 每个 Python 版本独立 runner 并行构建;scikit-build-core 走 PEP 517 隔离
+    # 构建(自动拉 scikit-build-core/cmake/ninja)。3.14 为前瞻版本,失败不阻塞
+    # 发布(continue-on-error)。
+    needs: release
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    continue-on-error: ${{ matrix.python-version == '3.14' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ inputs.version }}
+          submodules: recursive
+
+      - name: Setup MSVC for pip wheel
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download FFmpeg 9.0 (shared)
+        shell: pwsh
+        run: |
+          $ffmpegZip = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip"
+          curl -L -o ffmpeg.zip $ffmpegZip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg
+
+      - name: Build pip wheel
+        shell: pwsh
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg/${{ env.FFMPEG_SUBDIR }}
+        run: |
+          # github.workspace 是反斜杠路径,混入 CMake install 字符串会被当
+          # 转义序列("Invalid character escape '\a'"),统一转正斜杠
+          $env:FFMPEG_DIR = $env:FFMPEG_DIR -replace '\\', '/'
+          pip wheel . --no-deps -w dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+          # 闭包自检：wheel 内必须恰好是 decord.dll + 6 个 FFmpeg DLL，
+          # 不允许 avdevice/ffprobe/其它大版本系列混入
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $names = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path "dist/*.whl")).Entries.FullName
+          $dlls = $names | Where-Object { $_ -match '^decord/[^/]+\.dll$' } | ForEach-Object { Split-Path $_ -Leaf } | Sort-Object
+          $expected = @('avcodec-63.dll','avfilter-12.dll','avformat-63.dll','avutil-61.dll','decord.dll','swresample-7.dll','swscale-10.dll')
+          if ((Compare-Object $dlls $expected).Count -ne 0) {
+            Write-Error "wheel DLL 闭包与预期不符: $($dlls -join ', ')"
+            exit 1
+          }
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.python-version }}
+          path: dist/*.whl
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    # 汇总发布:zip + 全部 wheel 一次创建 Release。核心版本(3.9–3.13)任一
+    # 失败则 wheels 失败、本 job 不执行(不出半成品 release);3.14 可选。
+    needs: [release, wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download zip + notes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: .
+          merge-multiple: true
+
       - name: Create GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $whl = (Get-ChildItem "dist/*.whl").FullName
-          gh release create "v${{ inputs.version }}" "decord-${{ inputs.version }}-win64-gpu.zip" "$whl" `
-            --title "decord v${{ inputs.version }}" `
-            --notes-file notes.md
+          $ver = "${{ inputs.version }}"
+          Get-ChildItem dist
+          $whls = (Get-ChildItem "dist/*.whl").FullName
+          # 幂等:Release 已存在(重跑)则只补传文件
+          if (gh release view "v$ver" 2>$null) {
+            gh release upload "v$ver" "decord-$ver-win64-gpu.zip" @whls --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            gh release create "v$ver" "decord-$ver-win64-gpu.zip" @whls `
+              --title "decord v$ver" `
+              --notes-file notes.md
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
