@@ -357,9 +357,12 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
     // （实测 hevc 16 chunks 全部 rc-unknown，退化为 CPU 主导 667fps）。
     {
         auto now = std::chrono::steady_clock::now();
+        static const bool rdbg = getenv("DECORD_CPU_RATE_DEBUG") != nullptr;
         if (last_prod_tp_.time_since_epoch().count() != 0) {
             double dt = std::chrono::duration<double>(now - last_prod_tp_).count();
             if (dt > 0.05) {
+                if (rdbg) fprintf(stderr, "[rate] RESET dt=%.0fms seg=%lld\n",
+                                  dt * 1000, (long long)prod_seg_frames_);
                 prod_seg_frames_ = 0;
                 prod_seg_secs_ = 0.0;
             } else if (dt > 1e-6) {
@@ -370,6 +373,10 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
                     double prev = prod_rate_.load(std::memory_order_relaxed);
                     prod_rate_.store(prev > 0 ? 0.5 * prev + 0.5 * r : r,
                                      std::memory_order_relaxed);
+                if (rdbg) fprintf(stderr, "[rate] FOLD t=%.3f r=%.0f rate=%.0f\n",
+                                  std::chrono::duration<double>(
+                                      std::chrono::steady_clock::now().time_since_epoch()).count(),
+                                  r, prod_rate_.load());
                     prod_seg_frames_ = 0;
                     prod_seg_secs_ = 0.0;
                 }

@@ -235,8 +235,45 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::size_t ReadyCap() const;
     /*! \brief 硬件自适应预算计算（空闲显存/内存 → 各池深/队列/prefetch） */
     void ComputeBudgets();
-    /*! demux 领先深度建议（自适应预算计算结果） */
-    int SuggestPrefetchDepth() const override { return prefetch_frames_; }
+    /*! \brief demux 领先深度建议（自适应预算计算结果）。
+     *  盲阶段（双侧速率未就绪，sched_initialized_ 未置位）收缩到
+     *  ~2 chunks：demux 全速领先（千余包瞬时入队）会让十几个 chunk
+     *  的路由决策跑在速率学习之前 —— hevc 实测 13 chunks 全部
+     *  rc-unknown 盲采 CPU（90% 帧量），water-filling 上线前流已
+     *  耗尽（混跑 1042 vs 纯 GPU 1836）。收缩后决策随发射实时
+     *  推进，首个 CPU-sample chunk 的段速率（16 帧首折）就位后
+     *  即转入稳态全深。 */
+    int SuggestPrefetchDepth() const override {
+        if (!sched_initialized_) {
+            const int est = static_cast<int>(est_chunk_frames_);
+            const int blind = est > 0 ? 2 * est + 64 : 640;
+            return std::min(prefetch_frames_, blind);
+        }
+        return prefetch_frames_;
+    }
+    /*! 重试推包门控：side_pending_（两侧在途帧，kick 计入、发射/陈旧
+     *  丢弃逐帧核销）是精确在途 —— VideoReader 的包账目因 hybrid 侧
+     *  丢弃永久虚高不可用（D3 教训），而重试无条件推包会让 demux 以
+     *  消费轮询速度跑到解码前面（hevc 实测 10 决策/50ms 全部盲分
+     *  CPU）。窗口必须 ≥ 两侧满库存之和（CPU queue + GPU ready +
+     *  上载容器 + 池在途）：块交替下两侧库存都会顶到各自上限，窗口
+     *  偏小会把 front chunk 后续的包拦死（发射顺序串行 → 死锁，
+     *  hybrid_gpu hevc 实测 1500 帧处挂死）。盲阶段收缩到 ~2 chunks
+     *  让路由决策随发射推进、速率学习先于决策就位。 */
+    bool NeedsPackets() const override {
+        if (eof_pushed_) return false;
+        const int64_t inflight = side_pending_[0] + side_pending_[1];
+        if (!sched_initialized_) {
+            const int est = static_cast<int>(est_chunk_frames_);
+            const int64_t blind = est > 0 ? 2 * est + 64 : 640;
+            return inflight < std::min<int64_t>(
+                       static_cast<int64_t>(prefetch_frames_)
+                           + queue_frames_ + ready_cap_frames_ + 512,
+                       blind);
+        }
+        return inflight < static_cast<int64_t>(prefetch_frames_)
+                          + queue_frames_ + ready_cap_frames_ + 512;
+    }
 
 #ifdef DECORD_USE_CUDA
     /*! \brief GPU 输出缓冲池（有界，阻塞 Acquire）。声明在 gpu_ 之前：

@@ -52,6 +52,15 @@ class ThreadedDecoderInterface {
          *  VideoReader 取 max(env 基线, 本值) —— 深度是离峰生产的前提，
          *  由解码器按其自适应预算给出。 */
         virtual int SuggestPrefetchDepth() const { return 0; }
+        /*! 解码器是否真的需要更多 demux 包（默认恒真 = 旧行为）。
+         *  NextFrameImpl 的重试推包用它门控：hybrid 侧丢弃的帧
+         *  （stale-drop/kick 陈旧帧）永不计入 VideoReader 的
+         *  frames_popped_，其 pkts_pushed_-frames_popped_ 在途账目
+         *  只会单调虚高（不可用于限流，D3 教训）；而 hybrid 内部的
+         *  side_pending_ 逐包递增、发射/丢弃逐帧核销，是精确在途。
+         *  无条件重试推包曾以消费轮询速度把 demux 拉到解码前面
+         *  10+ chunks —— 盲阶段路由决策全部跑在速率学习之前。 */
+        virtual bool NeedsPackets() const { return true; }
         virtual void SuggestDiscardPTS(std::vector<int64_t> dts) = 0;
         virtual void ClearDiscardPTS() = 0;
         virtual ~ThreadedDecoderInterface() = default;

@@ -842,14 +842,23 @@ NDArray VideoReader::NextFrameImpl() {
     int rewind_offset = 0;
     int retry = 0;
     while (!ret) {
-        // 无条件 PushNext（账目完整性依赖）：不能用 pkts_pushed_-
-        // frames_popped_ 做推包限流 —— hybrid 会解码侧丢弃陈旧帧
-        // （stale-drop/discard_pts），丢掉的帧永不计入 frames_popped_，
-        // 在途计数永久虚高会把文件尾真包拦死（实测 seek 错位 + EOF
-        // 排空耗尽 FATAL）。EOF 语义污染的原始触发路径（dav1d CPU 块
-        // 断流滞留）已由 AV1 零 CPU 块根治，此处保持旧语义。
-        PushNext();
-        ++pkts_pushed_;  // prefetch accounting: every pushed packet counts
+        // 无条件 PushNext 的账目问题（D3 历史）由 decoder 侧精确在途
+        // 计数解决：hybrid 的 pkts_pushed_-frames_popped_ 因侧丢弃
+        // 永久虚高不可用于限流，但 side_pending_（逐包递增/发射丢弃
+        // 核销）精确。按 NeedsPackets 门控重试推包 —— 无条件版曾以
+        // 消费轮询速度把 demux 拉到解码前面 10+ chunks，盲阶段路由
+        // 决策全部跑在速率学习之前（hevc 混跑 1042 vs 纯 GPU 1836）。
+        // 非 hybrid 解码器 NeedsPackets 恒真，行为不变。
+        if (decoder_->NeedsPackets()) {
+            PushNext();
+            ++pkts_pushed_;  // prefetch accounting: every pushed packet counts
+        } else if (!eof_) {
+            // 门控未推包且 Pop 空手：让出式自旋等生产推进。不能睡 ——
+            // 1ms 睡眠把帧交付量子化到 ≤500fps（CPU 实时段 1.4ms/帧，
+            // 轮询+睡变成 2ms/帧，hevc 实测 1304→487）；纯自旋在 32 核
+            // 机器上也不伤（消费仅 1 核，实测 1304fps），yield 更礼貌。
+            std::this_thread::yield();
+        }
         if (curr_frame_ >= GetFrameCount()) {
             return NDArray::Empty({}, kUInt8, out_ctx_);
         }

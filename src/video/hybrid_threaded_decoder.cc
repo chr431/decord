@@ -244,6 +244,9 @@ void HybridThreadedDecoder::ComputeBudgets() {
     // demux 领先必须同时覆盖两路存货（CPU queue + GPU ready）+ 余量：
     // 否则两路分食领先窗口互相饿（CPU 块发射期 GPU 拿不到包只能空转，
     // av1 6000 帧实测退化到 836fps）。压缩包驻留 RAM 仅 ~17KB/帧。
+    // 注意：深度本身不是混跑损耗的调节旋钮（hevc 1678/2600/3500/4800
+    // 实测平坦）—— 决策质量由 NeedsPackets 的盲阶段节拍控制，见
+    // SuggestPrefetchDepth/NeedsPackets 注释。
     prefetch_frames_ = clampi(queue_frames_ + ready_cap_frames_ + 128,
                               192, 3072);
     if (codec_id_ == AV_CODEC_ID_AV1) {
@@ -253,6 +256,9 @@ void HybridThreadedDecoder::ComputeBudgets() {
         // 全 GPU 后 384 领先对吞吐无约束（发射吃 NVDEC 实时速率）。
         prefetch_frames_ = std::min(prefetch_frames_, 384);
     }
+    // 诊断/实验直控（绕过公式与 AV1 钳制）
+    if (const char *e = getenv("DECORD_HYBRID_PREFETCH"))
+        if (atoi(e) > 0) prefetch_frames_ = atoi(e);
 
     if (getenv("DECORD_HYBRID_DEBUG")) {
         fprintf(stderr, "[hybrid-budget] vram=%.0fMB ram=%.0fMB pool=%d up=%d queue=%d ready=%d prefetch=%d\n",
@@ -597,7 +603,9 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // GPU，采样安全（旧版曾因水位门控屏蔽速率学习把整条流钉死 CPU）。
     if (rate[SIDE_CPU] <= 0) {
         if (getenv("DECORD_HYBRID_DEBUG")) {
-            fprintf(stderr, "[hybrid-sched] key=%lld rc-unknown -> CPU-sample\n",
+            fprintf(stderr, "[hybrid-sched] t=%.3f key=%lld rc-unknown -> CPU-sample\n",
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count(),
                     (long long)key_pts);
         }
         return SIDE_CPU;
@@ -642,6 +650,26 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
                             + alloc_frames_[1]) + est) * rate[SIDE_CPU] / tot;
     Side chosen = (static_cast<double>(alloc_frames_[SIDE_CPU]) <= want_cpu)
                       ? SIDE_CPU : SIDE_GPU;
+    // GPU 领先硬顶（决策级）：GPU 在途帧（已路由未发射）超过上限时
+    // 强制下一 chunk 给 CPU。超过部分毫无吞吐意义 —— 喂包闸关死后
+    // 只是压缩包在宿主队列堆积；更致命的是它会占满 demux 在途窗口，
+    // 把后续 CPU chunk 的包拦在门外 —— dav1d 的 CPU 块尾帧（~8-16 帧
+    // 滞留）必须由下一个 CPU chunk 的包穿过同一解码器才冲出，GPU
+    // 领先无界 = 前块永久缺帧 + 消费端死等（av1 lockstep 实测 11 帧
+    // 缺口 + GPU 领先 2323 死锁）。water-filling 赤字会连续选 GPU，
+    // 块预算顶不住，必须在此决策点强制。上限 = 在途窗口（prefetch+
+    // queue+ready+512，NeedsPackets 口径）− CPU 侧不可避免库存
+    //（queue + 上载容器）− 256 余量：既不发生窗口内死锁，又保留
+    // hevc/h264 深领先带来的长 GPU 块收益（av1 lockstep 死锁阈值
+    // 实测 ~2330 = 窗口 2350）。
+    {
+        const int64_t gpu_cap = static_cast<int64_t>(prefetch_frames_)
+            + ready_cap_frames_ + 248
+            - (out_cuda_ ? up_pool_frames_ : 0);
+        if (gpu_pending_ > gpu_cap) {
+            chosen = SIDE_CPU;
+        }
+    }
     // 粘性：同侧连续分配不足 sticky_budget 个 chunk 估计帧数则不切。
     // 下界 2 chunks：逐 chunk 交替让 CPU 侧频繁断流（dav1d 帧并行
     // 反复冷启动，有效速率掉到满速 ~1/4）；上界受 CPU 存货深度约束：
@@ -655,10 +683,17 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // GPU 生产、GPU 块发射期 CPU 攒存货 —— GPU 块过短会把 CPU 的攒货
     // 窗口压扁，CPU 块尾段退化为实时跟随（对称 768/768 块实测 av1
     // 1424fps < 全 GPU 1520）。上限 12 chunks 防极端比率。
+    // ready 容量硬顶：GPU 领先超过 ready_+池 的部分只是压缩包在宿主
+    // 队列堆积（喂包闸关死，进不了解码器）。且 dav1d 的 CPU 块尾帧
+    // （~8-16 帧滞留）要等下一个 CPU chunk 的包穿过同一解码器才冲出
+    // —— GPU 领先无界时在途窗口被 GPU 包占满，那些包永远推不进来
+    //（av1 lockstep 实测 11 帧缺口 + GPU 领先 2323 死锁）。
     const int64_t gpu_budget = std::min<int64_t>(
-        12 * est,
-        std::max<int64_t>(cpu_budget, static_cast<int64_t>(
-            cpu_budget * rate[SIDE_GPU] / std::max(rate[SIDE_CPU], 1.0))));
+        std::min<int64_t>(
+            12 * est,
+            std::max<int64_t>(cpu_budget, static_cast<int64_t>(
+                cpu_budget * rate[SIDE_GPU] / std::max(rate[SIDE_CPU], 1.0)))),
+        static_cast<int64_t>(ready_cap_frames_) + 128);
     const int64_t sticky_budget =
         cur_side_ == SIDE_CPU ? cpu_budget : gpu_budget;
     if (chosen != cur_side_
