@@ -170,6 +170,9 @@ jobs:
         env:
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0
         run: |
+          # github.workspace 是反斜杠路径,混入 CMake install 字符串会被当
+          # 转义序列("Invalid character escape '\a'"),统一转正斜杠
+          $env:FFMPEG_DIR = $env:FFMPEG_DIR -replace '\\', '/'
           pip wheel . --no-deps -w dist
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem dist

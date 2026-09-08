@@ -187,7 +187,11 @@ install(TARGETS decord
 # 的其它大版本系列一律不进 wheel。swscale 不在 decord.dll 直接导入表,但
 # avfilter 传递依赖它(BtbN/gyan 共享构建均如此),必须一并携带。
 if(WIN32 AND FFMPEG_DIR)
-  install(DIRECTORY "${FFMPEG_DIR}/bin/"
+  # 归一化为 CMake 路径:FFMPEG_DIR 可能来自环境变量/CI(如 D:\a\decord\decord),
+  # 反斜杠直接拼进 install() 会在生成的 cmake_install.cmake 里被当转义序列
+  # 解析("Invalid character escape '\a'")。
+  file(TO_CMAKE_PATH "${FFMPEG_DIR}" DECORD_FFMPEG_BIN)
+  install(DIRECTORY "${DECORD_FFMPEG_BIN}/bin/"
     DESTINATION ${DECORD_INSTALL_LIBDIR}
     FILES_MATCHING
     PATTERN "avcodec-*.dll"
