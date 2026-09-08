@@ -296,6 +296,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}  # publish job 无 checkout,gh 需显式指定仓库
         run: |
           $ver = "${{ inputs.version }}"
           Get-ChildItem dist
