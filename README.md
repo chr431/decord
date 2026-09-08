@@ -117,7 +117,7 @@ PYTHONPATH=python python -c "import decord; print(decord.__version__, decord.__f
 import decord
 from decord import VideoReader, cpu, gpu
 
-print(decord.__version__, decord.__ffmpeg_version__)   # 0.7.14 9.0.x
+print(decord.__version__, decord.__ffmpeg_version__)   # 0.8.0 9.0.x
 
 vr = VideoReader('examples/flipping_a_pancake.mkv', ctx=cpu(0))
 # 文件对象也可以（内存内解码）
@@ -214,7 +214,7 @@ decord.bridge.set_bridge('torch')    # 'mxnet' | 'torch' | 'tensorflow' | 'nativ
 ## hybrid 混合解码（实验性）
 
 `decord.hybrid(dev_id)`（输出落主机内存）与 `decord.hybrid_gpu(dev_id)`（帧驻留显存）
-把**一路 demux 码流在关键帧边界切成块**，按实测产率比例（water-filling）分给 CPU 软解
+把**一路 demux 码流在关键帧边界切成块**，按"最少剩余工作量"（实测产率 + 实时在途）分给 CPU 软解
 （FFmpeg，多帧并行）与 NVDEC（CUVID），两侧并行解码、按呈现序合并发射：
 
 - 调度器在线学习两侧产率（CPU 侧为 filter 后有效产出，GPU 侧为落地速率 EWMA），
@@ -301,7 +301,8 @@ shared，1080p，`output_format='yuv420'`，`get_batch` 每批 250 帧顺序读�
 | `DECORD_BATCH_BUF_POOL` / `DECORD_BATCH_BUF_POOL_MAX` | 1 / 2 | get_batch 批缓冲池开关与保留块数 |
 | `DECORD_BATCH_COPY_WORKERS` | 2–4 自动 | 批拷贝工作线程（`0` 恢复串行拷贝） |
 | `DECORD_DISABLE_INDEX_CACHE` | 未设 | 设后禁用关键帧索引磁盘缓存（默认写系统缓存目录） |
-| `DECORD_HYBRID_VRAM_BUDGET_MB` / `DECORD_HYBRID_RAM_BUDGET_MB` | 空闲量 ×30% | hybrid 显存/内存硬预算（覆盖自动值） |
+| `DECORD_HYBRID_VRAM_BUDGET_MB` / `DECORD_HYBRID_RAM_BUDGET_MB` | 空闲量 ×0.65 / ×0.45 | hybrid 显存/内存硬预算（覆盖自动值） |
+| `DECORD_HYBRID_PINNED_POOL` | 1 | CPU-out 的 pinned 主机帧池（D2H 直达；`0` 回退暂存路径） |
 | `DECORD_PREFETCH_DEPTH_HYBRID` | 384 | hybrid demux 领先基线（实际取 max(此值, 解码器建议)） |
 | `DECORD_EOF_RETRY_MAX` / `DECORD_REWIND_RETRY_MAX` | 10240 / 16 | 损坏流容错的 EOF/回退重试上界 |
 
@@ -326,8 +327,8 @@ shared，1080p，`output_format='yuv420'`，`get_batch` 每批 250 帧顺序读�
 - CPU 管线：NV12 直出（filter `format=nv12` + 两次 memcpy 打包）替代标量 U/V 交错
   循环；解码线程默认随物理核扩展（clamp 2–16）。
 - NVDEC：每帧 CUDA event 同步替代全流同步；D2H 异步环；上载批量化（批末单 sync）。
-- hybrid：调度按实测产率 water-filling；demux 决策节拍与速率学习解耦；GPU 领先
-  硬顶防 dav1d 尾帧死锁；批量 H2D 上载。
+- hybrid：least-remaining-work 调度 + 库存帽按产率比分账 + pinned 帧池 D2H 直达；
+  demux 决策节拍与速率学习解耦；GPU 领先硬顶防 dav1d 尾帧死锁。
 
 **正确性**
 
@@ -359,7 +360,7 @@ python tests/test_hybrid_lockstep.py 600     # 混跑字节级交错对照
 
 版本事实源为 `python/decord/_ffi/libinfo.py` 的 `__version__`（`pyproject.toml` 同步，
 用 `python tools/update_version.py` 统一更新）。发布走 GitHub Actions → **Release** →
-Run workflow：填版本号（如 `0.7.14`）与 ref（默认 `master`），workflow 自动 bump 版本 →
+Run workflow：填版本号（如 `0.8.0`）与 ref（默认 `master`），workflow 自动 bump 版本 →
 tag `vX.Y.Z` → CUDA + FFmpeg 9.0 构建 → 打包 `decord-<ver>-win64-gpu.zip` → 创建
 Release。构建失败不产生任何 commit/tag/release。tag push 不触发 PyPI 发布（已移除）。
 

@@ -126,7 +126,7 @@ forward slashes on Windows), `-DFFMPEG_DIR=...`,
 import decord
 from decord import VideoReader, cpu, gpu
 
-print(decord.__version__, decord.__ffmpeg_version__)   # 0.7.14 9.0.x
+print(decord.__version__, decord.__ffmpeg_version__)   # 0.8.0 9.0.x
 
 vr = VideoReader('examples/flipping_a_pancake.mkv', ctx=cpu(0))
 # a file-like object works as well (in-memory decoding)
@@ -232,7 +232,7 @@ decord.bridge.set_bridge('torch')    # 'mxnet' | 'torch' | 'tensorflow' | 'nativ
 (frames resident in VRAM) split **a single demux stream into chunks at keyframe
 boundaries**, assign them to the CPU software decoder (FFmpeg, frame-parallel)
 and NVDEC (CUVID) proportionally to their measured production rates
-(water-filling), decode both sides concurrently and emit frames in presentation
+(least-remaining-work), decode both sides concurrently and emit frames in presentation
 order:
 
 - The scheduler learns both production rates online (CPU side: post-filter
@@ -329,7 +329,8 @@ Commonly used (all optional; adaptive defaults apply when unset):
 | `DECORD_BATCH_BUF_POOL` / `DECORD_BATCH_BUF_POOL_MAX` | 1 / 2 | get_batch batch-buffer pool switch and retained blocks |
 | `DECORD_BATCH_COPY_WORKERS` | auto 2–4 | batch copy worker threads (`0` restores serial copies) |
 | `DECORD_DISABLE_INDEX_CACHE` | unset | set to disable the on-disk keyframe index cache (system cache dir by default) |
-| `DECORD_HYBRID_VRAM_BUDGET_MB` / `DECORD_HYBRID_RAM_BUDGET_MB` | 30% of free | hybrid VRAM/RAM hard budgets (override auto) |
+| `DECORD_HYBRID_VRAM_BUDGET_MB` / `DECORD_HYBRID_RAM_BUDGET_MB` | 0.65 / 0.45 of free | hybrid VRAM/RAM hard budgets (override auto) |
+| `DECORD_HYBRID_PINNED_POOL` | 1 | pinned host frame pool for CPU-out (direct D2H; `0` = staging fallback) |
 | `DECORD_PREFETCH_DEPTH_HYBRID` | 384 | hybrid demux lead baseline (effective value = max(this, decoder suggestion)) |
 | `DECORD_EOF_RETRY_MAX` / `DECORD_REWIND_RETRY_MAX` | 10240 / 16 | EOF/rewind retry bounds for corrupted-stream tolerance |
 
@@ -359,7 +360,8 @@ renovation), by theme:
   cores by default (clamp 2–16).
 - NVDEC: per-frame CUDA event sync instead of full-stream sync; async D2H ring;
   batched H2D upload (one sync per batch).
-- Hybrid: water-filling scheduling on measured rates; demux decision pacing
+- Hybrid: least-remaining-work scheduling + rate-proportional inventory caps +
+  pinned-frame-pool direct D2H; demux decision pacing
   decoupled from rate learning; GPU-lead hard cap preventing dav1d tail-frame
   deadlocks; batched H2D upload.
 
@@ -401,7 +403,7 @@ python tests/test_hybrid_lockstep.py 600     # byte-exact interleaved hybrid che
 The version source of truth is `__version__` in
 `python/decord/_ffi/libinfo.py` (`pyproject.toml` kept in sync; update both via
 `python tools/update_version.py`). Releases run from GitHub Actions →
-**Release** → Run workflow: provide the version (e.g. `0.7.14`) and ref
+**Release** → Run workflow: provide the version (e.g. `0.8.0`) and ref
 (default `master`); the workflow bumps the version → tags `vX.Y.Z` → builds
 with CUDA + FFmpeg 9.0 → packages `decord-<ver>-win64-gpu.zip` → creates the
 Release. A failed build produces no commit/tag/release. Tag pushes do not
