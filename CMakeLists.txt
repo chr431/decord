@@ -24,7 +24,7 @@ decord_option(USE_MSVC_MT "Build with MT" OFF)
 
 # Project
 if(USE_CUDA)
-project(decord C CXX CUDA)
+project(decord C CXX)
 endif(USE_CUDA)
 
 # include directories
@@ -111,7 +111,7 @@ endif()
 
 # Targets
 
-add_library(decord SHARED ${DECORD_CORE_SRCS} ${DECORD_FFMPEG_SRCS} ${NVDEC_SRCS} ${RUNTIME_CUDA_SRCS} ${NVDEC_CUDA_SRCS})
+add_library(decord SHARED ${DECORD_CORE_SRCS} ${DECORD_FFMPEG_SRCS} ${NVDEC_SRCS} ${RUNTIME_CUDA_SRCS})
 
 # Windows: copy the FFmpeg runtime DLLs next to the built decord.dll so the
 # development build runs out of the box (libinfo.py loads decord.dll from
