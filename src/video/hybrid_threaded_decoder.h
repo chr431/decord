@@ -38,16 +38,50 @@
 
 #include <atomic>
 #include <functional>
-#include <functional>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <vector>
 
 namespace decord {
 
 #ifdef DECORD_USE_CUDA
+/*!
+ * \brief pinned 主机帧池（CPU-out 落地专用）：cudaHostAlloc 块经
+ *  NDArray::FromRecycled 包装，D2H 直达最终帧 —— 替代"pinned 暂存 +
+ *  每帧 Empty 分配 + memcpy"的旧三步落地（每帧 ~0.3ms memcpy +
+ *  3.1MB 分配器churn）。池尽 = LandStep 背压（回退旧路径无需）。
+ *  块由 deleter 归还复用；尺寸不匹配（ROI 重建）的旧块直接释放。
+ */
+class PinnedHostFramePool
+        : public std::enable_shared_from_this<PinnedHostFramePool> {
+  public:
+    void Reset(std::size_t max_cap, std::size_t frame_bytes,
+               std::vector<int64_t> shape);
+    bool Acquire(runtime::NDArray *out);   ///< 非阻塞；false = 池尽/禁用
+    bool Enabled() const { return max_cap_ > 0 && !disabled_; }
+    std::size_t frame_bytes() const { return bytes_; }
+    void MarkDisabled() { disabled_ = true; }
+
+  private:
+    struct Holder {
+        std::shared_ptr<PinnedHostFramePool> pool;
+        void *data;
+        std::size_t bytes;
+    };
+    static void ReturnDeleter(runtime::NDArray::Container *self);
+    void Return(void *data, std::size_t bytes);
+    std::mutex mtx_;
+    std::deque<void *> free_;
+    std::size_t created_ = 0;
+    std::size_t cap_ = 0;       ///< 当前允许的已建块数（耗尽翻倍）
+    std::size_t max_cap_ = 0;
+    std::size_t bytes_ = 0;
+    bool disabled_ = false;
+    std::vector<int64_t> shape_;
+};
 /*!
  * \brief 有界 GPU 缓冲池（混合解码器专用）：固定 cap 块输出缓冲，
  *  Acquire 空时阻塞（等待落地线程回收），绝不超额分配 —— 显存占用的
@@ -165,8 +199,13 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief GPU 帧搬到主机内存（布局两侧逐字节一致，整块 D2H） */
     static runtime::NDArray ToHost(const runtime::NDArray &gpu_frame);
 #ifdef DECORD_USE_CUDA
-    /*! \brief GPU 工作线程主循环：落地（LandStep）+ 喂包（FeedStep） */
+    /*! \brief 落地线程主循环：只做 LandStep（NVDEC 收帧 → D2H → ready_） */
     void GpuWorkerLoop();
+    /*! \brief 喂包线程主循环：只做 FeedStep。与落地分离 —— FeedStep 极
+     *  廉价但旧实现与 LandStep（含 3.1MB/帧 D2H 收割 memcpy）串行，落地
+     *  1500fps 时单线程循环率 ~2200/s 已在 NVDEC 供包临界（1868/s），
+     *  落地越忙喂包越饿，rg 被压到 ~1400（独跑 1868）。 */
+    void FeederLoop();
     /*! \brief 落地一步：ready_ 有余量才 gpu_->Pop → D2H → ready_。
      *  持续排空 NVDEC 输出队列是显存有界的关键（reorder 无界堆积即
      *  7.7GB 峰值/OOM 的根因）。返回是否做了实际工作。 */
@@ -204,9 +243,14 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     runtime::NDArray d2h_host_[kD2HRingSlots];  ///< 目标宿主帧（保活）
     runtime::NDArray d2h_gpu_[kD2HRingSlots];   ///< 源 GPU 帧（事件前不回池）
     bool d2h_valid_[kD2HRingSlots] = {};
+    bool d2h_pooled_[kD2HRingSlots] = {};  ///< host 帧来自 pinned 池（收割零拷贝）
     int64_t d2h_seq_ = 0;
     std::size_t d2h_bytes_ = 0;
     void *d2h_stream_ = nullptr;   ///< D2H 专用非阻塞流（与 NVDEC 流并行）
+    /*! \brief pinned 主机帧池（CPU-out）：D2H 直达最终帧，消除暂存
+     *  memcpy + 每帧 Empty 分配。池深随 ready 预算（自适应上限），
+     *  池尽 = 背压；cudaHostAlloc 失败自动降级回暂存路径。 */
+    std::shared_ptr<PinnedHostFramePool> pinned_pool_;
     /*! \brief 冲刷 D2H 环（marker 前保序 / Stop 前）：收割全部在途帧
      *  入 ready_。ready_ 满时容忍越界（软限，仅 EOF 尾部发生）。 */
     void FlushD2H();

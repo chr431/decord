@@ -97,6 +97,73 @@ HybridThreadedDecoder::~HybridThreadedDecoder() {
 }
 
 #ifdef DECORD_USE_CUDA
+// ── PinnedHostFramePool：D2H 直达最终帧的 pinned 主机帧池 ──
+void PinnedHostFramePool::Reset(std::size_t max_cap, std::size_t frame_bytes,
+                                std::vector<int64_t> shape) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    // 旧尺寸块解除复用（在途块由 deleter 归还时按尺寸直接释放）
+    while (!free_.empty()) {
+        cudaFreeHost(free_.front());
+        free_.pop_front();
+    }
+    max_cap_ = max_cap;
+    cap_ = std::min<std::size_t>(max_cap, 64);  // 起步小池，耗尽翻倍
+    bytes_ = frame_bytes;
+    shape_ = std::move(shape);
+}
+
+bool PinnedHostFramePool::Acquire(runtime::NDArray *out) {
+    if (disabled_ || max_cap_ == 0 || bytes_ == 0) return false;
+    void *p = nullptr;
+    bool need_alloc = false;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (!free_.empty()) {
+            p = free_.front();
+            free_.pop_front();
+        } else if (created_ < cap_) {
+            ++created_;
+            need_alloc = true;
+        } else if (cap_ < max_cap_) {
+            cap_ = std::min<std::size_t>(cap_ * 2, max_cap_);
+            ++created_;
+            need_alloc = true;
+        }
+        // else：池尽 → 背压（p 保持 null）
+    }
+    if (need_alloc) {
+        if (cudaHostAlloc(&p, bytes_, cudaHostAllocDefault) != cudaSuccess) {
+            // OOM/权限：禁用池，永久回退暂存路径（正确性优先）
+            std::lock_guard<std::mutex> lk(mtx_);
+            --created_;
+            disabled_ = true;
+            return false;
+        }
+    }
+    if (p == nullptr) return false;
+    Holder *h = new Holder{shared_from_this(), p, bytes_};
+    *out = runtime::NDArray::FromRecycled(p, shape_, kUInt8,
+                                          DLDevice{kDLCPU, 0},
+                                          &ReturnDeleter, h);
+    return true;
+}
+
+void PinnedHostFramePool::ReturnDeleter(runtime::NDArray::Container *self) {
+    auto *h = static_cast<Holder *>(self->manager_ctx);
+    h->pool->Return(h->data, h->bytes);
+    delete h;
+    delete self;
+}
+
+void PinnedHostFramePool::Return(void *data, std::size_t bytes) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!disabled_ && bytes == bytes_ && free_.size() < max_cap_) {
+        free_.push_back(data);
+    } else {
+        cudaFreeHost(data);
+    }
+}
+
 void HybridGpuBufferPool::Reset(
         std::size_t cap, std::vector<int64_t> shape, DLDataType dtype, DLDevice dev) {
     std::lock_guard<std::mutex> lk(mtx_);
@@ -334,6 +401,24 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
             // 显存帧容器，独立于 GPU 解码池（防饿死）
             up_pool_.Reset(up_pool_frames_, gpu_frame_shape_, kUInt8,
                            DLDevice{kDLCUDA, device_id_});
+        } else {
+            // pinned 主机帧池（D2H 直达最终帧）：池深 = ready 预算 +
+            // 在途/余量 —— pinned 只是替换 ready 帧原有的 pageable 分配
+            //（内存总量不变，非分页锁定）。cudaHostAlloc 失败自动禁用
+            // 回退暂存路径；DECORD_HYBRID_PINNED_POOL=0 显式关闭。
+            static const bool pinned_on = [] {
+                const char *e = getenv("DECORD_HYBRID_PINNED_POOL");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            if (pinned_on) {
+                if (!pinned_pool_) {
+                    pinned_pool_ = std::make_shared<PinnedHostFramePool>();
+                }
+                pinned_pool_->Reset(
+                    static_cast<std::size_t>(ready_cap_frames_)
+                        + kD2HRingSlots + 16,
+                    static_cast<std::size_t>(frame_bytes_), gpu_frame_shape_);
+            }
         }
     }
 #endif
@@ -432,6 +517,13 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
         if (out_cuda_) {
             up_pool_.Reset(up_pool_frames_, gpu_frame_shape_, kUInt8,
                            DLDevice{kDLCUDA, device_id_});
+        } else if (pinned_pool_) {
+            // ROI 重建：帧尺寸已变，池按新尺寸重建（在途旧块归还时
+            // 按尺寸直接释放）
+            pinned_pool_->Reset(
+                static_cast<std::size_t>(ready_cap_frames_)
+                    + kD2HRingSlots + 16,
+                static_cast<std::size_t>(frame_bytes_), gpu_frame_shape_);
         }
     }
 #endif
@@ -644,6 +736,14 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
             queue_frames_ = static_cast<int>(q);
             ready_cap_frames_ = static_cast<int>(rd);
             cpu_.SetQueueDepth(queue_frames_);
+            // pinned 池上限随新 ready 同步抬高：池帽 < ReadyCap 会出现
+            // "池尽但 ready 未满" 的窗口 —— lander 停止 pop 而 FeedStep
+            // 仍在喂包，NVDEC 事件环溢出 FATAL（lockstep 实测）。
+            if (pinned_pool_ && !out_cuda_) {
+                pinned_pool_->Reset(
+                    static_cast<std::size_t>(rd) + kD2HRingSlots + 16,
+                    pinned_pool_->frame_bytes(), gpu_frame_shape_);
+            }
             if (getenv("DECORD_HYBRID_DEBUG")) {
                 fprintf(stderr, "\n[hybrid-sched] inv-split rc=%.0f rg=%.0f -> queue=%d ready=%d\n",
                         rate[SIDE_CPU], rate[SIDE_GPU], queue_frames_,
@@ -1067,6 +1167,16 @@ bool HybridThreadedDecoder::LandStep() {
         std::lock_guard<std::mutex> lk(rmtx_);
         if (ready_.size() >= ReadyCap()) return false;  // 预算内背压
     }
+    // 预取 pinned 池帧（CPU-out 直达 D2H 用）：必须在 gpu_->Pop 之前 ——
+    // pop 之后无法把帧塞回解码器。池尽**不背压而是降级**：走下方暂存
+    // 路径（慢但永不枯竭）—— 若池尽返回 false 会停止 pop，而 ready 未
+    // 满时 FeedStep 仍在喂包，NVDEC 64 槽事件环随即溢出 FATAL（解码
+    // 线程死亡 = 永久挂等；lockstep 慢消费实测）。ready 闸是唯一背压，
+    // 与 FeedStep 的喂包闸同口径对齐，不会过喂。
+    runtime::NDArray pooled;
+    if (!out_cuda_ && pinned_pool_ && pinned_pool_->Enabled()) {
+        pinned_pool_->Acquire(&pooled);  // 失败 = 本次走暂存路径
+    }
     runtime::NDArray f;
     if (!gpu_->Pop(&f) || !f.defined()) return false;
     // 落地速率（供调度）：段式统计 —— 只累计连续落地段（间隔 <50ms），
@@ -1152,6 +1262,35 @@ bool HybridThreadedDecoder::LandStep() {
         }
         const char *src = static_cast<const char *>
             (const_cast<DLTensor *>(f.operator->())->data);
+        // pinned 池路径：D2H 直达最终帧（收割零拷贝入 ready_，消除
+        // 暂存 memcpy + 每帧 Empty 分配）。pooled 帧在 LandStep 入口
+        // （gpu_->Pop 之前）预取 —— pop 之后无法把帧塞回解码器，池尽
+        // 若在此时才失败 = 已弹出的帧被丢弃 = 永久缺帧死等（lockstep
+        // 慢消费实测挂死）。入口预取失败 = 干净背压，帧留在解码器内。
+        if (pooled.defined()) {
+            void *dst = const_cast<DLTensor *>(pooled.operator->())->data;
+            if (d2h_stream_ != nullptr && d2h_ev_[k] != nullptr) {
+                pooled.pts = f.pts;
+                cudaMemcpyAsync(dst, src, static_cast<size_t>(frame_bytes_),
+                                cudaMemcpyDeviceToHost,
+                                reinterpret_cast<cudaStream_t>(d2h_stream_));
+                cudaEventRecord(reinterpret_cast<cudaEvent_t>(d2h_ev_[k]),
+                                reinterpret_cast<cudaStream_t>(d2h_stream_));
+                d2h_host_[k] = std::move(pooled);
+                d2h_gpu_[k] = f;    // 源保活（事件前不回池）
+                d2h_pooled_[k] = true;
+                d2h_valid_[k] = true;
+                ++d2h_seq_;
+                return true;
+            }
+            // 无流/事件：池块上同步 D2H（罕见兜底），直接交付
+            pooled.pts = f.pts;
+            cudaMemcpy(dst, src, static_cast<size_t>(frame_bytes_),
+                       cudaMemcpyDeviceToHost);
+            std::lock_guard<std::mutex> lk(rmtx_);
+            ready_.push_back(std::move(pooled));
+            return true;
+        }
         if (d2h_staging_[k] != nullptr && d2h_ev_[k] != nullptr
                 && d2h_stream_ != nullptr) {
             cudaMemcpyAsync(d2h_staging_[k], src,
@@ -1184,12 +1323,19 @@ bool HybridThreadedDecoder::HarvestD2H(int k) {
         if (ready_.size() >= ReadyCap()) return false;  // 预算内背压
     }
     cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(d2h_ev_[k]));
-    std::memcpy(d2h_host_[k].operator->()->data, d2h_staging_[k],
-                static_cast<size_t>(frame_bytes_));
-    {
+    if (d2h_pooled_[k]) {
+        // pinned 池帧：D2H 已直达，零拷贝入 ready_
         std::lock_guard<std::mutex> lk(rmtx_);
         ready_.push_back(std::move(d2h_host_[k]));
+    } else {
+        std::memcpy(d2h_host_[k].operator->()->data, d2h_staging_[k],
+                    static_cast<size_t>(frame_bytes_));
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            ready_.push_back(std::move(d2h_host_[k]));
+        }
     }
+    d2h_pooled_[k] = false;
     d2h_host_[k] = runtime::NDArray();
     d2h_gpu_[k] = runtime::NDArray();  // 源回池
     d2h_valid_[k] = false;
