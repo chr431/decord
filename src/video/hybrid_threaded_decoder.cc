@@ -482,13 +482,6 @@ void HybridThreadedDecoder::StopGpuWorker() {
         }
     }
     up_stage_bytes_ = 0;
-    up_stage_idx_ = 0;
-    for (auto &ev : up_ev_) {
-        if (ev != nullptr) {
-            cudaEventDestroy(reinterpret_cast<cudaEvent_t>(ev));
-            ev = nullptr;
-        }
-    }
     if (d2h_stream_ != nullptr) {
         cudaStreamDestroy(reinterpret_cast<cudaStream_t>(d2h_stream_));
         d2h_stream_ = nullptr;
@@ -1188,7 +1181,9 @@ void HybridThreadedDecoder::FlushD2H() {
 }
 
 void HybridThreadedDecoder::AbortInflight() {
-    // Clear/ROI 重建：同步在途拷贝（缓冲安全释放）后丢弃
+    // Clear/ROI 重建：同步在途拷贝（缓冲安全释放）后丢弃。
+    // H2D 批量上载无跨 UploadStep 的在途状态（所有路径批内 sync 完成后
+    // 才返回），上载线程 join 后此流必空闲 —— 防御性 sync 一次。
     for (int k = 0; k < kD2HRingSlots; ++k) {
         if (d2h_valid_[k]) {
             if (d2h_ev_[k] != nullptr) {
@@ -1200,14 +1195,8 @@ void HybridThreadedDecoder::AbortInflight() {
         }
     }
     d2h_seq_ = 0;
-    for (int k = 0; k < 4; ++k) {
-        if (up_valid_[k]) {
-            if (up_ev_[k] != nullptr) {
-                cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(up_ev_[k]));
-            }
-            up_buf_[k] = runtime::NDArray();  // 显存缓冲随析构回 up_pool_
-            up_valid_[k] = false;
-        }
+    if (up_stream_ != nullptr) {
+        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(up_stream_));
     }
 }
 
@@ -1280,33 +1269,57 @@ bool HybridThreadedDecoder::FeedStep() {
 
 bool HybridThreadedDecoder::UploadStep() {
     if (!out_cuda_) return false;
+    // ── H2D 批量上载（重设计，替代每帧 sync）──
+    // 旧实现每帧 memcpy 到 pinned + cudaMemcpyAsync 提交后立即
+    // cudaStreamSynchronize（~0.4-0.7ms 串行）—— 上载能力 ~1400fps，
+    // CPU chunk 的显存存货（up_pool）永远填不满（no-buf 1727 次/3000
+    // 帧），CPU 块发射退化为上载实时跟随。批次化：≤kUploadBatch 帧逐
+    // 帧 memcpy 到各自 pinned 槽 + async 提交（驱动流水化：H2D(i) 与
+    // 宿主 memcpy(i+1) 重叠），批末一次 sync 统一收割。
+    // 语义与逐帧同步完全一致：帧只在 H2D 完成后进 cpu_ready_、顺序 =
+    // 提交顺序；marker/池尽/CPU 断流等所有提前退出路径先冲刷批再处理
+    //（此前事件环方案的 marker/EOF 语义腐坏在这里不存在 —— 冲刷在
+    // UploadStep 栈内同步完成，无跨调用在途状态）。
     static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
-    runtime::NDArray buf;
-    if (!up_pool_.Acquire(&buf)) {
-        if (dbg) fprintf(stderr, "[hybrid-u] no-buf");
-        return false;  // 上载池耗尽：CPU 帧显存容器已满（背压）
-    }
-    if (dbg) fprintf(stderr, "[hybrid-u] pop");
-    runtime::NDArray f;
-    if (!cpu_.Pop(&f) || !f.defined()) {
-        if (dbg) fprintf(stderr, "[hybrid-u] cpu-empty");
-        return false;  // buf 随析构归还池
-    }
-    if (dbg) fprintf(stderr, "[hybrid-u] copy");
-    if (IsMarker(f)) {
-        // marker 必须排在所有在途上载帧之后（发射顺序 = cpu_ready_ 顺序）
-        FlushUpload();
-        std::lock_guard<std::mutex> lk(rmtx_);
-        cpu_ready_.push_back(std::move(f));
-        return true;
-    }
-    // H2D：pinned 暂存环 + 非阻塞流。pageable 源的 H2D 在 WDDM 下走
-    // 驱动 staging（~1.2ms/帧），pinned 源 ~0.4ms。提交后滞后 4 帧收割
-    // （槽复用时事件早已完成）：每帧同步等待曾把 CPU chunk 发射压到
-    // 实时跟随（上载 ~1000fps 上限）。两侧布局逐字节一致已验证。
-    {
-        const int k = up_stage_idx_ & 3;
-        if (up_staging_[k] == nullptr || up_stage_bytes_ != static_cast<std::size_t>(frame_bytes_)) {
+    runtime::NDArray bufs[kUploadBatch];
+    int nf = 0;
+    bool did = false;
+    auto flush = [&]() {
+        if (nf == 0) return;
+        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(up_stream_));
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            for (int i = 0; i < nf; ++i) {
+                cpu_ready_.push_back(std::move(bufs[i]));  // pts 提交时已设
+            }
+        }
+        if (dbg) fprintf(stderr, "[hybrid-u] flush %d", nf);
+        nf = 0;
+        did = true;
+    };
+    while (nf < kUploadBatch) {
+        runtime::NDArray buf;
+        if (!up_pool_.Acquire(&buf)) {
+            if (dbg) fprintf(stderr, "[hybrid-u] no-buf");
+            flush();  // 上载池耗尽：CPU 帧显存容器已满（背压）
+            return did;
+        }
+        runtime::NDArray f;
+        if (!cpu_.Pop(&f) || !f.defined()) {
+            if (dbg) fprintf(stderr, "[hybrid-u] cpu-empty");
+            flush();  // buf 随析构归还池
+            return did;
+        }
+        if (IsMarker(f)) {
+            // marker 保序：批内帧全部 H2D 完成后才入队 marker
+            flush();
+            std::lock_guard<std::mutex> lk(rmtx_);
+            cpu_ready_.push_back(std::move(f));
+            return true;
+        }
+        const int k = nf;
+        if (up_staging_[k] == nullptr
+                || up_stage_bytes_ != static_cast<std::size_t>(frame_bytes_)) {
             if (up_staging_[k] != nullptr) {
                 cudaFreeHost(up_staging_[k]);
                 up_staging_[k] = nullptr;
@@ -1315,56 +1328,32 @@ bool HybridThreadedDecoder::UploadStep() {
                                static_cast<size_t>(frame_bytes_)) == cudaSuccess) {
                 up_stage_bytes_ = static_cast<std::size_t>(frame_bytes_);
             }
-            if (up_ev_[k] == nullptr) {
-                cudaEvent_t ev = nullptr;
-                if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming)
-                        == cudaSuccess) {
-                    up_ev_[k] = ev;
-                }
-            }
         }
         const char *src = static_cast<const char *>
             (const_cast<DLTensor *>(f.operator->())->data);
         char *dst_dev = static_cast<char *>
             (const_cast<DLTensor *>(buf.operator->())->data);
         if (up_staging_[k] != nullptr) {
+            // 槽 k 占用至批末 sync（H2D 源保活）；宿主帧 f 的 memcpy 在
+            // 提交前同步完成，无需保活。
             std::memcpy(up_staging_[k], src, static_cast<size_t>(frame_bytes_));
             cudaMemcpyAsync(dst_dev, up_staging_[k],
                             static_cast<size_t>(frame_bytes_),
                             cudaMemcpyHostToDevice,
                             reinterpret_cast<cudaStream_t>(up_stream_));
         } else {
+            // pinned 分配失败的兜底：pageable 直接异步（驱动 staging，
+            // 慢但正确 —— 批末 sync 同样保证完成）
             cudaMemcpyAsync(dst_dev, src, static_cast<size_t>(frame_bytes_),
                             cudaMemcpyHostToDevice,
                             reinterpret_cast<cudaStream_t>(up_stream_));
         }
-        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(up_stream_));
-        ++up_stage_idx_;
+        buf.pts = f.pts;
+        bufs[nf] = std::move(buf);
+        ++nf;
     }
-    buf.pts = f.pts;
-    {
-        std::lock_guard<std::mutex> lk(rmtx_);
-        cpu_ready_.push_back(std::move(buf));
-    }
-    if (dbg) fprintf(stderr, "[hybrid-u] done");
+    flush();
     return true;
-}
-
-void HybridThreadedDecoder::FlushUpload() {
-    // marker 保序：按提交顺序同步事件后入队（EOF 尾部一次性，容忍等待）
-    const int64_t in_use = std::min<int64_t>(4, up_stage_idx_);
-    for (int64_t i = in_use; i > 0; --i) {
-        const int k = static_cast<int>((up_stage_idx_ - i) & 3);
-        if (!up_valid_[k]) continue;
-        if (up_ev_[k] != nullptr) {
-            cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(up_ev_[k]));
-        }
-        {
-            std::lock_guard<std::mutex> lk(rmtx_);
-            cpu_ready_.push_back(std::move(up_buf_[k]));
-        }
-        up_valid_[k] = false;
-    }
 }
 
 void HybridThreadedDecoder::GpuWorkerLoop() {

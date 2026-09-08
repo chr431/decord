@@ -185,19 +185,15 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  会与 CU 解码器 stream_（blocking 流）互斥 —— 每次上载都整体暂停
      *  NVDEC/转换管线（实测 hevc hybrid_gpu 被压到 0.75x）。 */
     void *up_stream_ = nullptr;
-    /*! \brief pinned 暂存环（4 槽，仅上载线程访问）：pageable H2D
-     *  走驱动内 staging（WDDM 下 ~1.2ms/帧），pinned H2D ~0.4ms —— 上载
-     *  能力从 ~830fps 提到 ~1300fps+。 */
-    void *up_staging_[4] = {nullptr, nullptr, nullptr, nullptr};
+    /*! \brief 上载批大小：≤8 帧逐帧 pinned+async 提交，批末一次
+     *  cudaStreamSynchronize 统一收割（摊销同步开销；宿主 memcpy 与
+     *  H2D 在批内重叠）。 */
+    static constexpr int kUploadBatch = 8;
+    /*! \brief pinned 暂存槽（每批帧各一槽，仅上载线程访问）：pageable
+     *  H2D 走驱动内 staging（WDDM 下 ~1.2ms/帧），pinned H2D ~0.4ms。
+     *  批内帧的槽到批末 sync 前都保持占用（H2D 源数据保活）。 */
+    void *up_staging_[kUploadBatch] = {};
     std::size_t up_stage_bytes_ = 0;
-    int up_stage_idx_ = 0;
-    /*! \brief H2D 提交事件（每槽一个）：滞后 4 帧收割 —— 提交后不立即
-     *  同步，槽轮转复用时才等事件。每帧同步等待（~0.4-1ms）曾把 CPU
-     *  chunk 的发射压到实时跟随（上载 ~1000fps 上限）。收割（事件同步
-     *  后 push cpu_ready_）保证消费者拿到的帧 H2D 必已完成。 */
-    void *up_ev_[4] = {nullptr, nullptr, nullptr, nullptr};
-    runtime::NDArray up_buf_[4];   ///< 在途上载的目标显存帧（保活）
-    bool up_valid_[4] = {false, false, false, false};
     /*! \brief D2H 异步中转环（仅 CPU-out 模式，工作线程访问）：GPU 帧
      *  cudaMemcpyAsync 到 pinned 槽，滞后 kD2HRingSlots 帧收割（事件
      *  已远，零等待）+ memcpy 到宿主 NDArray 入 ready_。此前同步 D2H
@@ -218,8 +214,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool HarvestD2H(int k);
     /*! \brief 同步并丢弃在途 D2H/H2D（Clear/ROI 重建用） */
     void AbortInflight();
-    /*! \brief 冲刷 H2D 在途环（marker 保序）：事件同步后按提交序 push */
-    void FlushUpload();
     /*! \brief 停止并回收 GPU 工作线程（Stop/Clear 共用） */
     void StopGpuWorker();
 #endif
