@@ -9,6 +9,8 @@
 
 #include <stdint.h>
 
+#include "../runtime/cuda/cudart_shim.h"
+
 namespace decord {
 namespace cuda {
 

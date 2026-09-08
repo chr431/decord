@@ -117,7 +117,7 @@ PYTHONPATH=python python -c "import decord; print(decord.__version__, decord.__f
 import decord
 from decord import VideoReader, cpu, gpu
 
-print(decord.__version__, decord.__ffmpeg_version__)   # 0.8.0 9.0.x
+print(decord.__version__, decord.__ffmpeg_version__)   # 0.8.1 9.0.x
 
 vr = VideoReader('examples/flipping_a_pancake.mkv', ctx=cpu(0))
 # 文件对象也可以（内存内解码）
@@ -360,7 +360,7 @@ python tests/test_hybrid_lockstep.py 600     # 混跑字节级交错对照
 
 版本事实源为 `python/decord/_ffi/libinfo.py` 的 `__version__`（`pyproject.toml` 同步，
 用 `python tools/update_version.py` 统一更新）。发布走 GitHub Actions → **Release** →
-Run workflow：填版本号（如 `0.8.0`）与 ref（默认 `master`），workflow 自动 bump 版本 →
+Run workflow：填版本号（如 `0.8.1`）与 ref（默认 `master`），workflow 自动 bump 版本 →
 tag `vX.Y.Z` → CUDA + FFmpeg 9.0 构建 → 打包 `decord-<ver>-win64-gpu.zip` → 创建
 Release。构建失败不产生任何 commit/tag/release。tag push 不触发 PyPI 发布（已移除）。
 

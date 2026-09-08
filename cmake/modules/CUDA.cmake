@@ -15,37 +15,29 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# CUDA Module
-find_cuda(${USE_CUDA})
-
-if(CUDA_FOUND)
-  # always set the includedir when cuda is available
-  # avoid global retrigger of cmake
-  include_directories(${CUDA_INCLUDE_DIRS})
-  add_definitions(-DDECORD_USE_CUDA)
-endif(CUDA_FOUND)
+# CUDA Module（0.8.1 去 Toolkit 化）
+#
+# 构建不再需要 CUDA Toolkit（无 nvcc、无 cudart、无 toolkit 头文件）：
+# - 驱动 API / NVCUVID / NVML 运行时动态加载（nv_gpu_dyn.cc，导入表无
+#   驱动 DLL —— 无 NVIDIA 驱动设备可正常加载并回退 CPU 解码）
+# - cudart 调用走自研垫片（src/runtime/cuda/cudart_shim.*，转驱动 API）
+# - improc kernel 以预编译 PTX 内嵌（src/improc/improc_ptx.inc，经
+#   cuModuleLoadData 加载；再生成命令见 improc_dyn.cc 头注释）
+# - nvcuvid.h / cuda.h / nvml.h 头文件由仓库自带（cuda_include/、nvcuvid/）
 
 if(USE_CUDA)
-  if(NOT CUDA_FOUND)
-    message(FATAL_ERROR "Cannot find CUDA, USE_CUDA=" ${USE_CUDA})
-  endif()
-  # 不再链接 nvml.lib / nvcuvid.lib（Video Codec SDK）：
-  # CUDA 驱动 API / NVCUVID / NVML 全部改为运行时动态加载（nv_gpu_dyn.cc），
-  # decord.dll 导入表不再依赖驱动 DLL → 无 NVIDIA 驱动设备可正常加载并
-  # 回退 CPU 解码。nvcuvid.h 头文件由仓库自带（src/video/nvcodec/nvcuvid/）。
-  message(STATUS "Build with CUDA support (GPU APIs dynamically loaded)")
+  add_definitions(-DDECORD_USE_CUDA)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/video/nvcodec/cuda_include)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/video/nvcodec/nvcuvid)
+  message(STATUS "Build with CUDA support (driver APIs dynamically loaded, no CUDA Toolkit required)")
   file(GLOB RUNTIME_CUDA_SRCS src/runtime/cuda/*.cc)
   file(GLOB NVDEC_SRCS src/video/nvcodec/*.cc)
-  file(GLOB NVDEC_CUDA_SRCS src/improc/*.cu)
-
-  # No NVRTC: the driver API, NVCUVID and NVML are all loaded at runtime
-  # (nv_gpu_dyn.cc); nothing references NVRTC symbols, and linking its
-  # import library would add a dead nvrtc64_*.dll dependency.
-  list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_CUDART_LIBRARY})
-  list(APPEND DECORD_RUNTIME_LINKER_LIBS ${CUDA_CUDA_LIBRARY})
-
+  file(GLOB NVDEC_CC_SRCS src/improc/*.cc)
+  list(APPEND NVDEC_SRCS ${NVDEC_CC_SRCS})
+  set(NVDEC_CUDA_SRCS "")  # 不再用 nvcc（kernel 以内嵌 PTX 提供）
 else(USE_CUDA)
   message(STATUS "CUDA disabled, no nvdec capabilities will be enabled...")
   set(NVDEC_SRCS "")
   set(RUNTIME_CUDA_SRCS "")
+  set(NVDEC_CUDA_SRCS "")
 endif(USE_CUDA)

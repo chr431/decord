@@ -126,7 +126,7 @@ forward slashes on Windows), `-DFFMPEG_DIR=...`,
 import decord
 from decord import VideoReader, cpu, gpu
 
-print(decord.__version__, decord.__ffmpeg_version__)   # 0.8.0 9.0.x
+print(decord.__version__, decord.__ffmpeg_version__)   # 0.8.1 9.0.x
 
 vr = VideoReader('examples/flipping_a_pancake.mkv', ctx=cpu(0))
 # a file-like object works as well (in-memory decoding)
@@ -275,13 +275,14 @@ experimental, numbers are order-of-magnitude guidance.
 |---|---|---|---|
 | `cpu` (16 decode threads) | 1233 | 961 | 709 |
 | `gpu` (NVDEC) | 958 | 1868 | 1285 |
-| `hybrid` (experimental, → host memory) | **1756** | **1938** | 1724 |
-| `hybrid_gpu` (experimental, → VRAM) | **1645** | **1979** | **1796** |
+| `hybrid` (experimental, → host memory) | **1761** | **2216** | **1852** |
+| `hybrid_gpu` (experimental, → VRAM) | **1650** | 2075 | 1785 |
 
 Notes:
 
 - All six configurations (3 codecs × both modes) beat pure CPU AND pure NVDEC
-  simultaneously (av1 CPU-out 1.34x, hevc 1.04x/1.06x, h264 1.42x/1.72x).
+  simultaneously: 1.42-2.31x over pure CPU, 1.01-1.86x over pure NVDEC
+  (hevc hybrid 2216 fps).
 - **The Windows power plan strongly affects hybrid stability**: under mixed
   CPU+GPU load, boost-governor behaviour can produce ±15-25% run-to-run
   variance ("bimodal" throughput) on the same binary. For reproducible
@@ -403,7 +404,7 @@ python tests/test_hybrid_lockstep.py 600     # byte-exact interleaved hybrid che
 The version source of truth is `__version__` in
 `python/decord/_ffi/libinfo.py` (`pyproject.toml` kept in sync; update both via
 `python tools/update_version.py`). Releases run from GitHub Actions →
-**Release** → Run workflow: provide the version (e.g. `0.8.0`) and ref
+**Release** → Run workflow: provide the version (e.g. `0.8.1`) and ref
 (default `master`); the workflow bumps the version → tags `vX.Y.Z` → builds
 with CUDA + FFmpeg 9.0 → packages `decord-<ver>-win64-gpu.zip` → creates the
 Release. A failed build produces no commit/tag/release. Tag pushes do not

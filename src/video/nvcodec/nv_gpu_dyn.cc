@@ -34,6 +34,10 @@ using nv_lib_t = void*;
 /* Function list macro: X(ret, default_err, name, params, call_args) */
 #define NV_CU_FUNCS(X)                                                          \
   X(CUresult, CUDA_ERROR_NOT_FOUND, cuInit, (unsigned int flags), (flags))      \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuGetErrorString,                           \
+    (CUresult error, const char** pStr), (error, pStr))                         \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuGetErrorName,                             \
+    (CUresult error, const char** pStr), (error, pStr))                         \
   X(CUresult, CUDA_ERROR_NOT_FOUND, cuDeviceGet,                                \
     (CUdevice* device, int ordinal), (device, ordinal))                         \
   X(CUresult, CUDA_ERROR_NOT_FOUND, cuDeviceGetName,                            \
@@ -51,6 +55,73 @@ using nv_lib_t = void*;
     (CUdevice dev), (dev))                                                      \
   X(CUresult, CUDA_ERROR_NOT_FOUND, cuDevicePrimaryCtxRetain,                   \
     (CUcontext* pctx, CUdevice dev), (pctx, dev))                               \
+  /* memory / copy / stream / event / device attr / tex / module+launch */      \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemGetInfo_v2,                               \
+    (size_t* free, size_t* total), (free, total))                               \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemAlloc_v2,                                 \
+    (CUdeviceptr* dptr, size_t bytesize), (dptr, bytesize))                     \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemFree_v2, (CUdeviceptr dptr), (dptr))      \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemHostAlloc,                             \
+    (void** pp, size_t bytesize, unsigned int Flags), (pp, bytesize, Flags))    \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemFreeHost, (void* p), (p))              \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyHtoD_v2,                               \
+    (CUdeviceptr dst, const void* src, size_t ByteCount), (dst, src, ByteCount))\
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyDtoH_v2,                               \
+    (void* dst, CUdeviceptr src, size_t ByteCount), (dst, src, ByteCount))      \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyDtoD_v2,                               \
+    (CUdeviceptr dst, CUdeviceptr src, size_t ByteCount), (dst, src, ByteCount))\
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyHtoDAsync_v2,                          \
+    (CUdeviceptr dst, const void* src, size_t ByteCount, CUstream hStream),     \
+    (dst, src, ByteCount, hStream))                                             \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyDtoHAsync_v2,                          \
+    (void* dst, CUdeviceptr src, size_t ByteCount, CUstream hStream),           \
+    (dst, src, ByteCount, hStream))                                             \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyDtoDAsync_v2,                          \
+    (CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream),     \
+    (dst, src, ByteCount, hStream))                                             \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyPeerAsync_v2,                          \
+    (CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,        \
+     CUcontext srcContext, size_t ByteCount, CUstream hStream),                 \
+    (dstDevice, dstContext, srcDevice, srcContext, ByteCount, hStream))         \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpy2D,                                 \
+    (const CUDA_MEMCPY2D* pCopy), (pCopy))                                      \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuStreamWaitEvent,                          \
+    (CUstream hStream, CUevent hEvent, unsigned int Flags),                     \
+    (hStream, hEvent, Flags))                                                   \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuStreamCreate,                             \
+    (CUstream* pStream, unsigned int Flags), (pStream, Flags))                  \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuStreamSynchronize, (CUstream hStream),    \
+    (hStream))                                                                  \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuStreamDestroy, (CUstream hStream),        \
+    (hStream))                                                                  \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuEventCreate,                              \
+    (CUevent* phEvent, unsigned int Flags), (phEvent, Flags))                   \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuEventRecord,                              \
+    (CUevent hEvent, CUstream hStream), (hEvent, hStream))                      \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuEventSynchronize, (CUevent hEvent),       \
+    (hEvent))                                                                   \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuEventDestroy, (CUevent hEvent),           \
+    (hEvent))                                                                   \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuDeviceGetAttribute,                       \
+    (int* pi, CUdevice_attribute attrib, CUdevice dev), (pi, attrib, dev))      \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuTexObjectCreate,                          \
+    (CUtexObject* pTexObject, const CUDA_RESOURCE_DESC* pResDesc,               \
+     const CUDA_TEXTURE_DESC* pTexDesc,                                         \
+     const CUDA_RESOURCE_VIEW_DESC* pResViewDesc),                              \
+    (pTexObject, pResDesc, pTexDesc, pResViewDesc))                             \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuTexObjectDestroy,                         \
+    (CUtexObject texObject), (texObject))                                       \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuModuleLoadData,                           \
+    (CUmodule* module, const void* image), (module, image))                     \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuModuleGetFunction,                        \
+    (CUfunction* hfunc, CUmodule hmod, const char* name), (hfunc, hmod, name))  \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuLaunchKernel,                             \
+    (CUfunction f, unsigned int gridDimX, unsigned int gridDimY,                \
+     unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,     \
+     unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream,     \
+     void** kernelParams, void** extra),                                        \
+    (f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,          \
+     sharedMemBytes, hStream, kernelParams, extra))                             \
   /* NVCUVID */                                                                 \
   X(CUresult, CUDA_ERROR_NOT_FOUND, cuvidCreateDecoder,                         \
     (CUvideodecoder* phDecoder, CUVIDDECODECREATEINFO* pdci),                   \
@@ -139,6 +210,11 @@ bool gpu_loaded() {
 
   /* usable when cuInit + all cuvid are ready (NVML is probe-only) */
   g_loaded = p_cuInit != nullptr && p_cuvidCreateDecoder != nullptr;
+  if (g_loaded) { g_loaded = (p_cuInit(0) == CUDA_SUCCESS); }
+  if (getenv("DECORD_CUDART_DEBUG")) {
+    fprintf(stderr, "[nv-dyn] ptrs: init=%p alloc=%p streamcreate=%p",
+            (void *)p_cuInit, (void *)p_cuMemAlloc_v2, (void *)p_cuStreamCreate);
+  }
   });
   return g_loaded;
 }

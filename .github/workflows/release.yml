@@ -67,15 +67,9 @@ jobs:
             exit 1
           }
 
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.36
-        # v0.2.36 的 Windows network 列表含 CUDA 13.x（含 13.3.1，本地 13.3 已验证构建）。
-        # 与 RaceVideoToLog 的 tensorrt_cu13_bindings 保持一致：全栈统一 CUDA 13，避免
-        # 最终用户需同时装 12.x + 13.x 两套 Toolkit 才能同时满足 TRT 与 decord。
-        # decord.dll 运行时动态加载 CUDA（nv_gpu_dyn），工具链版本不影响产物。
-        with:
-          cuda: '13.3.1'
-          method: 'network'
+      # 0.8.1 起 CUDA 构建不再需要 CUDA Toolkit（无 nvcc/cudart，驱动 API 全部
+      # 运行时动态加载 + improc kernel 以内嵌 PTX 提供）—— 此前卡发布数次的
+      # Jimver/cuda-toolkit 网络安装步骤已删除。
 
       - name: Download FFmpeg 9.0 (shared)
         shell: pwsh
@@ -88,12 +82,11 @@ jobs:
       - name: Build decord (GPU)
         shell: pwsh
         run: |
-          # CUDA 路径必须正斜杠（CMake 反斜杠转义坑，本地验证过）
-          $cudaFwd = "$env:CUDA_PATH".Replace('\', '/')
+          # 0.8.1：无 CUDA Toolkit —— USE_CUDA=ON 仅启用混合解码（驱动 API
+          # 运行时动态加载 + 内嵌 PTX kernel），不再需要 CUDA_PATH。
           $ffmpegDir = (Resolve-Path "ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0").Path
-          Write-Host "CUDA:   $cudaFwd"
           Write-Host "FFMPEG: $ffmpegDir"
-          cmake -S . -B build -DUSE_CUDA="$cudaFwd" -DFFMPEG_DIR="$ffmpegDir" -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -DUSE_CUDA=ON -DFFMPEG_DIR="$ffmpegDir" -DCMAKE_BUILD_TYPE=Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build --config Release --parallel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

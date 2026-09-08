@@ -13,7 +13,7 @@
 #include "frame_trace.h"
 #if DECORD_USE_CUDA
 #include "nvcodec/cuda_threaded_decoder.h"
-#include <cuda_runtime_api.h>
+#include "../runtime/cuda/cudart_shim.h"
 #endif
 #include <algorithm>
 #include <cerrno>

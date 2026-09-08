@@ -26,7 +26,8 @@
 
 #include <dmlc/thread_local.h>
 #include <decord/runtime/registry.h>
-#include <cuda_runtime.h>
+#include "cudart_shim.h"
+#include "../../video/nvcodec/nv_gpu_dyn.h"
 #include "cuda_common.h"
 
 namespace decord {
@@ -73,9 +74,16 @@ class CUDADeviceAPI final : public DeviceAPI {
         return;
       }
       case kDeviceName: {
-        cudaDeviceProp props;
-        CUDA_CALL(cudaGetDeviceProperties(&props, ctx.device_id));
-        *rv = std::string(props.name);
+        // 去 toolkit 化：不再拉取整个 cudaDeviceProp，直接经驱动 API 取名
+        char name[256] = {};
+        CUdevice dev = 0;
+        if (cudaSuccess != cudaSetDevice(ctx.device_id)
+            || CUDA_SUCCESS != nv::cuDeviceGet(&dev, ctx.device_id)
+            || CUDA_SUCCESS != nv::cuDeviceGetName(name, sizeof(name), dev)) {
+          *rv = std::string("unknown");
+          return;
+        }
+        *rv = std::string(name);
         return;
       }
       case kMaxClockRate: {

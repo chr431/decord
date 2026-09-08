@@ -61,7 +61,7 @@
 #endif
 
 #ifdef DECORD_USE_CUDA
-#include <cuda_runtime.h>
+#include "../runtime/cuda/cudart_shim.h"
 #endif
 #include <algorithm>
 #include <cstring>

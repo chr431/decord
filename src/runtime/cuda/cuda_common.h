@@ -26,7 +26,7 @@
 #define DECORD_RUNTIME_CUDA_CUDA_COMMON_H_
 
 #include <cuda.h>
-#include <cuda_runtime.h>
+#include "cudart_shim.h"
 #include <decord/runtime/packed_func.h>
 #include <string>
 #include "../workspace_pool.h"
