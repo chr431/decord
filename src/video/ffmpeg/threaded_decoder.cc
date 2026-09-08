@@ -371,8 +371,22 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
                 if (prod_seg_frames_ >= 16) {
                     double r = prod_seg_frames_ / prod_seg_secs_;
                     double prev = prod_rate_.load(std::memory_order_relaxed);
-                    prod_rate_.store(prev > 0 ? 0.75 * prev + 0.25 * r : r,
-                                     std::memory_order_relaxed);
+                    // 容量跟踪（快升慢降）：调度需要的是"产能"而非"当前
+                    // 混合速率"。EWMA 会被相位混合比例污染（CPU 值日期
+                    // 产出耦合 ~650 vs GPU 值日离峰 ~950，混合比例即份额
+                    // → 速率学习与份额互为因果的反馈环，hevc 混跑实测
+                    // 同二进制 1577-1833 双峰）。上升限速 1.3x 防排水
+                    // 爆发尖峰锁存；下降每折 5% 缓漂 —— 产能不因空闲/
+                    // 耦合段贬值，真实降载（热/竞争）20 折内可追踪。
+                    double next;
+                    if (prev <= 0) {
+                        next = r;
+                    } else if (r > prev) {
+                        next = std::min(r, prev * 1.3);
+                    } else {
+                        next = 0.95 * prev + 0.05 * r;
+                    }
+                    prod_rate_.store(next, std::memory_order_relaxed);
                 if (rdbg) fprintf(stderr, "[rate] FOLD t=%.3f r=%.0f rate=%.0f\n",
                                   std::chrono::duration<double>(
                                       std::chrono::steady_clock::now().time_since_epoch()).count(),

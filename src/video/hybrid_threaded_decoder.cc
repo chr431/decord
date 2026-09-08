@@ -1053,8 +1053,20 @@ bool HybridThreadedDecoder::LandStep() {
                 if (land_seg_frames_ >= 16) {
                     double r = land_seg_frames_ / land_seg_secs_;
                     double prev = gpu_rate_landed_.load(std::memory_order_relaxed);
-                    gpu_rate_landed_.store(
-                        prev > 0 ? 0.75 * prev + 0.25 * r : r, std::memory_order_relaxed);
+                    // 容量跟踪（快升慢降，同 cpu_.prod_rate_ 注释）：CPU
+                    // 值日期间 ready 满载闸住落地、低速段把 EWMA 从 1519
+                    // 拖到 1132 → tg 虚高 → GPU 显差 → CPU 值日更长 ——
+                    // 空闲贬值与相位比例互为反馈（hevc 1577-1833 双峰的
+                    // 根因）。产能不因空闲贬值。
+                    double next;
+                    if (prev <= 0) {
+                        next = r;
+                    } else if (r > prev) {
+                        next = std::min(r, prev * 1.3);
+                    } else {
+                        next = 0.95 * prev + 0.05 * r;
+                    }
+                    gpu_rate_landed_.store(next, std::memory_order_relaxed);
                     land_seg_frames_ = 0;
                     land_seg_secs_ = 0.0;
                 }
