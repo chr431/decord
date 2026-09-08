@@ -6,9 +6,11 @@
 #   3. CMake GPU 构建 decord.dll（USE_CUDA=ON）
 #   4. 若 libinfo.py / pyproject.toml 版本 != 输入版本：两文件同步升版本 → commit → push 到目标分支
 #   5. 打 tag v<版本> 并 push
-#   6. 打包 zip（布局 = RaceVideoToLog 的 _decord_build/，解压即用）：
+#   6. 构建 pip wheel（scikit-build-core，bump 之后跑以拿到正确版本号；
+#      内容 = decord.dll + FFmpeg 导入闭包 6 DLL，自动安装规则见 CMakeLists）
+#   7. 打包 zip（布局 = RaceVideoToLog 的 _decord_build/，解压即用）：
 #        decord.dll + FFmpeg 9.0 DLLs + ffprobe.exe + python/decord/
-#   7. 创建 GitHub Release（notes = 自上一 tag 的 commit 列表）+ 上传 zip
+#   8. 创建 GitHub Release（notes = 自上一 tag 的 commit 列表）+ 上传 zip 与 wheel
 #
 # 只监听 workflow_dispatch（push/tag 不会二次触发）。构建失败时不会产生
 # 任何 commit / tag / release（commit+tag 在构建成功后才执行）。
@@ -108,7 +110,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           $changed = $false
-          # 版本事实源：libinfo.py（setup.py / __init__.py 从中派生）
+          # 版本事实源：libinfo.py（pyproject.toml / __init__.py 从中派生）
           $content = [System.IO.File]::ReadAllText((Resolve-Path $libinfo))
           $cur = [regex]::Match($content, '__version__ = "(\d+\.\d+\.\d+)"').Groups[1].Value
           Write-Host "当前 libinfo.py 版本: $cur"
@@ -156,6 +158,31 @@ jobs:
           git push origin "v$ver"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # wheel 必须在版本 bump 之后构建，文件名/元数据才是 v<版本>。
+      # scikit-build-core 走 PEP 517 隔离构建（自动拉 scikit-build-core/cmake/ninja）；
+      # Ninja 生成器需要 cl 在 PATH，msvc-dev-cmd 负责注入 vcvars 环境。
+      # [tool.scikit-build] 在 SKBUILD+WIN32 下默认 USE_CUDA=ON，无需显式传。
+      - name: Setup MSVC for pip wheel
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build pip wheel
+        shell: pwsh
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg/ffmpeg-n9.0-latest-win64-gpl-shared-9.0
+        run: |
+          pip wheel . --no-deps -w dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+          # 闭包自检：wheel 内必须恰好是 decord.dll + 6 个 FFmpeg DLL，
+          # 不允许 avdevice/ffprobe/其它大版本系列混入
+          $names = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path "dist/*.whl")).Entries.FullName
+          $dlls = $names | Where-Object { $_ -match '^decord/[^/]+\.dll$' } | ForEach-Object { Split-Path $_ -Leaf } | Sort-Object
+          $expected = @('avcodec-63.dll','avfilter-12.dll','avformat-63.dll','avutil-61.dll','decord.dll','swresample-7.dll','swscale-10.dll')
+          if ((Compare-Object $dlls $expected).Count -ne 0) {
+            Write-Error "wheel DLL 闭包与预期不符: $($dlls -join ', ')"
+            exit 1
+          }
+
       - name: Generate release notes
         id: notes
         shell: pwsh
@@ -194,6 +221,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ inputs.version }}" "decord-${{ inputs.version }}-win64-gpu.zip" `
+          $whl = (Get-ChildItem "dist/*.whl").FullName
+          gh release create "v${{ inputs.version }}" "decord-${{ inputs.version }}-win64-gpu.zip" "$whl" `
             --title "decord v${{ inputs.version }}" `
             --notes-file notes.md

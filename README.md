@@ -44,15 +44,29 @@
 ### 硬性依赖
 
 - **FFmpeg 9.0**（shared 构建，`avcodec-63`）。推荐
-  [BtbN n9.0 win64 gpl-shared](https://github.com/BtbN/FFmpeg-Builds/releases)；
-  FFmpeg 7.x/8.x 会直接编译失败。
-- GPU（NVDEC）构建另需 **CUDA Toolkit（13.x 已验证）+ NVIDIA Video Codec SDK**，
-  且驱动需提供 `nvcuvid` 库。
+  [BtbN n9.0 win64 gpl-shared](https://github.com/BtbN/FFmpeg-Builds/releases)。
+- GPU（NVDEC）构建只需 NVIDIA 驱动（**0.8.1 起不需要 CUDA Toolkit 与
+  Video Codec SDK**：驱动 API 运行时动态加载，improc kernel 以内嵌 PTX 提供）。
 
-### 预编译包（Windows，推荐）
+### 预编译 wheel（Windows，推荐）
 
 从 [GitHub Releases](https://github.com/chr431/decord/releases) 下载
-`decord-<版本>-win64-gpu.zip`，内含：
+`decord-<版本>-cp3xx-cp3xx-win_amd64.whl`，直接安装：
+
+```bash
+pip install decord-<版本>-cp313-cp313-win_amd64.whl
+```
+
+wheel 自包含运行时：`decord.dll` + FFmpeg 导入闭包（`avcodec/avformat/avutil/
+avfilter/swresample/swscale` 共 6 个 DLL，约 163 MB 原始 / 64 MB 压缩）会装进
+`site-packages/decord/`，`import decord` 即用，不依赖源码树、构建目录或 PATH
+上有没有 FFmpeg。未打包 `avdevice` 与 `ffprobe.exe`（decord.dll 不导入）。
+不依赖 PyPI 上的 decord（那是上游 0.6.0 CPU 版）。
+
+### 便携 zip（Windows）
+
+Releases 同时提供 `decord-<版本>-win64-gpu.zip`（布局 = RaceVideoToLog 的
+`_decord_build/`，解压即用）：
 
 ```
 _decord_build/
@@ -63,38 +77,39 @@ _decord_build/
 ```
 
 使用方式：把 `python/decord` 所在目录加入 `PYTHONPATH`（或直接拷到你的项目里），
-并保证 `decord.dll` 与 FFmpeg DLL 同目录或在 `PATH` 上。**不依赖 PyPI 上的 decord**
-（那是上游 0.6.0 CPU 版）。
+并保证 `decord.dll` 与 FFmpeg DLL 同目录或在 `PATH` 上。
 
-### 从源码 pip 安装
+### 从源码 pip 构建
 
 构建由 `pyproject.toml`（scikit-build-core）驱动：`pip install` 会用 CMake 编译共享
-库并打进 wheel。
+库与 FFmpeg 运行闭包一起打进 wheel。Windows 下 pip 构建**默认启用 CUDA**（GPU 变体，
+与本 fork 发布形态一致），需要 `FFMPEG_DIR` 指向 FFmpeg SDK（include/ + lib/）：
 
 ```bash
 git clone --recursive https://github.com/chr431/decord
 cd decord
 
-# 纯 CPU
-pip install . --config-settings='cmake.args=-DUSE_CUDA=0'
+# Windows：GPU（默认）——只要求 NVIDIA 驱动，无需 Toolkit
+export FFMPEG_DIR=D:/path/to/ffmpeg-n9.0-latest-win64-gpl-shared-9.0
+pip install .
 
-# GPU (NVDEC)：需要 CUDA Toolkit + Video Codec SDK
-pip install . --config-settings="cmake.args=-DUSE_CUDA=ON;-DFFMPEG_DIR=D:/path/to/ffmpeg-9.0"
+# Windows：纯 CPU 覆盖
+pip install . --config-settings="cmake.define.USE_CUDA=OFF"
+
+# 仓库内一键脚本（vcvars + FFMPEG_DIR 默认值已配好）
+make_wheel.bat
 ```
 
 Linux 下 NVDEC 构建若报 `libnvcuvid.so` 找不到，可参考上游
 [#102](https://github.com/dmlc/decord/issues/102)：用 `ldconfig -p | grep libnvcuvid`
 找到该库并链接到 `CUDA_TOOLKIT_ROOT_DIR/lib64`。
 
-运行期 FFmpeg 共享库（`avcodec-63.dll` 等）必须在 `PATH` 上，或与 `decord.dll`
-同目录。
-
 ### 开发构建（CMake + PYTHONPATH）
 
 ```bash
-# Windows（启用 CUDA；纯 CPU 去掉 -DUSE_CUDA 或传 0）
-cmake -S . -B build -DUSE_CUDA="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" \
-      -DFFMPEG_DIR="D:/path/to/ffmpeg-n9.0-win64-gpl-shared-9.0" -DCMAKE_BUILD_TYPE=Release
+# Windows（启用 CUDA）
+cmake -S . -B build -DUSE_CUDA=ON \
+      -DFFMPEG_DIR="D:/path/to/ffmpeg-n9.0-latest-win64-gpl-shared-9.0" -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 
 # Linux / macOS
@@ -102,11 +117,11 @@ cmake -S . -B build -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release -DFFMPEG_DIR=/path/t
 cmake --build build -j$(nproc)
 
 # 直接用新构建的库跑 Python 绑定（无需 pip install）
-PYTHONPATH=python python -c "import decord; print(decord.__version__, decord.__ffmpeg_version__)"
+PYTHONPATH=python python -c "import decord; print(decord.__version__)"
 ```
 
-常用 CMake 选项：`-DUSE_CUDA=ON|OFF|<CUDA根目录>`（NVDEC；Windows 传路径时必须用
-正斜杠）、`-DFFMPEG_DIR=...`、`-DDECORD_INSTALL_LIBDIR=...`。Python 绑定按
+常用 CMake 选项：`-DUSE_CUDA=ON|OFF`（NVDEC；0.8.1 起无需 CUDA Toolkit）、
+`-DFFMPEG_DIR=...`、`-DDECORD_INSTALL_LIBDIR=...`。Python 绑定按
 `build/`（Windows 为 `build/Release`）→ `DECORD_LIBRARY_PATH` 的顺序找库。
 
 ## 快速上手
@@ -361,8 +376,9 @@ python tests/test_hybrid_lockstep.py 600     # 混跑字节级交错对照
 版本事实源为 `python/decord/_ffi/libinfo.py` 的 `__version__`（`pyproject.toml` 同步，
 用 `python tools/update_version.py` 统一更新）。发布走 GitHub Actions → **Release** →
 Run workflow：填版本号（如 `0.8.1`）与 ref（默认 `master`），workflow 自动 bump 版本 →
-tag `vX.Y.Z` → CUDA + FFmpeg 9.0 构建 → 打包 `decord-<ver>-win64-gpu.zip` → 创建
-Release。构建失败不产生任何 commit/tag/release。tag push 不触发 PyPI 发布（已移除）。
+tag `vX.Y.Z` → 构建 pip wheel（`decord-<ver>-cp3xx-win_amd64.whl`）→ 打包
+`decord-<ver>-win64-gpu.zip` → 创建 Release 并上传两个产物。构建失败不产生任何
+commit/tag/release。tag push 不触发 PyPI 发布（已移除）。
 
 ## 致谢与许可
 

@@ -19,6 +19,12 @@ endif()
 # You can create a config.cmake at build folder
 # and add set(OPTION VALUE) to override these build options.
 # Alernatively, use cmake -DOPTION=VALUE through command-line.
+# scikit-build-core(pip wheel)构建在 Windows 上默认启用 CUDA——本 fork 的
+# 发布形态是 win64-gpu,且 0.8.1 起 CUDA 构建零 Toolkit 依赖,可直接出包。
+# 显式 -DUSE_CUDA=OFF 仍然生效;普通 cmake 开发构建与非 Windows 平台不变。
+if(SKBUILD AND WIN32 AND NOT DEFINED USE_CUDA)
+  set(USE_CUDA ON)
+endif()
 decord_option(USE_CUDA "Build with CUDA" OFF)
 decord_option(USE_MSVC_MT "Build with MT" OFF)
 
@@ -170,7 +176,24 @@ endif()
 if(NOT DEFINED DECORD_INSTALL_LIBDIR)
   set(DECORD_INSTALL_LIBDIR decord)
 endif()
+# 不安装 ARCHIVE(.lib/.exp):pip wheel 只需要运行时 DLL,导入库是纯死重。
 install(TARGETS decord
   LIBRARY DESTINATION ${DECORD_INSTALL_LIBDIR}
-  RUNTIME DESTINATION ${DECORD_INSTALL_LIBDIR}
-  ARCHIVE DESTINATION ${DECORD_INSTALL_LIBDIR})
+  RUNTIME DESTINATION ${DECORD_INSTALL_LIBDIR})
+
+# wheel 化:decord.dll 的 FFmpeg 依赖必须与其同目录安装(python/decord/
+# _ffi/libinfo.py 在包目录下查找)。这里只装导入闭包实际需要的 6 个运行时
+# DLL——avdevice 未被 decord.dll 导入,ffprobe 等可执行程序与开发树里遗留
+# 的其它大版本系列一律不进 wheel。swscale 不在 decord.dll 直接导入表,但
+# avfilter 传递依赖它(BtbN/gyan 共享构建均如此),必须一并携带。
+if(WIN32 AND FFMPEG_DIR)
+  install(DIRECTORY "${FFMPEG_DIR}/bin/"
+    DESTINATION ${DECORD_INSTALL_LIBDIR}
+    FILES_MATCHING
+    PATTERN "avcodec-*.dll"
+    PATTERN "avformat-*.dll"
+    PATTERN "avutil-*.dll"
+    PATTERN "avfilter-*.dll"
+    PATTERN "swresample-*.dll"
+    PATTERN "swscale-*.dll")
+endif()

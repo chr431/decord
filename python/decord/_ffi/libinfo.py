@@ -87,6 +87,7 @@ def find_lib_path(name=None, search_path=None, optional=False):
 # We use the version of the incoming release for code
 # that is under development.
 # The following line is the single source of truth for this fork's version.
-# Bump it as part of the release process (see README "Releases" section);
-# python/setup.py and python/decord/__init__.py both derive from here.
+# Bump it as part of the release process (see README "Releases" section) or
+# via tools/update_version.py; pyproject.toml (pip wheel 元数据) and
+# python/decord/__init__.py derive from here.
 __version__ = "0.8.1"

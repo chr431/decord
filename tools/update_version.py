@@ -43,7 +43,7 @@ def update(file_name, pattern, repl):
 def main():
     curr_dir = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
     proj_root = os.path.abspath(os.path.join(curr_dir, ".."))
-    # python path（版本事实源；python/setup.py 与 python/decord/__init__.py 从中派生）
+    # python path（版本事实源；pyproject.toml 与 python/decord/__init__.py 从中派生）
     update(os.path.join(proj_root, "python", "decord", "_ffi", "libinfo.py"),
            r"(?<=__version__ = \")[.0-9a-z]+", __version__)
     # wheel 元数据（scikit-build-core 读 [project].version）

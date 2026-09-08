@@ -38,10 +38,17 @@ def _load_lib():
     # PATH may legitimately be unset in embedded/container environments
     # (dmlc/decord#357); get() keeps import alive there.
     existing_path = os.environ.get('PATH', '')
+    lib_dir = os.path.dirname(lib_path[0])
     if existing_path:
-        os.environ['PATH'] = existing_path + os.pathsep + os.path.dirname(lib_path[0])
+        os.environ['PATH'] = existing_path + os.pathsep + lib_dir
     else:
-        os.environ['PATH'] = os.path.dirname(lib_path[0])
+        os.environ['PATH'] = lib_dir
+    # Windows (Python 3.8+): dependent DLLs (the bundled FFmpeg runtime next
+    # to decord.dll) are resolved under LOAD_LIBRARY_SEARCH_* rules, where
+    # the legacy PATH append above is not consulted — register the directory
+    # explicitly. No-op elsewhere.
+    if hasattr(os, 'add_dll_directory'):
+        os.add_dll_directory(lib_dir)
     # RTLD_GLOBAL exports FFmpeg/libav symbols into the process namespace and
     # breaks other native extensions (PyAV/torch/cv2/duckdb; dmlc/decord#361).
     # Load with the ctypes default (RTLD_LOCAL) unless explicitly opted in.

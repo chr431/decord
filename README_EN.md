@@ -52,14 +52,32 @@ are backward-compatible extensions) while renovating the internals:
 
 - **FFmpeg 9.0** (shared build, `avcodec-63`). The
   [BtbN n9.0 win64 gpl-shared](https://github.com/BtbN/FFmpeg-Builds/releases)
-  builds are recommended; FFmpeg 7.x/8.x fail to compile by design.
-- The GPU (NVDEC) build additionally needs the **CUDA Toolkit (13.x verified) +
-  NVIDIA Video Codec SDK**, and a driver providing `nvcuvid`.
+  builds are recommended.
+- The GPU (NVDEC) build only needs an NVIDIA driver — **since 0.8.1 neither the
+  CUDA Toolkit nor the Video Codec SDK is required** (driver APIs are loaded
+  dynamically at runtime; the improc kernel ships as embedded PTX).
 
-### Prebuilt package (Windows, recommended)
+### Prebuilt wheel (Windows, recommended)
 
-Download `decord-<version>-win64-gpu.zip` from
-[GitHub Releases](https://github.com/chr431/decord/releases). Contents:
+Download `decord-<version>-cp3xx-cp3xx-win_amd64.whl` from
+[GitHub Releases](https://github.com/chr431/decord/releases) and install it:
+
+```bash
+pip install decord-<version>-cp313-cp313-win_amd64.whl
+```
+
+The wheel is self-contained: `decord.dll` plus the FFmpeg import closure
+(`avcodec/avformat/avutil/avfilter/swresample/swscale`, 6 DLLs, ~163 MB raw /
+64 MB compressed) installs into `site-packages/decord/`; `import decord` works
+out of the box with no source tree, build directory, or FFmpeg on `PATH`.
+`avdevice` and `ffprobe.exe` are not bundled (decord.dll does not import them).
+This fork does **not** depend on the PyPI `decord` package (that is upstream
+0.6.0, CPU-only).
+
+### Portable zip (Windows)
+
+Releases also provide `decord-<version>-win64-gpu.zip` (layout =
+RaceVideoToLog's `_decord_build/`, unzip and run):
 
 ```
 _decord_build/
@@ -71,38 +89,41 @@ _decord_build/
 
 Usage: put the `python/decord` directory on `PYTHONPATH` (or copy it into your
 project), and keep `decord.dll` plus the FFmpeg DLLs in the same directory or on
-`PATH`. This fork does **not** depend on the PyPI `decord` package (that is
-upstream 0.6.0, CPU-only).
+`PATH`.
 
-### pip install from source
+### pip build from source
 
 The build is driven by `pyproject.toml` (scikit-build-core): `pip install`
-compiles the shared library with CMake and bundles it into the wheel.
+compiles the shared library with CMake and bundles it together with the FFmpeg
+runtime closure into the wheel. On Windows a pip build **defaults to CUDA**
+(GPU variant, matching this fork's release artifact); point `FFMPEG_DIR` at an
+FFmpeg SDK (include/ + lib/):
 
 ```bash
 git clone --recursive https://github.com/chr431/decord
 cd decord
 
-# CPU-only
-pip install . --config-settings='cmake.args=-DUSE_CUDA=0'
+# Windows: GPU (default) — driver only, no Toolkit needed
+export FFMPEG_DIR=D:/path/to/ffmpeg-n9.0-latest-win64-gpl-shared-9.0
+pip install .
 
-# GPU (NVDEC): needs CUDA Toolkit + Video Codec SDK
-pip install . --config-settings="cmake.args=-DUSE_CUDA=ON;-DFFMPEG_DIR=D:/path/to/ffmpeg-9.0"
+# Windows: CPU-only override
+pip install . --config-settings="cmake.define.USE_CUDA=OFF"
+
+# One-shot in-repo script (vcvars + FFMPEG_DIR defaults wired up)
+make_wheel.bat
 ```
 
 On Linux, if the NVDEC build cannot find `libnvcuvid.so` (see upstream
 [#102](https://github.com/dmlc/decord/issues/102)), locate it with
 `ldconfig -p | grep libnvcuvid` and link it into `CUDA_TOOLKIT_ROOT_DIR/lib64`.
 
-At runtime the FFmpeg shared libraries (`avcodec-63.dll` etc.) must be on
-`PATH` or sit next to `decord.dll`.
-
 ### Development build (CMake + PYTHONPATH)
 
 ```bash
-# Windows (CUDA enabled; drop -DUSE_CUDA or pass 0 for CPU-only)
-cmake -S . -B build -DUSE_CUDA="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" \
-      -DFFMPEG_DIR="D:/path/to/ffmpeg-n9.0-win64-gpl-shared-9.0" -DCMAKE_BUILD_TYPE=Release
+# Windows (CUDA enabled)
+cmake -S . -B build -DUSE_CUDA=ON \
+      -DFFMPEG_DIR="D:/path/to/ffmpeg-n9.0-latest-win64-gpl-shared-9.0" -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 
 # Linux / macOS
@@ -110,11 +131,11 @@ cmake -S . -B build -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release -DFFMPEG_DIR=/path/t
 cmake --build build -j$(nproc)
 
 # Run the Python bindings against the freshly built library (no pip install)
-PYTHONPATH=python python -c "import decord; print(decord.__version__, decord.__ffmpeg_version__)"
+PYTHONPATH=python python -c "import decord; print(decord.__version__)"
 ```
 
-Useful CMake options: `-DUSE_CUDA=ON|OFF|<cuda-root>` (NVDEC; the path must use
-forward slashes on Windows), `-DFFMPEG_DIR=...`,
+Useful CMake options: `-DUSE_CUDA=ON|OFF` (NVDEC; no CUDA Toolkit needed since
+0.8.1), `-DFFMPEG_DIR=...`,
 `-DDECORD_INSTALL_LIBDIR=...`. The Python bindings locate the library in
 `build/` (`build/Release` on Windows) first, then `DECORD_LIBRARY_PATH`.
 
@@ -405,9 +426,10 @@ The version source of truth is `__version__` in
 `python/decord/_ffi/libinfo.py` (`pyproject.toml` kept in sync; update both via
 `python tools/update_version.py`). Releases run from GitHub Actions →
 **Release** → Run workflow: provide the version (e.g. `0.8.1`) and ref
-(default `master`); the workflow bumps the version → tags `vX.Y.Z` → builds
-with CUDA + FFmpeg 9.0 → packages `decord-<ver>-win64-gpu.zip` → creates the
-Release. A failed build produces no commit/tag/release. Tag pushes do not
+(default `master`); the workflow bumps the version → tags `vX.Y.Z` → builds the
+pip wheel (`decord-<ver>-cp3xx-win_amd64.whl`) → packages
+`decord-<ver>-win64-gpu.zip` → creates the Release with both artifacts. A
+failed build produces no commit/tag/release. Tag pushes do not
 trigger PyPI publishing (removed).
 
 ## Acknowledgements & license
