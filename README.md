@@ -1,378 +1,372 @@
-# Decord
+# Decord（现代化 fork）
+
+[English](README_EN.md) | 简体中文
 
 ![CI Build](https://github.com/chr431/decord/workflows/C/C++%20CI/badge.svg?branch=dev)
 
 ![symbol](docs/symbol.png)
 
-`Decord` is a reverse procedure of `Record`. It provides convenient video slicing methods based on a thin wrapper on top of hardware accelerated video decoders, e.g.
+`Decord` 是 `Record` 的逆序词。它在硬件加速视频解码器（FFmpeg / NVIDIA Video Codec
+/NVDEC）之上提供一层薄封装，把视频当作可随机访问的帧序列来用——为深度学习的数据
+管线解决"视频随机访问又慢又麻烦"的问题，也能解码音频并与视频同步切片。
 
--   FFMPEG/LibAV(Done)
--   Nvidia Codecs(Done)
+本仓库是 [dmlc/decord](https://github.com/dmlc/decord) 的**现代化 fork**，在保持上游
+0.6.0 API 完全兼容（已逐文件比对，公开 API 零缺失，差异全部是向后兼容扩展）的前提下
+做了大范围翻新：
 
-`Decord` was designed to handle awkward video shuffling experience in order to provide smooth experiences similar to random image loader for deep learning.
+- **只支持 FFmpeg 9.0**（编译期强制，`avcodec 63`）。7.x/8.x 兼容已移除：跨版本的
+  关键帧索引与 seek 落点行为差异曾引入难以排查的正确性问题。
+- **CUDA 13 + NVDEC** 构建链路翻新，Windows / Linux CI 均覆盖。
+- **hybrid 混合解码（实验性）**：单路 demux 在关键帧边界拆分给 CPU 软解与 NVDEC
+  并行解码、按呈现序合并——见 [hybrid 混合解码](#hybrid-混合解码实验性)。
+- **吞吐与正确性专项**（详见[本 fork 的主要改动](#本-fork-的主要改动)）：消费端批组装
+  解锁、seek 着陆自愈、混合调度节拍、NV12 直出、关键帧索引磁盘缓存等。
 
-`Decord` is also able to decode audio from both video and audio files. One can slice video and audio together to get a synchronized result; hence providing a one-stop solution for both video and audio decoding.
+> ⚠️ **hybrid / hybrid_gpu 是实验性接口**：调度策略、性能与显存/内存上界可能随版本
+> 变化且不另行通知。生产环境请使用 `cpu()` / `gpu()`。
 
-Table of contents
-=================
+## 目录
 
-- [Benchmark](#preliminary-benchmark)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Bridge for Deep Learning frameworks](#bridges-for-deep-learning-frameworks)
+- [安装](#安装)
+- [快速上手](#快速上手)
+- [seek 语义：seek() vs seek_accurate()](#seek-语义seek-vs-seek_accurate)
+- [hybrid 混合解码（实验性）](#hybrid-混合解码实验性)
+- [性能参考](#性能参考)
+- [API 速览](#api-速览)
+- [环境变量参考](#环境变量参考)
+- [本 fork 的主要改动](#本-fork-的主要改动)
+- [测试](#测试)
+- [发布流程（维护者）](#发布流程维护者)
+- [致谢与许可](#致谢与许可)
 
-## Preliminary benchmark
+## 安装
 
-Decord is good at handling random access patterns, which is rather common during neural network training.
+### 硬性依赖
 
-![Speed up](https://user-images.githubusercontent.com/3307514/71223638-7199f300-2289-11ea-9e16-104038f94a55.png)
+- **FFmpeg 9.0**（shared 构建，`avcodec-63`）。推荐
+  [BtbN n9.0 win64 gpl-shared](https://github.com/BtbN/FFmpeg-Builds/releases)；
+  FFmpeg 7.x/8.x 会直接编译失败。
+- GPU（NVDEC）构建另需 **CUDA Toolkit（13.x 已验证）+ NVIDIA Video Codec SDK**，
+  且驱动需提供 `nvcuvid` 库。
 
-## Installation
+### 预编译包（Windows，推荐）
 
-### Install via pip
+从 [GitHub Releases](https://github.com/chr431/decord/releases) 下载
+`decord-<版本>-win64-gpu.zip`，内含：
 
-PyPI 上的 `decord` 是上游 0.6.0（CPU 版）；本 fork 不依赖它，通过 GitHub
-Release 分发预编译包（见下方「Releases（本 fork）」），解压即用、无需 pip。
-从源码安装（含 pip 安装）见下一节。
-
-Supported platforms:
-
-- [x] Linux
-- [x] Mac OS >= 10.12, python>=3.5
-- [x] Windows
-
-
-### Install from source
-
-The build is driven by a `pyproject.toml` (scikit-build-core): `pip install`
-compiles the shared library with CMake and bundles it into the wheel, so
-no separate build step is needed.
-
-#### Linux
-
-Install the system packages for building the shared library, for Debian/Ubuntu users, run:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake ninja-build
-sudo apt-get install -y ffmpeg libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libswresample-dev
+```
+_decord_build/
+├── decord.dll            # CPU+NVDEC 构建
+├── avcodec-63.dll 等     # FFmpeg 9.0 运行库
+├── ffprobe.exe
+└── python/decord/        # Python 绑定
 ```
 
-Clone the repo recursively(important)
+使用方式：把 `python/decord` 所在目录加入 `PYTHONPATH`（或直接拷到你的项目里），
+并保证 `decord.dll` 与 FFmpeg DLL 同目录或在 `PATH` 上。**不依赖 PyPI 上的 decord**
+（那是上游 0.6.0 CPU 版）。
+
+### 从源码 pip 安装
+
+构建由 `pyproject.toml`（scikit-build-core）驱动：`pip install` 会用 CMake 编译共享
+库并打进 wheel。
 
 ```bash
 git clone --recursive https://github.com/chr431/decord
-```
-
-Install:
-
-```bash
 cd decord
-pip install .
-```
 
-If your FFmpeg is not found automatically, point CMake at it:
-
-```bash
-FFMPEG_DIR=/path/to/ffmpeg pip install .
-```
-
-#### GPU (NVDEC) builds
-
-Enable CUDA at build time. CUDA and the NVIDIA Video Codec SDK are required:
-
-```bash
-# CPU-only:
+# 纯 CPU
 pip install . --config-settings='cmake.args=-DUSE_CUDA=0'
 
-# GPU (requires CUDA toolkit + Video Codec SDK; libnvcuvid must be found):
-pip install . --config-settings='cmake.args=-DUSE_CUDA=ON'
+# GPU (NVDEC)：需要 CUDA Toolkit + Video Codec SDK
+pip install . --config-settings="cmake.args=-DUSE_CUDA=ON;-DFFMPEG_DIR=D:/path/to/ffmpeg-9.0"
 ```
 
-Note that if you encountered the an issue with `libnvcuvid.so` (e.g., see [#102](https://github.com/dmlc/decord/issues/102)), it's probably due to the missing link for
-`libnvcuvid.so`, you can manually find it (`ldconfig -p | grep libnvcuvid`) and link the library to `CUDA_TOOLKIT_ROOT_DIR\lib64` to allow `decord` smoothly detect and link the correct library.
+Linux 下 NVDEC 构建若报 `libnvcuvid.so` 找不到，可参考上游
+[#102](https://github.com/dmlc/decord/issues/102)：用 `ldconfig -p | grep libnvcuvid`
+找到该库并链接到 `CUDA_TOOLKIT_ROOT_DIR/lib64`。
 
-To specify a customized FFMPEG library path, pass `-DFFMPEG_DIR=/path/to/ffmpeg` (or set the `FFMPEG_DIR` environment variable).
+运行期 FFmpeg 共享库（`avcodec-63.dll` 等）必须在 `PATH` 上，或与 `decord.dll`
+同目录。
 
-Editable development install (rebuilds on import):
+### 开发构建（CMake + PYTHONPATH）
 
 ```bash
-FFMPEG_DIR=/path/to/ffmpeg pip install -e .
-```
+# Windows（启用 CUDA；纯 CPU 去掉 -DUSE_CUDA 或传 0）
+cmake -S . -B build -DUSE_CUDA="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" \
+      -DFFMPEG_DIR="D:/path/to/ffmpeg-n9.0-win64-gpl-shared-9.0" -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 
-#### Windows
-
-Install CMake, Visual Studio (with C++ toolchain) and an FFmpeg build
-(>= 5.0) such as the ones from <https://www.gyan.dev/ffmpeg/builds/>.
-Then:
-
-```powershell
-$env:FFMPEG_DIR = "D:\path\to\ffmpeg"   # folder containing include/ and lib/
-pip install .
-```
-
-At runtime the FFmpeg shared libraries (`avcodec-*.dll` etc.) must be
-findable — either on `PATH` or next to `decord.dll` (the FFmpeg bin
-folder on `PATH` is the usual setup). The GPU (NVDEC) build requires the
-CUDA toolkit and the NVIDIA Video Codec SDK:
-
-```powershell
-pip install . --config-settings="cmake.args=-DUSE_CUDA=ON;-DFFMPEG_DIR=D:\path\to\ffmpeg"
-```
-
-#### Development build (build/ + PYTHONPATH)
-
-For hacking on decord itself, build the shared library with CMake and run
-the python package in place — `decord/_ffi/libinfo.py` finds the library
-in `build/` (or `build/Release` on Windows):
-
-```bash
 # Linux / macOS
 cmake -S . -B build -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release -DFFMPEG_DIR=/path/to/ffmpeg
 cmake --build build -j$(nproc)
 
-# Windows (CUDA enabled; omit -DUSE_CUDA=ON for CPU-only)
-cmake -S . -B build -DUSE_CUDA=ON -DFFMPEG_DIR=D:/path/to/ffmpeg
-cmake --build build --config Release
+# 直接用新构建的库跑 Python 绑定（无需 pip install）
+PYTHONPATH=python python -c "import decord; print(decord.__version__, decord.__ffmpeg_version__)"
 ```
 
-Then run the python bindings against the freshly built library (no pip
-install needed):
+常用 CMake 选项：`-DUSE_CUDA=ON|OFF|<CUDA根目录>`（NVDEC；Windows 传路径时必须用
+正斜杠）、`-DFFMPEG_DIR=...`、`-DDECORD_INSTALL_LIBDIR=...`。Python 绑定按
+`build/`（Windows 为 `build/Release`）→ `DECORD_LIBRARY_PATH` 的顺序找库。
 
-```bash
-PYTHONPATH=python python -c "from decord import VideoReader; print(len(VideoReader('examples/flipping_a_pancake.mkv')))"
-```
-
-Set `DECORD_LIBRARY_PATH` to point at the shared library if it lives
-somewhere else.  Useful build options: `-DUSE_CUDA=ON|OFF` (NVDEC),
-`-DFFMPEG_DIR=...` (custom FFmpeg), `-DDECORD_INSTALL_LIBDIR=...`
-(install destination for `cmake --install`).
-
-### Releases（本 fork）
-
-本 fork 是 RaceVideoToLog 的硬依赖（next_roi / get_codec / GPU 动态加载 /
-CPU 内存修复），**不依赖 PyPI decord**。版本与发布遵循：
-
-- **版本号**：SemVer `X.Y.Z`，事实源为
-  `python/decord/_ffi/libinfo.py` 的 `__version__`（`python/setup.py` 与
-  `python/decord/__init__.py` 从它派生）。`pyproject.toml`（wheel 元数据）
-  与其保持同步：统一跑 `python tools/update_version.py`（改脚本顶部
-  `__version__` 后执行），或由发布 workflow 的 bump 步骤同步更新两处。
-- **tag 约定**：`v<X.Y.Z>`（如 `v0.7.0`）。
-- **发布产物**：GitHub Release 的 `decord-<ver>-win64-gpu.zip`，内含
-  `_decord_build/` 布局 —— `decord.dll` + FFmpeg 8.1 DLLs + `ffprobe.exe`
-  + `python/decord/`。解压即得 RaceVideoToLog 的 `_decord_build/` 目录，
-  `setup_venv.bat` 直接拷贝。
-
-#### 发布流程（一键）
-
-在 GitHub Actions → **Release** → Run workflow：
-
-1. `version`：要发布的版本号（如 `0.7.0`），会自动打 tag `v0.7.0`
-2. `ref`：默认 `master`（可改为其它分支）
-
-workflow 会依次：校验版本格式 + tag 不重复 → 安装 CUDA Toolkit +
-下载 BtbN FFmpeg 8.1 → CMake GPU 构建 → 若 `libinfo.py` / `pyproject.toml`
-版本不符则同步升版本并 commit+push → 打 tag → 打包 zip → 创建 Release
-（notes = 自上一 tag 的 commit 列表）并上传 zip。**构建失败不会产生任何
-commit/tag/release**。
-
-#### 手动构建（无 GitHub 时）
-
-```bash
-# CUDA 路径必须用正斜杠（反斜杠会被 CMake 当转义序列）
-cmake -S . -B build -DUSE_CUDA="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" \
-      -DFFMPEG_DIR="D:/path/to/ffmpeg-8.1" -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-# 产物: build/Release/decord.dll（FFmpeg DLLs 需与 decord.dll 同目录）
-```
-
-#### Mac OS
-
-Installation on macOS is similar to Linux. But macOS users need to install building tools like clang, GNU Make, cmake first.
-
-Tools like clang and GNU Make are packaged in _Command Line Tools_ for macOS. To install:
-
-```bash
-xcode-select --install
-```
-
-To install other needed packages like cmake, we recommend first installing Homebrew, which is a popular package manager for macOS. Detailed instructions can be found on its [homepage](https://brew.sh/).
-
-After installation of Homebrew, install cmake and ffmpeg by:
-
-```bash
-brew install cmake ffmpeg
-# note: make sure you have cmake 3.8 or later, you can install from cmake official website if it's too old
-```
-
-Clone the repo recursively(important)
-
-```bash
-git clone --recursive https://github.com/chr431/decord
-```
-
-Then go to root directory build shared library:
-
-```bash
-cd decord
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make
-```
-
-Install python bindings:
-
-```bash
-cd ../python
-# option 1: add python path to $PYTHONPATH, you will need to install numpy separately
-pwd=$PWD
-echo "PYTHONPATH=$PYTHONPATH:$pwd" >> ~/.bash_profile
-source ~/.bash_profile
-# option 2: install with setuptools
-python3 setup.py install --user
-```
-
-## Usage
-
-Decord provides minimal API set for bootstraping. You can also check out jupyter notebook [examples](examples/).
+## 快速上手
 
 ### VideoReader
 
-VideoReader is used to access frames directly from video files.
-
 ```python
-from decord import VideoReader
-from decord import cpu, gpu
+import decord
+from decord import VideoReader, cpu, gpu
+
+print(decord.__version__, decord.__ffmpeg_version__)   # 0.7.14 9.0.x
 
 vr = VideoReader('examples/flipping_a_pancake.mkv', ctx=cpu(0))
-# a file like object works as well, for in-memory decoding
+# 文件对象也可以（内存内解码）
 with open('examples/flipping_a_pancake.mkv', 'rb') as f:
-  vr = VideoReader(f, ctx=cpu(0))
+    vr = VideoReader(f, ctx=cpu(0))
+
 print('video frames:', len(vr))
-# 1. the simplest way is to directly access frames
+
+# 逐帧顺序读取（内部自动做最高效的 seek/skip）
 for i in range(len(vr)):
-    # the video reader will handle seeking and skipping in the most efficient manner
-    frame = vr[i]
-    print(frame.shape)
+    frame = vr[i]          # decord.ndarray.NDArray, HxWx3
+    ...
 
-# To get multiple frames at once, use get_batch
-# this is the efficient way to obtain a long list of frames
+# 批量读取：随机/乱序索引最高效的入口
 frames = vr.get_batch([1, 3, 5, 7, 9])
-print(frames.shape)
-# (5, 240, 320, 3)
-# duplicate frame indices will be accepted and handled internally to avoid duplicate decoding
+print(frames.shape)        # (5, 240, 320, 3)
+# 重复索引合法，内部去重，不重复解码
 frames2 = vr.get_batch([1, 2, 3, 2, 3, 4, 3, 4, 5]).asnumpy()
-print(frames2.shape)
-# (9, 240, 320, 3)
 
-# 2. you can do cv2 style reading as well
-# skip 100 frames
-vr.skip_frames(100)
-# seek to start
-vr.seek(0)
-batch = vr.next()
-print('frame shape:', batch.shape)
-print('numpy frames:', batch.asnumpy())
+# 等差步长采样（分频/frame-skip）走流式快速路径：一次顺序解码完成整段
+frames3 = vr.get_batch(range(0, 600, 3))
 
+# 流式发射：后台线程预取下一批，解码完即交付（批间顺序=完成序）
+for start_pos, batch in vr.get_batch_stream(range(0, len(vr)), batch=250):
+    ...  # 批内按 indices 序；跨批按 start_pos 重排或与顺序无关
 ```
 
-### Hybrid decoding (EXPERIMENTAL)
-
-`decord.hybrid(ctx)` / `decord.hybrid_gpu(ctx)` split one demux stream at
-keyframe boundaries between the CPU software decoder and NVDEC. These
-contexts are **experimental**: scheduling, performance and memory bounds
-may change between releases without notice. Prefer `cpu()` / `gpu()` for
-production use.
-
-### VideoLoader
-
-VideoLoader is designed for training deep learning models with tons of video files.
-It provides smart video shuffle techniques in order to provide high random access performance (We know that seeking in video is super slow and redundant).
-The optimizations are underlying in the C++ code, which are invisible to user.
+### 输出格式与 ROI
 
 ```python
-from decord import VideoLoader
-from decord import cpu, gpu
+# output_format: 'rgb' (HxWx3) | 'gray' (HxW) | 'yuv420' (H*3/2 x W 半平面 NV12)
+vr = VideoReader('video.mp4', ctx=cpu(0), output_format='yuv420')
 
-vl = VideoLoader(['1.mp4', '2.avi', '3.mpeg'], ctx=[cpu(0)], shape=(2, 320, 240, 3), interval=1, skip=5, shuffle=1)
-print('Total batches:', len(vl))
-
-for batch in vl:
-    print(batch[0].shape)
+# ROI-first：固化后解码器只输出该矩形（CPU 在颜色转换前裁剪，
+# GPU 只转换 ROI 窗口），必须在读任何帧之前设置
+vr = VideoReader('video.mp4', ctx=gpu(0), roi=(100, 60, 740, 660))
+frame = vr.next()          # 直接得到 ROI 帧
 ```
 
-Shuffling video can be tricky, thus we provide various modes:
+### 元数据探测（不开解码器）
 
 ```python
-shuffle = -1  # smart shuffle mode, based on video properties, (not implemented yet)
-shuffle = 0  # all sequential, no seeking, following initial filename order
-shuffle = 1  # random filename order, no random access for each video, very efficient
-shuffle = 2  # random order
-shuffle = 3  # random frame access in each video only
+from decord import probe
+
+info = probe('video.mp4')
+# {'duration_s':…, 'bit_rate':…, 'nb_frames':…, 'video_codec':'h264',
+#  'width':1920, 'height':1080, 'pix_fmt':'yuv420p', 'avg_fps':…,
+#  'audio_streams':1, 'subtitle_streams':0}
+# 等价于一次最小 ffprobe，毫秒级，不创建解码器、不分配帧缓冲
 ```
 
-### AudioReader
-
-AudioReader is used to access samples directly from both video(if there's an audio track) and audio files.
+### seek 语义：seek() vs seek_accurate()
 
 ```python
-from decord import AudioReader
-from decord import cpu, gpu
+vr.seek(pos)            # 快速 seek：落点只在"关键帧级别"保证（可能落在
+                        # pos 之前或之后的关键帧），文档化的非精确行为
+vr.seek_accurate(pos)   # 精确 seek：着陆校验自愈，保证下一帧 == 顺序读的第 pos 帧
+vr.skip_frames(100)     # 顺序跳帧
+```
 
-# You can specify the desired sample rate and channel layout
-# For channels there are two options: default to the original layout or mono
+需要帧级精度的随机访问请用 `seek_accurate()` 或 `get_batch([pos])`（两者都逐帧精确）。
+`seek()` 只适合"回到开头/大致位置"的场景。
+
+### AudioReader / AVReader / VideoLoader
+
+音频与音视频同步切片、以及训练用批量装载器与上游用法一致：
+
+```python
+from decord import AudioReader, AVReader, VideoLoader
+
 ar = AudioReader('example.mp3', ctx=cpu(0), sample_rate=44100, mono=False)
-print('Shape of audio samples: ', ar.shape())
-# To access the audio samples
-print('The first sample: ', ar[0])
-print('The first five samples: ', ar[0:5])
-print('Get a batch of samples: ', ar.get_batch([1,3,5]))
-```
-
-### AVReader
-
-AVReader is a wraper for both AudioReader and VideoReader. It enables you to slice the video and audio simultaneously.
-
-```python
-from decord import AVReader
-from decord import cpu, gpu
+print(ar[0:5])
 
 av = AVReader('example.mov', ctx=cpu(0))
-# To access both the video frames and corresponding audio samples
-audio, video = av[0:20]
-# Each element in audio will be a batch of samples corresponding to a frame of video
-print('Frame #: ', len(audio))
-print('Shape of the audio samples of the first frame: ', audio[0].shape)
-print('Shape of the first frame: ', video.asnumpy()[0].shape)
-# Similarly, to get a batch
-audio2, video2 = av.get_batch([1,3,5])
+audio, video = av[0:20]      # 每帧视频对应一段音频样本
+
+vl = VideoLoader(['1.mp4', '2.avi', '3.mpeg'], ctx=[cpu(0)],
+                 shape=(2, 320, 240, 3), interval=1, skip=5, shuffle=1)
+for batch in vl:
+    ...
 ```
 
+shuffle 模式与上游一致：`0` 全顺序；`1` 文件名乱序（每文件内顺序，最高效）；
+`2` 全随机；`3` 文件内随机帧访问。
 
-
-## Bridges for deep learning frameworks:
-
-It's important to have a bridge from decord to popular deep learning frameworks for training/inference
-
--   Apache MXNet (Done)
--   Pytorch (Done)
--   TensorFlow (Done)
-
-Using bridges for deep learning frameworks are simple, for example, one can set the default tensor output to `mxnet.ndarray`:
+### 深度学习框架桥接
 
 ```python
 import decord
-vr = decord.VideoReader('examples/flipping_a_pancake.mkv')
-print('native output:', type(vr[0]), vr[0].shape)
-# native output: <class 'decord.ndarray.NDArray'>, (240, 426, 3)
-# you only need to set the output type once
-decord.bridge.set_bridge('mxnet')
-print(type(vr[0], vr[0].shape))
-# <class 'mxnet.ndarray.ndarray.NDArray'> (240, 426, 3)
-# or pytorch and tensorflow(>=2.2.0)
-decord.bridge.set_bridge('torch')
-decord.bridge.set_bridge('tensorflow')
-# or back to decord native format
-decord.bridge.set_bridge('native')
+decord.bridge.set_bridge('torch')    # 'mxnet' | 'torch' | 'tensorflow' | 'native'
+# 此后 vr[0] / get_batch(...) 直接返回目标框架的张量
 ```
+
+## hybrid 混合解码（实验性）
+
+`decord.hybrid(dev_id)`（输出落主机内存）与 `decord.hybrid_gpu(dev_id)`（帧驻留显存）
+把**一路 demux 码流在关键帧边界切成块**，按实测产率比例（water-filling）分给 CPU 软解
+（FFmpeg，多帧并行）与 NVDEC（CUVID），两侧并行解码、按呈现序合并发射：
+
+- 调度器在线学习两侧产率（CPU 侧为 filter 后有效产出，GPU 侧为落地速率 EWMA），
+  按比例分配块；粘性块交替避免频繁断流。
+- 内存/显存有自适应硬预算（默认取空闲量的 30%，可用环境变量覆盖），所有队列深度
+  由预算推导，防 OOM。
+- 选择 hybrid 即是显式要求 CPU+GPU 混跑：**内部不做慢侧自动回退**，即使某些码流
+  上混跑慢于纯 NVDEC（尊重用户选择；实验语义不作静默替换）。
+
+```python
+import warnings
+from decord import VideoReader, hybrid, hybrid_gpu
+
+with warnings.catch_warnings():
+    warnings.simplefilter('ignore')          # 实验性 UserWarning 可按需忽略
+    vr = VideoReader('video.mp4', ctx=hybrid(0), output_format='yuv420')
+
+vr.seek_accurate(0)
+batch = vr.get_batch(range(0, 1000))         # 与普通 reader 完全同 API
+```
+
+**何时有用**：软解与 NVDEC 速率接近的码流（典型如 1080p H.264）收益最大；软解明显
+慢于 NVDEC 的码流（hevc/av1）混跑通常介于两者之间——快于纯 CPU、慢于纯 NVDEC。
+请以自己机器上的实测为准（见[性能参考](#性能参考)）。
+
+## 性能参考
+
+以下为**本机实测口径**（AMD Ryzen 9 7945HX + RTX 4060 Laptop，Windows，FFmpeg 9.0
+shared，1080p，`output_format='yuv420'`，`get_batch` 每批 250 帧顺序读，5 轮取中位，
+单位 fps）。不同机器/码流/分辨率差异很大，请自行实测；hybrid 属实验性，数字仅供
+量级参考。
+
+| 解码方式 | H.264 | HEVC | AV1 |
+|---|---|---|---|
+| `cpu`（12 解码线程） | 1243 | 721 | 709 |
+| `gpu`（NVDEC） | ~970 | 1836 | 1479 |
+| `hybrid`（实验性，→主机内存） | **1587** | 1457 | 1108 |
+| `hybrid_gpu`（实验性，→显存） | 1421 | 1421 | 1031 |
+| hybrid 相对纯 CPU | 1.28x | 2.02x | 1.56x |
+
+说明：
+
+- H.264 上软解与 NVDEC 速率接近，混跑接近"两者之和"的理想；hevc/av1 混跑快于纯
+  CPU 但慢于纯 NVDEC（无自动回退，见上）。
+- `get_batch` 的吞吐包含全部管线（消费端批组装：批缓冲池 + 拷贝/解码重叠），纯 CPU
+  路径同样受益。
+- `probe()` 元数据探测毫秒级、不建解码器，适合做调度前的资产检查。
+
+## API 速览
+
+`VideoReader`（完整文档见 `python/decord/video_reader.py` docstring）：
+
+| 成员 | 说明 |
+|---|---|
+| `len(vr)` / `get_key_indices()` | 帧数 / 关键帧索引列表 |
+| `vr[i]` / `vr.next()` | 单帧读取（NDArray） |
+| `vr.get_batch(indices, roi=None)` | 批量读取；支持乱序、重复索引、等差步长快速路径 |
+| `vr.get_batch_stream(indices, batch=250)` | 流式发射：后台预取，批间按完成序交付 `(start_pos, batch)` |
+| `vr.seek(pos)` / `vr.seek_accurate(pos)` | 快速（关键帧级）/ 精确（帧级）seek |
+| `vr.skip_frames(n)` | 顺序跳帧 |
+| `vr.next_roi(x1,y1,x2,y2)` / `get_batch(..., roi=…)` | ROI 读取（ROI-first 时解码器只输出该矩形） |
+| `vr.get_frame_timestamp(idx)` / `get_avg_fps()` | 时间戳 / 平均帧率 |
+| `vr.get_codec()` / `get_color_range()` | 编码名 / 流 color range |
+| `probe(uri)`（模块级） | 不开解码器的容器/流元数据（dict） |
+| `get_ffmpeg_version()` / `decord.__ffmpeg_version__` | 加载中的原生库实际链接的 FFmpeg 版本 |
+
+模块级：`cpu(id)`、`gpu(id)`、`hybrid(id)`、`hybrid_gpu(id)`、`probe`、
+`bridge.set_bridge(...)`、`VideoLoader`、`AudioReader`、`AVReader`。
+
+## 环境变量参考
+
+常用（全部可选，不设即用自适应默认值）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DECORD_LIBRARY_PATH` | — | Python 绑定搜索 `decord.dll`/`libdecord.so` 的额外目录 |
+| `DECORD_FFMPEG_THREAD_COUNT` | 物理核数（clamp 2–16） | CPU 软解线程数（NVDEC 不受影响） |
+| `DECORD_FILTER_THREADS` | 1 | CPU 侧 filter 线程数 |
+| `DECORD_PREFETCH_DEPTH` | 8 | 纯 CPU/GPU 管线的 demux 领先深度 |
+| `DECORD_CPU_FRAME_QUEUE_SIZE` | 自适应 | CPU 解码输出队列深度（内存上界） |
+| `DECORD_CONVERT_WORKERS` | 自动（RGB 输出 2–8） | RGB 转换扇出线程池（`0/1` 关闭） |
+| `DECORD_BATCH_BUF_POOL` / `DECORD_BATCH_BUF_POOL_MAX` | 1 / 2 | get_batch 批缓冲池开关与保留块数 |
+| `DECORD_BATCH_COPY_WORKERS` | 2–4 自动 | 批拷贝工作线程（`0` 恢复串行拷贝） |
+| `DECORD_DISABLE_INDEX_CACHE` | 未设 | 设后禁用关键帧索引磁盘缓存（默认写系统缓存目录） |
+| `DECORD_HYBRID_VRAM_BUDGET_MB` / `DECORD_HYBRID_RAM_BUDGET_MB` | 空闲量 ×30% | hybrid 显存/内存硬预算（覆盖自动值） |
+| `DECORD_PREFETCH_DEPTH_HYBRID` | 384 | hybrid demux 领先基线（实际取 max(此值, 解码器建议)） |
+| `DECORD_EOF_RETRY_MAX` / `DECORD_REWIND_RETRY_MAX` | 10240 / 16 | 损坏流容错的 EOF/回退重试上界 |
+
+诊断用（日常无需）：
+
+| 变量 | 说明 |
+|---|---|
+| `DECORD_HYBRID_DEBUG` | hybrid 调度/预算/发射遥测（stderr） |
+| `DECORD_SEEK_DEBUG` | seek 落点跟踪 |
+| `DECORD_CPU_RATE_DEBUG` | CPU 产率段折叠打印 |
+| `DECORD_HYBRID_FORCE_SIDE=cpu\|gpu` | 强制混合解码全走单侧（实验对照） |
+| `DECORD_HYBRID_PREFETCH` | 直控 hybrid demux 领先深度（绕过公式） |
+
+## 本 fork 的主要改动
+
+相对上游 0.6.0（除依赖翻新外）的主要工程项，按主题：
+
+**吞吐**
+
+- get_batch 消费端解锁：批缓冲池（免每批 ~0.8GB 大块分配的首触缺页税）+ 逐帧拷贝
+  派发后台线程与解码重叠；等差步长（分频采样）走单遍流式快速路径。
+- CPU 管线：NV12 直出（filter `format=nv12` + 两次 memcpy 打包）替代标量 U/V 交错
+  循环；解码线程默认随物理核扩展（clamp 2–16）。
+- NVDEC：每帧 CUDA event 同步替代全流同步；D2H 异步环；上载批量化（批末单 sync）。
+- hybrid：调度按实测产率 water-filling；demux 决策节拍与速率学习解耦；GPU 领先
+  硬顶防 dav1d 尾帧死锁；批量 H2D 上载。
+
+**正确性**
+
+- seek 着陆校验改为 pts 锚定的有界自愈循环（命中交付 / 欠冲前进 / 过冲回退关键帧）。
+- FFmpeg 9-only 编译期门禁，消除跨版本索引/落点行为差异这一整类问题。
+- 重复索引、批缓冲池复用、混合块边界的并发修正（逐字节 lockstep 套件守护）。
+
+**工程**
+
+- 关键帧索引磁盘缓存（按 路径哈希 + 大小 + mtime 失效，写系统缓存目录）。
+- `probe()` / `get_ffmpeg_version()` C API 与 Python 绑定。
+- ROI-first 解码管线（CPU/GPU 统一只输出固定矩形）。
+- 测试：`tests/run_fast.sh` 并行四套件（md5 / 流式 / 步长 / lockstep 字节级对照）。
+
+完整历史见 commit log；`dev` 与 `master` 均受 CI 监听。
+
+## 测试
+
+```bash
+# 快速回归（约 3 分钟；DECORD_LIBRARY_PATH 指向构建产物目录）
+DECORD_LIBRARY_PATH=<dll目录> bash tests/run_fast.sh [帧数]
+
+# 单套件
+python tests/test_hybrid.py --n 600          # md5 + seek
+python tests/test_hybrid_lockstep.py 600     # 混跑字节级交错对照
+```
+
+## 发布流程（维护者）
+
+版本事实源为 `python/decord/_ffi/libinfo.py` 的 `__version__`（`pyproject.toml` 同步，
+用 `python tools/update_version.py` 统一更新）。发布走 GitHub Actions → **Release** →
+Run workflow：填版本号（如 `0.7.14`）与 ref（默认 `master`），workflow 自动 bump 版本 →
+tag `vX.Y.Z` → CUDA + FFmpeg 9.0 构建 → 打包 `decord-<ver>-win64-gpu.zip` → 创建
+Release。构建失败不产生任何 commit/tag/release。tag push 不触发 PyPI 发布（已移除）。
+
+## 致谢与许可
+
+- 上游项目 [dmlc/decord](https://github.com/dmlc/decord)——本 fork 的全部基础架构
+  （FFI、reader/loader、bridge）来自上游，遵循 **Apache License 2.0**（见
+  [LICENSE](LICENSE)）。
+- 视频解码依赖 [FFmpeg](https://ffmpeg.org)（动态链接）。本仓库以 Apache-2.0 发布；
+  FFmpeg 自身的许可（LGPL-2.1+，启用 GPL 构建组件时为 GPL）随所选二进制适用，
+  分发时请一并遵守。
+- NVIDIA Video Codec SDK / NVDEC 遵循 NVIDIA 相应许可。
