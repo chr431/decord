@@ -76,6 +76,17 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
          *  一个 chunk 帧数（~286）就会退化为实时跟随解码速率
          *  （hevc CPU 侧 ~700fps，实测整体被拖到 0.70x）。 */
         void SetQueueDepth(int n) { max_queue_frames_ = n; }
+        /*! \brief 可发射存货深度（filter 后帧队列）。混合调度的库存迟滞
+         *  切换信号：GPU 块把它灌满、CPU 块把它排空 —— 份额自发涌现。 */
+        size_t QueueDepth() const {
+            return frame_queue_ ? frame_queue_->Size() : 0;
+        }
+        /*! \brief 在途深度（未解码包 + 已解码未 filter 的原始帧）。
+         *  与 QueueDepth 的差值用于诊断"包在途却不产出"的停摆层。 */
+        size_t PendingDepth() const {
+            return (pkt_queue_ ? pkt_queue_->Size() : 0)
+                 + (raw_queue_ ? raw_queue_->Size() : 0);
+        }
         double ProductionRate() const {
             return prod_rate_.load(std::memory_order_relaxed);
         }
