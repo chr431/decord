@@ -506,6 +506,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
     }
     // hybrid 解码器需要 (关键帧 pts, 呈现序帧号) 表：chunk 的 expected
     // 帧数 = 相邻关键帧 rank 差，是"补满才关 chunk"合并逻辑的基准。
+#ifdef DECORD_USE_CUDA
     if (IsHybridType(static_cast<int>(ctx_.device_type))) {
         auto *hybrid = dynamic_cast<HybridThreadedDecoder *>(decoder_.get());
         if (hybrid && !frame_ts_.empty() && !key_indices_.empty()
@@ -519,6 +520,7 @@ void VideoReader::SetVideoStream(int stream_nb) {
                                      static_cast<int64_t>(frame_ts_.size()));
         }
     }
+#endif
 }
 
 unsigned int VideoReader::QueryStreams() const {

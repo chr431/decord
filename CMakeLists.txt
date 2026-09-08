@@ -103,6 +103,12 @@ file(GLOB DECORD_CORE_SRCS src/*.cc src/runtime/*.cc src/video/*.cc src/sampler/
 include(cmake/modules/FFmpeg.cmake)
 include(cmake/modules/CUDA.cmake)
 
+# CPU-only 构建排除 hybrid 解码器（构造期初始化 CUDA 专属成员，与
+# nvcodec 同款处理；VideoReader 对其引用已有 DECORD_USE_CUDA 守卫）
+if(NOT USE_CUDA)
+  list(FILTER DECORD_CORE_SRCS EXCLUDE REGEX "hybrid_threaded_decoder")
+endif()
+
 # Targets
 
 add_library(decord SHARED ${DECORD_CORE_SRCS} ${DECORD_FFMPEG_SRCS} ${NVDEC_SRCS} ${RUNTIME_CUDA_SRCS} ${NVDEC_CUDA_SRCS})

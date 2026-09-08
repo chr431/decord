@@ -15,7 +15,15 @@ jobs:
       with:
         submodules: recursive
     - name: install dependencies
-      run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake ninja-build ffmpeg libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libswresample-dev libgtest-dev
+      # apt ffmpeg 仅提供 CLI（ffprobe 供测试用）；头文件/链接库必须用
+      # FFmpeg 9.0（编译期门禁 avcodec 63，apt 版本过旧直接 #error）
+      run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake ninja-build ffmpeg xz-utils libgtest-dev
+    - name: Download FFmpeg 9.0 (shared, BtbN linux64)
+      run: |
+        curl -L -o ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-shared-9.0.tar.xz
+        mkdir ffmpeg && tar -xJf ffmpeg.tar.xz -C ffmpeg --strip-components=1
+        echo "FFMPEG_DIR=$PWD/ffmpeg" >> $GITHUB_ENV
+        echo "LD_LIBRARY_PATH=$PWD/ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
     - name: install test dependencies
       run: pip3 install pytest
     - name: install (scikit-build-core builds libdecord)

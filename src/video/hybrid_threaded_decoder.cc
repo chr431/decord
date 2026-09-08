@@ -60,7 +60,9 @@
 #include <unistd.h>
 #endif
 
+#ifdef DECORD_USE_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <algorithm>
 #include <cstring>
 
@@ -1029,6 +1031,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         runtime::NDArray f;
         if (!PopSide(s, &f)) {
             static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
+#ifdef DECORD_USE_CUDA
             if (dbg) {
                 // 连续取空诊断：头部 chunk 与两侧队列状态（D 类问题定位用）。
                 // 只嵌 rmtx_ 读队列长度；chunk/pend 字段按本文件既有调试
@@ -1052,6 +1055,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                             (int)side_pending_[1]);
                 }
             }
+#endif
             if (dbg) fprintf(stderr, "[hybrid-p] empty side=%d emitted_total=%lld\n", (int)s, (long long)emitted_total_);
             return false;
         }
