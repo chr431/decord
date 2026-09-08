@@ -229,22 +229,39 @@ CUThreadedDecoder::~CUThreadedDecoder() {
 
 int CUDAAPI CUThreadedDecoder::HandlePictureSequence(void* user_data, CUVIDEOFORMAT* format) {
     auto decoder = reinterpret_cast<CUThreadedDecoder*>(user_data);
-    // LOG(INFO) << "HandlePictureSequence, thread id: " << std::this_thread::get_id();;
-    return decoder->HandlePictureSequence_(format);
+    // 异常不得穿越 CUVID 驱动栈帧展开(行为不受我们控制,曾以进程无声死亡
+    // 收场):统一捕获并记录为内部错误,由下一次 Pop() 的 CheckErrorStatus
+    // 抛给 Python。return 0 = 拒绝流格式,解码终止但进程存活。
+    try {
+        return decoder->HandlePictureSequence_(format);
+    } catch (const std::exception& e) {
+        decoder->RecordInternalError(std::string("sequence callback: ") + e.what());
+        return 0;
+    }
 }
 
 int CUDAAPI CUThreadedDecoder::HandlePictureDecode(void* user_data,
                                             CUVIDPICPARAMS* pic_params) {
     auto decoder = reinterpret_cast<CUThreadedDecoder*>(user_data);
-    // LOG(INFO) << "HandlePictureDecode, thread id: " << std::this_thread::get_id();;
-    return decoder->HandlePictureDecode_(pic_params);
+    // 同 HandlePictureSequence:驱动回调内不得让异常外逸。
+    try {
+        return decoder->HandlePictureDecode_(pic_params);
+    } catch (const std::exception& e) {
+        decoder->RecordInternalError(std::string("decode callback: ") + e.what());
+        return 0;
+    }
 }
 
 int CUDAAPI CUThreadedDecoder::HandlePictureDisplay(void* user_data,
                                              CUVIDPARSERDISPINFO* disp_info) {
     auto decoder = reinterpret_cast<CUThreadedDecoder*>(user_data);
-    // LOG(INFO) << "HandlePictureDisplay, thread id: " << std::this_thread::get_id();;
-    return decoder->HandlePictureDisplay_(disp_info);
+    // 同 HandlePictureSequence:驱动回调内不得让异常外逸。
+    try {
+        return decoder->HandlePictureDisplay_(disp_info);
+    } catch (const std::exception& e) {
+        decoder->RecordInternalError(std::string("display callback: ") + e.what());
+        return 0;
+    }
 }
 
 int CUThreadedDecoder::HandlePictureSequence_(CUVIDEOFORMAT* format) {
@@ -384,19 +401,27 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
                                             ScaleMethod_Linear,
                                             ChromaUpMethod_Linear,
                                             decoder_.BitDepth());
+    bool converted;
     if (roi_valid_) {
         // ROI-first：只转换 ROI 窗口（1:1 像素映射），输出池已是 ROI 尺寸
-        // （VideoReader::SetRoi 重建）→ 免全帧转换与每帧裁剪拷贝。
-        ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_,
-                     input_width, input_height,
-                     roi_x2_ - roi_x1_, roi_y2_ - roi_y1_,
-                     roi_x1_, roi_y1_, 1.0f, 1.0f, decoder_.BitDepth(),
-                     output_format_, color_range_);
+        // （VideoReader::SetRoi 重建）→ 免全帧转换与逐帧裁剪拷贝。
+        converted = ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_,
+                                 input_width, input_height,
+                                 roi_x2_ - roi_x1_, roi_y2_ - roi_y1_,
+                                 roi_x1_, roi_y1_, 1.0f, 1.0f, decoder_.BitDepth(),
+                                 output_format_, color_range_);
     } else {
-        ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_,
-                     input_width, input_height, width_, height_,
-                     0, 0, 0.0f, 0.0f, decoder_.BitDepth(),
-                     output_format_, color_range_);
+        converted = ProcessFrame(textures.chroma, textures.luma, dst_ptr, stream_,
+                                 input_width, input_height, width_, height_,
+                                 0, 0, 0.0f, 0.0f, decoder_.BitDepth(),
+                                 output_format_, color_range_);
+    }
+    if (!converted) {
+        // kernel 启动失败(improc 已打印错误并作废模块缓存,下次强制重载):
+        // 丢弃该帧并记录内部错误——不产生 reorder/事件入队,下一次 Pop()
+        // 经 CheckErrorStatus 抛给 Python。
+        RecordInternalError("display callback: frame conversion failed");
+        return 0;
     }
     // No per-frame sync anymore: the tail sync moves to consumer-side Pop
     // (per-frame event) and the unmap moves to the next display callback

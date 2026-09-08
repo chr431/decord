@@ -34,23 +34,33 @@ namespace {
 const char kKernelName[] =
     "_ZN6decord4cuda6detail20process_frame_kernelIhEEvyyPT_ttttiiffii";
 
-std::once_flag g_once;
-bool g_ready = false;
+// 模块缓存按"加载时所在上下文"键控:module/function 句柄是上下文作用域的,
+// 主上下文若被销毁重建(refcount 归零 / 外部 reset),旧句柄全部悬空,再用
+// 即 cuLaunchKernel 失败乃至驱动内访问违例。检测到上下文变化就重新加载
+// (驱动有磁盘 JIT 缓存,重载开销为一次性数十毫秒)。
+std::mutex g_mu;
+CUcontext g_ctx = nullptr;
 CUmodule g_module = nullptr;
 CUfunction g_function = nullptr;
+bool g_ready = false;
 
-void InitModule() {
+bool InitModuleLocked(CUcontext cur) {
   if (!nv::gpu_loaded()) {
-    LOG(FATAL) << "improc: NVIDIA driver not available";
+    fprintf(stderr, "[improc] NVIDIA driver not available\n");
+    return false;
   }
   if (nv::cuModuleLoadData(&g_module, kImprocPtx) != CUDA_SUCCESS) {
-    LOG(FATAL) << "improc: failed to load embedded PTX module";
+    fprintf(stderr, "[improc] failed to load embedded PTX module\n");
+    return false;
   }
   if (nv::cuModuleGetFunction(&g_function, g_module, kKernelName)
           != CUDA_SUCCESS) {
-    LOG(FATAL) << "improc: kernel entry not found in PTX: " << kKernelName;
+    fprintf(stderr, "[improc] kernel entry not found in PTX: %s\n", kKernelName);
+    return false;
   }
+  g_ctx = cur;
   g_ready = true;
+  return true;
 }
 
 int DivUp(int total, int grain) {
@@ -59,7 +69,7 @@ int DivUp(int total, int grain) {
 
 }  // namespace
 
-void ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
+bool ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
     uint8_t* dst, cudaStream_t stream, uint16_t input_width, uint16_t input_height,
     int output_width, int output_height,
     int src_x0, int src_y0, float fx, float fy, int bit_depth,
@@ -72,8 +82,14 @@ void ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
   // normalized float 采样即等价（见 improc.cu 注释）。
   (void)bit_depth;
 
-  std::call_once(g_once, InitModule);
-  if (!g_ready) return;  // InitModule 已 LOG(FATAL)，防御
+  CUcontext cur = nullptr;
+  nv::cuCtxGetCurrent(&cur);
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_ready || cur != g_ctx) {
+      if (!InitModuleLocked(cur)) return false;
+    }
+  }
 
   // kernel 形参顺序：luma(tex) chroma(tex) dst in_w in_h out_w out_h
   //                 src_x0 src_y0 fx fy output_format color_range
@@ -89,8 +105,17 @@ void ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
       g_function, DivUp(output_width, 32), DivUp(output_height, 8), 1,
       32, 8, 1, 0, reinterpret_cast<CUstream>(stream), params, nullptr);
   if (lr != CUDA_SUCCESS) {
-    LOG(FATAL) << "improc: cuLaunchKernel failed: " << lr;
+    // 不抛异常(本函数运行于 CUVID display 回调的驱动栈帧内,异常穿越驱动帧
+    // 的行为不受我们控制);报告失败由调用方丢弃该帧并记录内部错误。
+    fprintf(stderr, "[improc] cuLaunchKernel failed: %d\n", static_cast<int>(lr));
+    {
+      // 启动失败通常意味着句柄/上下文异常:作废缓存,下次强制重载
+      std::lock_guard<std::mutex> lk(g_mu);
+      g_ready = false;
+    }
+    return false;
   }
+  return true;
 }
 
 }  // namespace cuda
