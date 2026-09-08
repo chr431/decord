@@ -267,25 +267,29 @@ CPU, slower than pure NVDEC. Measure on your own hardware (see
 
 Measured on one machine (AMD Ryzen 9 7945HX + RTX 4060 Laptop, Windows, FFmpeg
 9.0 shared, 1080p, `output_format='yuv420'`, sequential `get_batch` of 250
-frames, median of 5 runs, fps). Results vary greatly across machines/streams/
-resolutions — measure your own workload; hybrid is experimental, numbers are
-order-of-magnitude guidance.
+frames, median of 5-10 runs, fps). Results vary greatly across machines/
+streams/resolutions/**power plans** — measure your own workload; hybrid is
+experimental, numbers are order-of-magnitude guidance.
 
 | Decoder | H.264 | HEVC | AV1 |
 |---|---|---|---|
-| `cpu` (12 decode threads) | 1243 | 721 | 709 |
-| `gpu` (NVDEC) | ~970 | 1836 | 1479 |
-| `hybrid` (experimental, → host memory) | **1587** | 1457 | 1108 |
-| `hybrid_gpu` (experimental, → VRAM) | 1421 | 1421 | 1031 |
-| hybrid vs pure CPU | 1.28x | 2.02x | 1.56x |
+| `cpu` (16 decode threads) | 1233 | 961 | 709 |
+| `gpu` (NVDEC) | 958 | 1868 | 1285 |
+| `hybrid` (experimental, → host memory) | **1570** | 1680 | **1340** |
+| `hybrid_gpu` (experimental, → VRAM) | ~1520 | 1848 | ~1250 |
 
 Notes:
 
-- On H.264, software decoding and NVDEC are close in speed, so mixing approaches
-  the ideal "sum of both"; HEVC/AV1 mixing is faster than pure CPU but slower
-  than pure NVDEC (no automatic fallback, see above).
+- Hybrid beats pure CPU on all three codecs; h264/av1 also beat pure NVDEC;
+  the hevc engine mode (`hyb_gpu`) is at parity with pure NVDEC (~99%).
+- **The Windows power plan strongly affects hybrid stability**: under mixed
+  CPU+GPU load, boost-governor behaviour can produce ±15-25% run-to-run
+  variance ("bimodal" throughput) on the same binary. For reproducible
+  benchmarks, pin the power plan (high performance / ultimate performance)
+  before measuring.
 - `get_batch` throughput includes every pipeline (consumer batch assembly:
-  batch buffer pool + copy/decode overlap); the pure-CPU path benefits equally.
+  batch buffer pool + copy/decode overlap); the pure-CPU path benefits
+  equally.
 - `probe()` inspects metadata in milliseconds without opening a decoder — handy
   for asset triage before scheduling.
 
