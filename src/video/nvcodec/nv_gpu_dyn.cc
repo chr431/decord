@@ -83,7 +83,8 @@ using nv_lib_t = void*;
     (CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,        \
      CUcontext srcContext, size_t ByteCount, CUstream hStream),                 \
     (dstDevice, dstContext, srcDevice, srcContext, ByteCount, hStream))         \
-  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpy2D,                                 \
+  /* 2D memcpy must use the _v2 export: v1 cuMemcpy2D returns 201 (INVALID_CONTEXT) under UVA */ \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpy2D_v2,                              \
     (const CUDA_MEMCPY2D* pCopy), (pCopy))                                      \
   X(CUresult, CUDA_ERROR_NOT_FOUND, cuStreamWaitEvent,                          \
     (CUstream hStream, CUevent hEvent, unsigned int Flags),                     \

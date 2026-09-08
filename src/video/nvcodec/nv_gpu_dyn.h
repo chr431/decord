@@ -64,6 +64,8 @@
 #ifdef cuMemcpy2D
 #undef cuMemcpy2D
 #endif
+/* Windows nvcuda.dll 的 cuMemcpy2D 导出是 v1 遗留接口（现代驱动/UVA 下
+ * 返回 CUDA_ERROR_INVALID_CONTEXT）；2D 拷贝统一走 cuMemcpy2D_v2 导出。 */
 
 namespace nv {
 
@@ -106,7 +108,7 @@ CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dst, CUdeviceptr src,
 CUresult CUDAAPI cuMemcpyPeerAsync_v2(CUdeviceptr dstDevice, CUcontext dstContext,
                                    CUdeviceptr srcDevice, CUcontext srcContext,
                                    size_t ByteCount, CUstream hStream);
-CUresult CUDAAPI cuMemcpy2D(const CUDA_MEMCPY2D* pCopy);
+CUresult CUDAAPI cuMemcpy2D_v2(const CUDA_MEMCPY2D* pCopy);
 CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
                                    unsigned int Flags);
 CUresult CUDAAPI cuStreamCreate(CUstream* pStream, unsigned int Flags);

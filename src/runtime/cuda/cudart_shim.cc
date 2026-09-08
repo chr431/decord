@@ -235,7 +235,7 @@ cudaError_t cudaMemcpy2D(void *dst, size_t dpitch, const void *src,
   m.dstPitch = dpitch;
   m.WidthInBytes = width;
   m.Height = height;
-  return Err(nv::cuMemcpy2D(&m));
+  return Err(nv::cuMemcpy2D_v2(&m));
 }
 
 cudaError_t cudaMemcpyPeerAsync(void *dst, int dstDevice, const void *src,
