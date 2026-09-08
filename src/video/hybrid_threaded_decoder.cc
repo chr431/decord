@@ -221,7 +221,11 @@ void HybridThreadedDecoder::ComputeBudgets() {
     double ram_budget = 1536.0 * 1024 * 1024;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > 0)
-        vram_budget = static_cast<double>(free_b) * 0.45;
+        // VRAM 0.65：VRAM 模式的 GPU 库存(ready_)持有池缓冲、与 NVDEC
+        // 喂包共用一个池，池深 = 库存上限 —— av1 引擎口径实测预算
+        // 3198→5200MB 时 1529→1805(GPU 主导码流需要最深库存；
+        // hevc/h264 已饱和不受影响)。仍按空闲量自适应，留 35% 余量。
+        vram_budget = static_cast<double>(free_b) * 0.65;
 #if defined(_WIN32)
     { MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
       if (GlobalMemoryStatusEx(&ms)) ram_budget = static_cast<double>(ms.ullAvailPhys) * 0.45; }
