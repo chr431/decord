@@ -1054,7 +1054,7 @@ bool HybridThreadedDecoder::LandStep() {
                     double r = land_seg_frames_ / land_seg_secs_;
                     double prev = gpu_rate_landed_.load(std::memory_order_relaxed);
                     gpu_rate_landed_.store(
-                        prev > 0 ? 0.5 * prev + 0.5 * r : r, std::memory_order_relaxed);
+                        prev > 0 ? 0.75 * prev + 0.25 * r : r, std::memory_order_relaxed);
                     land_seg_frames_ = 0;
                     land_seg_secs_ = 0.0;
                 }

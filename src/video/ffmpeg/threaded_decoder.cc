@@ -371,7 +371,7 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
                 if (prod_seg_frames_ >= 16) {
                     double r = prod_seg_frames_ / prod_seg_secs_;
                     double prev = prod_rate_.load(std::memory_order_relaxed);
-                    prod_rate_.store(prev > 0 ? 0.5 * prev + 0.5 * r : r,
+                    prod_rate_.store(prev > 0 ? 0.75 * prev + 0.25 * r : r,
                                      std::memory_order_relaxed);
                 if (rdbg) fprintf(stderr, "[rate] FOLD t=%.3f r=%.0f rate=%.0f\n",
                                   std::chrono::duration<double>(
