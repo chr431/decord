@@ -276,7 +276,7 @@ experimental, numbers are order-of-magnitude guidance.
 | `cpu` (16 decode threads) | 1233 | 961 | 709 |
 | `gpu` (NVDEC) | 958 | 1868 | 1285 |
 | `hybrid` (experimental, → host memory) | **1628** | 1717 | **1774** |
-| `hybrid_gpu` (experimental, → VRAM) | **1627** | **2050** | 1529 |
+| `hybrid_gpu` (experimental, → VRAM) | **1645** | **1979** | **1796** |
 
 Notes:
 
