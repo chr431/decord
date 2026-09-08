@@ -275,13 +275,14 @@ experimental, numbers are order-of-magnitude guidance.
 |---|---|---|---|
 | `cpu` (16 decode threads) | 1233 | 961 | 709 |
 | `gpu` (NVDEC) | 958 | 1868 | 1285 |
-| `hybrid` (experimental, → host memory) | **1570** | 1680 | **1340** |
-| `hybrid_gpu` (experimental, → VRAM) | ~1520 | 1848 | ~1250 |
+| `hybrid` (experimental, → host memory) | **1628** | 1717 | **1774** |
+| `hybrid_gpu` (experimental, → VRAM) | **1627** | **2050** | 1529 |
 
 Notes:
 
-- Hybrid beats pure CPU on all three codecs; h264/av1 also beat pure NVDEC;
-  the hevc engine mode (`hyb_gpu`) is at parity with pure NVDEC (~99%).
+- Hybrid beats pure CPU on all three codecs; h264/av1 (both modes) and the hevc
+  engine mode (`hyb_gpu`) also beat pure NVDEC (av1 CPU-out reaches 1.38x, hevc
+  engine mode 1.10x).
 - **The Windows power plan strongly affects hybrid stability**: under mixed
   CPU+GPU load, boost-governor behaviour can produce ±15-25% run-to-run
   variance ("bimodal" throughput) on the same binary. For reproducible
