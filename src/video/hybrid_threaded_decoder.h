@@ -273,6 +273,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::size_t ReadyCap() const;
     /*! \brief 硬件自适应预算计算（空闲显存/内存 → 各池深/队列/prefetch） */
     void ComputeBudgets();
+    double vram_budget_ = 768.0 * 1024 * 1024;  ///< 显存预算（ROI 重建池深复用）
     /*! \brief demux 领先深度建议（自适应预算计算结果）。
      *  盲阶段（双侧速率未就绪，sched_initialized_ 未置位）收缩到
      *  ~2 chunks：demux 全速领先（千余包瞬时入队）会让十几个 chunk
@@ -412,6 +413,8 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
 
     // ── 速率感知（跨 Clear 保留）──
     int chunks_assigned_[2] = {0, 0};
+    int64_t assigned_frames_[2] = {0, 0};  ///< 各侧累计分账帧数（chunk 关闭
+                                           ///< 时按 expected 累计；份额 governor 用）
     int64_t emitted_total_ = 0;          ///< 全局已发射帧数（消费位置）
     int64_t side_pending_[2] = {0, 0};   ///< 各侧已路由未发射帧数（真积压，
                                          ///< 含在途解码与存货，包粒度精确）

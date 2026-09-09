@@ -286,7 +286,7 @@ void HybridThreadedDecoder::ComputeBudgets() {
     // 方值日里被背压闸住（产能闲置）—— hevc 显存池 2132→4500MB 实测
     // 引擎口径 1848→2041（每轮 >2000，超纯 NVDEC 9%）。仍按空闲量自适应，
     // env 可覆盖。
-    double vram_budget = 768.0 * 1024 * 1024;
+    vram_budget_ = 768.0 * 1024 * 1024;
     double ram_budget = 1536.0 * 1024 * 1024;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > 0)
@@ -294,7 +294,7 @@ void HybridThreadedDecoder::ComputeBudgets() {
         // 喂包共用一个池，池深 = 库存上限 —— av1 引擎口径实测预算
         // 3198→5200MB 时 1529→1805(GPU 主导码流需要最深库存；
         // hevc/h264 已饱和不受影响)。仍按空闲量自适应，留 35% 余量。
-        vram_budget = static_cast<double>(free_b) * 0.65;
+        vram_budget_ = static_cast<double>(free_b) * 0.65;
 #if defined(_WIN32)
     { MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
       if (GlobalMemoryStatusEx(&ms)) ram_budget = static_cast<double>(ms.ullAvailPhys) * 0.45; }
@@ -303,17 +303,17 @@ void HybridThreadedDecoder::ComputeBudgets() {
       if (pages > 0 && ps > 0) ram_budget = static_cast<double>(pages) * ps * 0.45; }
 #endif
     if (const char *e = getenv("DECORD_HYBRID_VRAM_BUDGET_MB"))
-        if (atof(e) > 0) vram_budget = atof(e) * 1024 * 1024;
+        if (atof(e) > 0) vram_budget_ = atof(e) * 1024 * 1024;
     if (const char *e = getenv("DECORD_HYBRID_RAM_BUDGET_MB"))
         if (atof(e) > 0) ram_budget = atof(e) * 1024 * 1024;
     const double fb = frame_bytes_ > 0 ? static_cast<double>(frame_bytes_) : 3.1e6;
     auto clampi = [](double v, int lo, int hi) {
         return static_cast<int>(std::max<double>(lo, std::min<double>(v, hi))); };
     if (out_cuda_) {
-        gpu_pool_frames_ = clampi(vram_budget * 0.65 / fb, 96, 1536);
-        up_pool_frames_ = clampi(vram_budget * 0.35 / fb, 48, 768);
+        gpu_pool_frames_ = clampi(vram_budget_ * 0.65 / fb, 96, 1536);
+        up_pool_frames_ = clampi(vram_budget_ * 0.35 / fb, 48, 768);
     } else {
-        gpu_pool_frames_ = clampi(vram_budget * 0.65 / fb, 28, 128);
+        gpu_pool_frames_ = clampi(vram_budget_ * 0.65 / fb, 28, 128);
         up_pool_frames_ = 0;
     }
     // queue 钳制 768→1536（库存帽 ≥ 相位帧量的前提；RAM 预算不足时仍被
@@ -342,7 +342,7 @@ void HybridThreadedDecoder::ComputeBudgets() {
 
     if (getenv("DECORD_HYBRID_DEBUG")) {
         fprintf(stderr, "[hybrid-budget] vram=%.0fMB ram=%.0fMB pool=%d up=%d queue=%d ready=%d prefetch=%d\n",
-                vram_budget / 1048576.0, ram_budget / 1048576.0,
+                vram_budget_ / 1048576.0, ram_budget / 1048576.0,
                 gpu_pool_frames_, up_pool_frames_, queue_frames_,
                 ready_cap_frames_, prefetch_frames_); }
 }
@@ -513,6 +513,27 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
         gpu_frame_shape_ = FrameShapeFor(output_format_, h, w);
         frame_bytes_ = 1;
         for (int64_t d : gpu_frame_shape_) frame_bytes_ *= d;
+        // ROI 后输出帧仅 ROI 大小（如 1080p NV12 全帧 ~3.1MB → ROI
+        // ~5.4KB）：按 ROI 帧字节重算 GPU 池/上载池深度。原深度按全帧
+        // 字节预算，ROI 场景虚小 ~570× —— FeedStep 喂包闸
+        // （ready_ + reserve >= gpu_pool_frames_）在 GPU 提前解码约千帧
+        // 后长期关闭：CPU 块期间拉取掉到 dav1d 速率、GPU 空有已路由包
+        // 不喂（[hybrid-w] idle rdy≈1006 q≈786 轨迹实测），混跑吞吐
+        // 退化近交替（av1 损耗 29.5%）。ROI 帧 5.4KB × 8192 ≈ 44MB。
+        {
+            auto clampi = [](double v, int lo, int hi) {
+                return (int)std::max<double>(double(lo),
+                                             std::min<double>(v, double(hi)));
+            };
+            const double fb_roi = (double)frame_bytes_;
+            if (out_cuda_ && fb_roi > 0) {
+                gpu_pool_frames_ = clampi(vram_budget_ * 0.65 / fb_roi,
+                                          96, 8192);
+                up_pool_frames_ = clampi(vram_budget_ * 0.35 / fb_roi,
+                                         48, 4096);
+                ready_cap_frames_ = gpu_pool_frames_ + up_pool_frames_ + 64;
+            }
+        }
         gpu_pool_.Reset(gpu_pool_frames_,
                         gpu_frame_shape_, kUInt8,
                         DLDevice{kDLCUDA, device_id_});
@@ -647,6 +668,7 @@ void HybridThreadedDecoder::ResetRouting() {
     has_stash_[0] = has_stash_[1] = false;
     eof_pushed_ = false;
     chunks_assigned_[0] = chunks_assigned_[1] = 0;
+    assigned_frames_[0] = assigned_frames_[1] = 0;
     emitted_total_ = 0;
     sched_initialized_ = false;
     side_pending_[0] = side_pending_[1] = 0;
@@ -868,6 +890,7 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                 last.expected = ExpectedFrames(last.start_pts, pkt->pts);
                 if (last.expected > 0) {
                     est_chunk_frames_ = last.expected;
+                    assigned_frames_[last.side] += last.expected;
                 }
             }
             Side old_side = cur_side_;
