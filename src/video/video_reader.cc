@@ -351,18 +351,22 @@ VideoReader::VideoReader(std::string fn, DLDevice ctx, int width, int height, in
 }
 
 VideoReader::~VideoReader(){
+    // hybrid_gpu 的输出帧驻留显存且直接引用解码器内部池缓冲（deleter =
+    // HybridGpuBufferPool::Deleter，会锁池的 mutex）：cached_frame_ /
+    // tmp_key_frame_ 可能仍持有这类引用，必须**先于** decoder_.reset()
+    // 释放 —— 否则 Deleter 摸到已析构的池（heap-use-after-free，池内存
+    // 未被堆复用时静默、被复用/反提交即 access violation；ASAN 于
+    // 2026-09-10 锤出，栈：Deleter:262 <- ~VideoReader:364）。av1 每关
+    // 必中（其路径总在缓存里留下 GPU 池帧），h264/hevc 视缓存状态偶发。
+    // （hybrid 的 CPU 输出帧是独立宿主分配，无此问题；统一提前释放无害。）
+    cached_frame_ = NDArray();
+    tmp_key_frame_ = NDArray();
     // Destroy the decoder before ndarray_pool_ (which is destroyed after
     // this body runs, as a member declared after decoder_).  Any output
     // buffers still queued in the decoder hold a manager_ctx pointing at
     // the pool; if the pool were freed first, their deleter would touch a
     // destroyed pool.
     decoder_.reset();
-    // hybrid_gpu 的输出帧驻留显存且直接引用解码器内部池缓冲；
-    // cached_frame_ / tmp_key_frame_ 可能仍持有这类引用 —— 解码器
-    // （含其池）销毁后必须先释放，否则成员析构阶段 deleter 回调悬空池。
-    // （hybrid 的 CPU 输出帧是独立宿主分配，无此问题；统一释放无害。）
-    cached_frame_ = NDArray();
-    tmp_key_frame_ = NDArray();
     // avformat_free_context(fmt_ctx_);
     // avformat_close_input(&fmt_ctx_);
     // LOG(INFO) << "Destruct Video REader";
