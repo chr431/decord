@@ -415,6 +415,13 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int chunks_assigned_[2] = {0, 0};
     int64_t assigned_frames_[2] = {0, 0};  ///< 各侧累计分账帧数（chunk 关闭
                                            ///< 时按 expected 累计；份额 governor 用）
+    // ── chunk 预路由（2026-09-10）：双侧速率就绪即按能力比配额一次性
+    // 规划全部未来 chunk 的侧；demux 一读到 keyframe 包即查表路由，
+    // 两解码器持续有包（混跑从"交替"变"并发"）。plan_side_ 按 kf 索引
+    // 对齐，-1 = 未规划（回退 pending 策略）。──
+    std::vector<int> plan_side_;
+    bool plan_ready_ = false;
+    void BuildPlan(int64_t key_pts, double cpu_share);
     int64_t emitted_total_ = 0;          ///< 全局已发射帧数（消费位置）
     int64_t side_pending_[2] = {0, 0};   ///< 各侧已路由未发射帧数（真积压，
                                          ///< 含在途解码与存货，包粒度精确）

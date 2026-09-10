@@ -329,13 +329,10 @@ void HybridThreadedDecoder::ComputeBudgets() {
     // SuggestPrefetchDepth/NeedsPackets 注释。
     prefetch_frames_ = clampi(queue_frames_ + ready_cap_frames_ + 128,
                               192, 3072);
-    if (codec_id_ == AV_CODEC_ID_AV1) {
-        // AV1：跨侧交界（CPU 块尾 → GPU 块首）存在既有内容竞态，GPU
-        // 在交界前数百 ms 已深超前解码会放大它（交界前 GPU 领先
-        // ~2000 帧 vs 基线 ~84 帧，实测交界尾 8 帧错位偶发）。AV1
-        // 全 GPU 后 384 领先对吞吐无约束（发射吃 NVDEC 实时速率）。
-        prefetch_frames_ = std::min(prefetch_frames_, 384);
-    }
+    // AV1 384 领先钳制已删除（2026-09-10 预路由改造）：深 demux 领先
+    // 是预路由设计的前提（GPU 侧要能持续拿到未来 chunk 的包）。原钳制
+    // 防的跨侧交界竞态由既有 expected 对齐 + kick/陈旧丢弃兜底承担，
+    // 并以全片逐位比对（引擎 _probe_hybrid_bitwise）作发布门禁。
     // 诊断/实验直控（绕过公式与 AV1 钳制）
     if (const char *e = getenv("DECORD_HYBRID_PREFETCH"))
         if (atoi(e) > 0) prefetch_frames_ = atoi(e);
@@ -669,6 +666,8 @@ void HybridThreadedDecoder::ResetRouting() {
     eof_pushed_ = false;
     chunks_assigned_[0] = chunks_assigned_[1] = 0;
     assigned_frames_[0] = assigned_frames_[1] = 0;
+    plan_ready_ = false;
+    plan_side_.clear();
     emitted_total_ = 0;
     sched_initialized_ = false;
     side_pending_[0] = side_pending_[1] = 0;
@@ -686,6 +685,45 @@ void HybridThreadedDecoder::ResetRouting() {
     gpu_pending_ = 0;
 #endif
     // kf 索引保留：Seek 后复用帧数表
+}
+
+void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
+    // 一次性规划全部未来 chunk：贪心配额 —— 每个候选 chunk 分给
+    // 「累计分账帧数加权后落后」的一侧（cpu_assigned*rg <= gpu_assigned*rc
+    // ⇔ CPU 份额低于 rc/(rc+rg)）。chunk 帧数直接取 kf rank 差（精确）。
+    // 规划冻结规划时的速率比；运行中速率漂移不做重规划（v1 取舍）。
+    if (kf_pts_.empty()) return;
+    auto it = std::lower_bound(kf_pts_.begin(), kf_pts_.end(), key_pts);
+    if (it == kf_pts_.end() || *it != key_pts) return;
+    int k0 = static_cast<int>(it - kf_pts_.begin());
+    plan_side_.assign(kf_pts_.size(), -1);
+    const double rc = std::max(cpu_.ProductionRate(), 1.0);
+    const double rg = std::max(gpu_rate_landed_.load(std::memory_order_relaxed), 1.0);
+    int64_t ac = assigned_frames_[SIDE_CPU];
+    int64_t ag = assigned_frames_[SIDE_GPU];
+    for (int k = k0; k < static_cast<int>(kf_pts_.size()); ++k) {
+        int64_t n = kf_rank_[k + 1] - kf_rank_[k];
+        if (k + 1 >= static_cast<int>(kf_pts_.size())) {
+            n = k > k0 ? (kf_rank_[k] - kf_rank_[k - 1])
+                       : (est_chunk_frames_ > 0 ? est_chunk_frames_ : 200);
+        }
+        Side s = (static_cast<double>(ac) * rg
+                  <= static_cast<double>(ag) * rc) ? SIDE_CPU : SIDE_GPU;
+        plan_side_[k] = static_cast<int>(s);
+        (s == SIDE_CPU ? ac : ag) += n;
+    }
+    plan_ready_ = true;
+    if (getenv("DECORD_HYBRID_DEBUG")) {
+        int nc = 0, nf[2] = {0, 0};
+        for (int k = k0; k < static_cast<int>(kf_pts_.size()); ++k) {
+            if (plan_side_[k] >= 0) {
+                ++nc;
+                ++nf[plan_side_[k]];
+            }
+        }
+        fprintf(stderr, "[hybrid-plan] k0=%d chunks=%d frames cpu=%d gpu=%d "
+                "(share=%.2f)\n", k0, nc, nf[0], nf[1], cpu_share);
+    }
 }
 
 HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
@@ -787,6 +825,34 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // 迟滞：对侧剩余 < 本侧 70% 才切（边界抖动 + dav1d 断流冷启动）。
     // CPU 管线空（无任何在途）时无条件给 CPU —— 前块保供 + dav1d 块
     // 尾滞留帧需要下一个 CPU chunk 的包冲出。
+    // 双侧速率就绪 → 一次性规划全部未来 chunk 的侧。FORCE_SHARE
+    // env 优先（份额实验旋钮），否则能力比 rc/(rc+rg)。
+    if (sched_initialized_ && !plan_ready_) {
+        double f = rate[SIDE_CPU] / std::max(rate[SIDE_CPU] + rate[SIDE_GPU], 1.0);
+        static const double fs_env = [] {
+            const char *e = getenv("DECORD_HYBRID_FORCE_SHARE");
+            if (!e) return -1.0;
+            double v = atof(e);
+            return (v > 0.0 && v < 1.0) ? v : -1.0;
+        }();
+        if (fs_env > 0) f = fs_env;
+        BuildPlan(key_pts, f);
+    }
+    // 预路由查表：规划覆盖的 chunk 直接返回（绕过 pending/迟滞策略）
+    if (plan_ready_) {
+        auto pit = std::lower_bound(kf_pts_.begin(), kf_pts_.end(), key_pts);
+        if (pit != kf_pts_.end() && *pit == key_pts) {
+            int k = static_cast<int>(pit - kf_pts_.begin());
+            if (k < static_cast<int>(plan_side_.size()) && plan_side_[k] >= 0) {
+                Side s = static_cast<Side>(plan_side_[k]);
+                if (getenv("DECORD_HYBRID_DEBUG")) {
+                    fprintf(stderr, "[hybrid-sched] plan key=%lld k=%d -> %d\n",
+                            (long long)key_pts, k, (int)s);
+                }
+                return s;
+            }
+        }
+    }
     const double tc = static_cast<double>(side_pending_[SIDE_CPU])
                       / std::max(rate[SIDE_CPU], 1.0);
     const double tg = static_cast<double>(gpu_pending_)
