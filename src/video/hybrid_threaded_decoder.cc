@@ -1770,6 +1770,14 @@ bool HybridThreadedDecoder::UploadStep() {
     //（此前事件环方案的 marker/EOF 语义腐坏在这里不存在 —— 冲刷在
     // UploadStep 栈内同步完成，无跨调用在途状态）。
     static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
+    // 批大小消融旋钮（一次性读 env；仅上载线程读写 up_batch_，无锁）。
+    static const int batch_env = [] {
+        const char *e = getenv("DECORD_HYBRID_UPLOAD_BATCH");
+        return e ? atoi(e) : 0;
+    }();
+    if (batch_env > 0) {
+        up_batch_ = batch_env < kUploadBatch ? batch_env : kUploadBatch;
+    }
     runtime::NDArray bufs[kUploadBatch];
     int nf = 0;
     bool did = false;
@@ -1788,7 +1796,7 @@ bool HybridThreadedDecoder::UploadStep() {
         nf = 0;
         did = true;
     };
-    while (nf < kUploadBatch) {
+    while (nf < up_batch_) {
         runtime::NDArray buf;
         if (!up_pool_.Acquire(&buf)) {
             up_nobuf_.fetch_add(1, std::memory_order_relaxed);

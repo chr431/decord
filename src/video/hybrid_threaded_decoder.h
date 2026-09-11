@@ -244,10 +244,19 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  会与 CU 解码器 stream_（blocking 流）互斥 —— 每次上载都整体暂停
      *  NVDEC/转换管线（实测 hevc hybrid_gpu 被压到 0.75x）。 */
     void *up_stream_ = nullptr;
-    /*! \brief 上载批大小：≤8 帧逐帧 pinned+async 提交，批末一次
+    /*! \brief 上载批大小：≤up_batch_ 帧逐帧 pinned+async 提交，批末一次
      *  cudaStreamSynchronize 统一收割（摊销同步开销；宿主 memcpy 与
-     *  H2D 在批内重叠）。 */
-    static constexpr int kUploadBatch = 8;
+     *  H2D 在批内重叠）。运行期默认 8，`DECORD_HYBRID_UPLOAD_BATCH`
+     *  可消融覆盖（1 = 逐帧同步旧行为）。
+     *
+     *  **批大小不是杠杆（2026-09-12 消融定论）**：有效批均 1.1-3 的约束
+     *  是 cpu-empty（上传者消费快于 CPU 解码者补充，队列近恒空），不是
+     *  上限——上限提到 32/64 批均纹丝不动；反向压到 1（逐帧同步旧行为）
+     *  引擎全片 e2e 也无差（hevc 配对 3 遍中位 9.54 vs 9.66s，符号混乱
+     *  = 漂移内；av1/h264 同）。上传同步成本不在关键路径，cpu-empty 提前
+     *  冲刷（低发射延迟）是正确默认，勿再做上传链重构。 */
+    static constexpr int kUploadBatch = 64;  ///< 数组容量上限（非行为默认）
+    int up_batch_ = 8;                       ///< 运行期批大小（仅上载线程读写）
     /*! \brief pinned 暂存槽（每批帧各一槽，仅上载线程访问）：pageable
      *  H2D 走驱动内 staging（WDDM 下 ~1.2ms/帧），pinned H2D ~0.4ms。
      *  批内帧的槽到批末 sync 前都保持占用（H2D 源数据保活）。 */
@@ -435,7 +444,13 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  冻结 → 队头缺帧、盲窗被对侧库存吃满、路由停摆、决策饥饿——
      *  环环相扣成死锁。修复 = kick 后把新 chunk 的前 KICK_BURST 个包
      *  也克隆喂给离场侧（其输出走越界 stash / 陈旧丢弃既有兜底，帧
-     *  记账与 kick 同型）。仅 Push 线程读写，无需加锁。 */
+     *  记账与 kick 同型）。仅 Push 线程读写，无需加锁。
+     *
+     *  承重性判别（2026-09-12）：`DECORD_HYBRID_KICK_BURST=0` 在**引擎
+     *  GPU 管线全片** hevc 上 4/4 挂死（sustained 默认计划），KICK_BURST=5
+     *  同口径数十次运行零挂死——修复确凿承重。注意纯 VideoReader 慢消费
+     *  者配方（含全片）**复现不了**该死锁（kick=0 也 16/16+4/4 干净），
+     *  差异诊断为 2026-09-11 §8.2 的"复现配方（无需引擎）"记载有误。 */
     static constexpr int KICK_BURST = 5;
     int kick_burst_ = 0;
     Side kick_burst_side_ = SIDE_CPU;
