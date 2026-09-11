@@ -64,6 +64,15 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
          *  落地/喂包线程（替代 1ms 轮询，hevc ~1800fps 下轮询延迟
          *  直接封顶吞吐）。 */
         void SetOnOutput(std::function<void()> cb) { on_output_ = std::move(cb); }
+        /*! \brief stall 取证：CU 三条队列深度（包 / 输出缓冲 / 待落地重排
+         *  环）。混合解码器 Pop 空手时用来自证 8 帧卡在哪一层：pkt>0 =
+         *  解析线程停摆；pkt=0 而 bufs/ord 非零 = 解码/转换在途；
+         *  三全零 = NVDEC DPB 扣留（等驱动它的后续包）。 */
+        void DiagDepths(int64_t *pkt, int64_t *bufs, int64_t *ord) {
+            *pkt = pkt_queue_ ? static_cast<int64_t>(pkt_queue_->Size()) : -1;
+            *bufs = frame_queue_ ? static_cast<int64_t>(frame_queue_->Size()) : -1;
+            *ord = reorder_queue_ ? static_cast<int64_t>(reorder_queue_->Size()) : -1;
+        }
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~CUThreadedDecoder();

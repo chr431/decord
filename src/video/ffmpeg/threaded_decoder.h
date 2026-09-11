@@ -67,33 +67,27 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~FFMPEGThreadedDecoder();
-        /*! 生产侧解码速率（帧/秒）。**默认口径 = 容量跟踪 EWMA**（快升
-         *  1.3x / 慢降 5%/折）—— 与 0.8.3 发布行为一致。
+        /*! 生产侧解码速率（帧/秒）。**唯一口径 = 滑窗持续产能**：最近 8 折
+         *  （16 帧/折）内"连续 4 折最小值"的最大值 + 0.997/折慢降锁，≥4 折
+         *  才出版（此前 0 = 未学得，调度走 CPU-sample chunk 冷启动）。
+         *  2026-09-12 起替代容量跟踪 EWMA（快升 1.3x/慢降 5%）——后者
+         *  实测缺陷（DECORD_CPU_RATE_DEBUG 折率轨迹，hevc hybrid 3000
+         *  帧）：filter 每次从背压封堵脱封，头 1-3 折读到的是**解码器内部
+         *  预跑存货的排空速度**（r=2491..9138 孤峰），EWMA 被逐峰棘轮永久
+         *  卡 1200-2500，真值 ≈ 纯 CPU 单臂 754 → BuildPlan 冻结高估 rc →
+         *  hevc CPU 份额翻 2-3x → 混跑 1568-1900 < 纯 nvdec 2036。
+         *  sustained 排除孤峰（撑不满 4 折）又保 h264 突发产能（连续 20+
+         *  折；纯中位数会在饿供相位把 h264 误杀到 rc=995 → 混跑 1881，
+         *  实测否决）。
          *
-         *  `DECORD_CPU_RATE_SUSTAINED=1` 切换到"滑窗持续产能"：最近 8 折
-         *  （16 帧/折）内连续 4 折最小值的最大值，慢降锁 0.997/折，≥4 折
-         *  才出版（此前 0 = 未学得，调度走 CPU-sample chunk 路径）。实测
-         *  动机（DECORD_CPU_RATE_DEBUG trace，hevc hybrid 3000 帧）：
-         *  filter 每次从背压封堵脱封，头 1-3 折读到的是**解码器内部预跑
-         *  存货的排空速度**（r=2491..9138 孤峰），EWMA 的 1.3x 棘轮逐峰
-         *  上抬、5% 缓降追不上 —— 永久卡在 1200-2500 而真实产率 ≈754，
-         *  BuildPlan 冻结高估 → hevc CPU 份额翻倍（plan rc=2217，混跑
-         *  1568-1900 < 纯 nvdec 2036）。sustained 实测收益（decode-only
-         *  3000f×3  reps）：hevc hybrid **2688 vs 1951（+38%）**、h264
-         *  不受排空孤峰影响（4 折窗把启动种子与孤峰都排除；h264 突发段
-         *  连续 20+ 折 → sustained 2500 vs EWMA 4300）、av1 ≈持平。
-         *
-         *  ⚠️ **为何仍是 opt-in**：GPU 驻留（hybrid_gpu，引擎 GPU 管线
-         *  口径）下按真实比例倾斜的计划（hevc 76% GPU）暴露一个**先于
-         *  本改动存在的 hybrid_gpu 死锁**：慢消费者复现 8 折门控与无门控
-         *  各 ~2/8 概率挂死（EWMA 对照 16/16 干净），签名
-         *  `[pop-stall] head=(CPU chunk) crdy=0 rdy=673 pend=1080/3394`
-         *  （CPU 解码器携 1080 帧路由中量**停摆**，673 个已落地 GPU 帧被
-         *  队头搁置）与 `[pop-stall] side=1 …em=235/240 rdy=0 q=0
-         *  pend=538/6`（队头尾 5 帧滞留 NVDEC，等待进不来包的后续包解
-         *  reorder）。份额分布只是改变撞窗概率，根因未定位前不得默认。
-         *  跟进项 = 先修该死锁（疑似 CPU 子解码器输出缓冲
-         *  （VideoReader ndarray_pool_）在倾斜计划下耗尽/回收停摆）。 */
+         *  两路统一采用（cpu-out/gpu-out）。曾观测 gpu-out+sustained 的
+         *  hevc 785fps 崩盘 / av1 挂死，归因为倾斜计划下的队头尾帧死锁
+         *  （open-GOP DPB 扣 IDR+leading 等后续包）——已由 kick 突发治本
+         *  （HybridThreadedDecoder::KICK_BURST，24/24 慢消费者压测 +
+         *  金标 28/28）。转默认实测（引擎 GPU 管线全片 e2e，配对 3 遍）：
+         *  hevc 12.73→9.66s（**−24%**，3/3）、av1 持平（±1% 漂移内）、
+         *  h264 3.30→3.15s（−4.7%，3/3）；decode-only 3000f hevc cpu-out
+         *  2684-2831 vs EWMA 1951（+43%，达并行理想 2790 的 96-101%）。 */
         double ProductionRate() const {
             return prod_rate_.load(std::memory_order_relaxed);
         }
@@ -175,7 +169,7 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         int max_queue_frames_;
         std::function<void()> on_output_;
         // ── 生产侧速率（仅 filter 线程访问，除原子速率外）──
-        std::atomic<double> prod_rate_{0.0};
+        std::atomic<double> prod_rate_{0.0};   ///< 滑窗持续产能读数（唯一口径）
         std::chrono::steady_clock::time_point last_prod_tp_{};
         int64_t prod_seg_frames_ = 0;
         double prod_seg_secs_ = 0.0;

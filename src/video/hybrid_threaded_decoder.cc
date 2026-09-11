@@ -641,14 +641,16 @@ void HybridThreadedDecoder::Stop() {
         // 一次性汇总（非打印测量协议的唯一输出点；析构时触发，不在被测
         // 墙钟窗口内）。口径见 .h「非打印测量」注释。
         fprintf(stderr,
-                "\n[hybrid-stats] mode=%s frames c=%lld g=%lld chunks c=%d g=%d\n",
+                "\n[hybrid-stats] mode=%s frames c=%lld g=%lld chunks c=%d g=%d"
+                " kicks c=%lld g=%lld\n",
 #ifdef DECORD_USE_CUDA
                 out_cuda_ ? "gpu-out" : "cpu-out",
 #else
                 "cpu-only",
 #endif
                 (long long)frames_out_[0].load(), (long long)frames_out_[1].load(),
-                chunks_assigned_[0], chunks_assigned_[1]);
+                chunks_assigned_[0], chunks_assigned_[1],
+                (long long)kicks_[0].load(), (long long)kicks_[1].load());
         fprintf(stderr,
                 "[hybrid-stats] plan rc=%lld rg=%lld frames c=%lld g=%lld"
                 " folds=%ld age=%lldms\n",
@@ -696,6 +698,7 @@ void HybridThreadedDecoder::ResetRouting() {
     routing_active_ = false;
     cur_side_ = SIDE_CPU;
     cur_start_pts_ = 0;
+    kick_burst_ = 0;
     emit_queue_.clear();
     stash_[0] = runtime::NDArray();
     stash_[1] = runtime::NDArray();
@@ -814,8 +817,9 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // （av1 全量实测 654fps vs 全 GPU 1520）。
     // 积压排空贪心 → 已被 water-filling 份额计数器取代（见下）。
     // CPU 速率取生产侧实测（filter 线程产出，NV12 直出后的有效供给
-    // 口径）：与 GPU 落地速率同口径可比。读数口径与滑窗"持续产能"
-    // 实验（DECORD_CPU_RATE_SUSTAINED）的取舍见 threaded_decoder.h。
+    // 口径）：与 GPU 落地速率同口径可比。读数 = 滑窗持续产能（唯一口径，
+    // 2026-09-12 起替代容量跟踪 EWMA；机制与两路统一采用的依据见
+    // threaded_decoder.h）。
     double rate[2] = {cpu_.ProductionRate(),
                       gpu_rate_landed_.load(std::memory_order_relaxed)};
     // rc 未学得：给一个 CPU chunk 采样（所有 codec —— water-filling 需要
@@ -890,13 +894,14 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // 尾滞留帧需要下一个 CPU chunk 的包冲出。
     // 双侧速率就绪 → 一次性规划全部未来 chunk 的侧。FORCE_SHARE
     // env 优先（份额实验旋钮），否则能力比 rc/(rc+rg)。
-    // 不加折数门控（2026-09-12 实测教训）：曾加过 `ProductionFolds()>=8`
-    // —— 计划推迟期间 chunk 决策全走 pending 策略，GPU 倾斜计划下
-    // gp_pending 冲到 1982/pktq 2401，CPU 存货(538)吃满 NeedsPackets
-    // 窗口，队头 GPU chunk 尾 5 帧永无 flush 机会 → hybrid_gpu hevc
-    // 全片活锁（slow-consumer 复现，EWMA 对照组 8/8 干净）。而滑窗
-    // sustained 统计**本身就防启动种子**（4 折窗最小值：hevc 首窗即
-    // 798、h264 2452、av1 ~1010），门控毫无必要。
+    // 不加折数门控（消融定论）：EWMA 的病在口径（排空孤峰棘轮，8 折内
+    // 照样卡 2000+，门控救不了 hevc：门控下仍 rc=2363 → 混跑 1655）；
+    // sustained 首窗（4 折）即给出 hevc 798 / h264 2452 / av1 ~1010 的
+    // 好读数，无须等 8 折。门控+盲窗加宽反而在 av1 gpu-out 把真交付
+    // 70%→10%（盲阶段 CPU 采样存货加深、保序等待拉长）——一并回退。
+    // 倾斜计划（两路皆然）的队头尾帧死锁由 kick 突发治本（.h
+    // KICK_BURST）：24/24 慢消费者压测 + 引擎金标 28/28 + 全片 e2e
+    // hevc −24%（配对 3 遍，sustained 转默认的依据，见 threaded_decoder.h）。
     if (sched_initialized_ && !plan_ready_) {
         double f = rate[SIDE_CPU] / std::max(rate[SIDE_CPU] + rate[SIDE_GPU], 1.0);
         static const double fs_env = [] {
@@ -1004,6 +1009,8 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
     bool is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
     Side flush_side = SIDE_CPU;
     bool need_flush = false;
+    bool burst_dup = false;
+    int burst_dup_side = -1;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (!routing_active_) {
@@ -1055,6 +1062,17 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
             if (s != old_side && IsIdrLikeCodec()) {
                 flush_side = old_side;
                 need_flush = true;
+                // kick 只送一个 IDR 冲不开 open-GOP 的 DPB（IDR 与其
+                // leading pictures 要等 IDR **之后**的包）——见 .h
+                // KICK_BURST 注释。武装突发：离场侧继续吃新 chunk 前
+                // KICK_BURST 个包的克隆。DECORD_HYBRID_KICK_BURST 可覆盖
+                //（0 = 退回单包 kick 旧行为，消融对照用）。
+                static const int burst_n = [] {
+                    const char *e = getenv("DECORD_HYBRID_KICK_BURST");
+                    return e ? atoi(e) : KICK_BURST;
+                }();
+                kick_burst_ = burst_n > 0 ? burst_n : 0;
+                kick_burst_side_ = old_side;
             }
             cur_side_ = s;
             cur_start_pts_ = pkt->pts;
@@ -1088,12 +1106,27 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
         Side tgt = (is_key ? cur_side_ : cur_route_override_);
         ++side_pending_[tgt];
         if (tgt == SIDE_GPU) ++gpu_pending_;
+        // 突发克隆消费（.h KICK_BURST）：新 chunk 的前几个真包同时克隆喂
+        // 给离场侧，驱动其 DPB 交出 IDR+leading。离场侧重新拿到 key 包
+        // （同侧续跑）时剩余突发作废（下个切换会重新武装）。
+        if (!need_flush && kick_burst_ > 0) {
+            if (is_key) {
+                kick_burst_ = 0;
+            } else if (tgt != kick_burst_side_) {
+                ++side_pending_[kick_burst_side_];
+                if (kick_burst_side_ == SIDE_GPU) ++gpu_pending_;
+                burst_dup = true;
+                burst_dup_side = static_cast<int>(kick_burst_side_);
+                --kick_burst_;
+            }
+        }
     }
     if (need_flush) {
         // kick（锁外执行）。与原型"块尾多解一帧"同型：克隆新 chunk 的
         // 关键帧包推给离场侧，触发其交出滞留的重排帧。kick 帧与迟到帧
         // 的顺序由 Pop 的 expected 帧数对齐保证（kick 帧 stash 扣住，
         // 迟到帧先发）。
+        kicks_[flush_side].fetch_add(1, std::memory_order_relaxed);
         AVPacket *kick = av_packet_clone(pkt.get());
         CHECK(kick != nullptr) << "av_packet_clone failed";
         ffmpeg::AVPacketPtr kick_ptr(kick, [](AVPacket *p) { av_packet_free(&p); });
@@ -1109,6 +1142,22 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
         }
     }
     Side target = is_key ? cur_side_ : cur_route_override_;
+    if (burst_dup) {
+        // 突发克隆包：内容=本包，去向=离场侧（记账已在锁内完成）。
+        AVPacket *dup = av_packet_clone(pkt.get());
+        CHECK(dup != nullptr) << "av_packet_clone failed";
+        ffmpeg::AVPacketPtr dup_ptr(dup, [](AVPacket *p) { av_packet_free(&p); });
+        if (burst_dup_side == SIDE_CPU) {
+            cpu_.Push(std::move(dup_ptr), runtime::NDArray());
+        }
+#ifdef DECORD_USE_CUDA
+        else {
+            std::lock_guard<std::mutex> lk(lcv_mtx_);
+            gpu_pkt_q_.push_back(std::move(dup_ptr));
+            lcv_.notify_all();
+        }
+#endif
+    }
     if (target == SIDE_CPU) {
         cpu_.Push(std::move(pkt), runtime::NDArray());
     } else {
@@ -1218,7 +1267,12 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         if (!PopSide(s, &f)) {
             static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
 #ifdef DECORD_USE_CUDA
-            if (dbg) {
+            // 取证采样在 DEBUG 与 STATS 两种口径都可用：挂死复现是时序
+            // 敏感的，DEBUG 打印本身改变时序（实测 DEBUG 下 8/8 干净、
+            // STATS 下 ~1/4 挂）；STATS 模式每 2000 连败一条，扰动可忽略。
+            static const bool foren =
+                dbg || getenv("DECORD_HYBRID_STATS") != nullptr;
+            if (foren) {
                 // 连续取空诊断：头部 chunk 与两侧队列状态（D 类问题定位用）。
                 // 只嵌 rmtx_ 读队列长度；chunk/pend 字段按本文件既有调试
                 // 打印惯例无锁读取（仅诊断，不保证精确快照）。
@@ -1230,15 +1284,44 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                         crdy = cpu_ready_.size();
                         rdy = ready_.size();
                     }
+                    std::size_t qpk = 0;
+                    {
+                        std::lock_guard<std::mutex> lk2(lcv_mtx_);
+                        qpk = gpu_pkt_q_.size();
+                    }
+                    std::size_t eqn = 0; int stm = 0;
+                    {
+                        std::lock_guard<std::mutex> lk3(mtx_);
+                        eqn = emit_queue_.size();
+                        stm = (has_stash_[0] ? 1 : 0) | (has_stash_[1] ? 2 : 0);
+                    }
+                    int64_t cud_p = -1, cud_b = -1, cud_o = -1;
+                    if (gpu_) gpu_->DiagDepths(&cud_p, &cud_b, &cud_o);
                     fprintf(stderr,
                             "\n[pop-stall] side=%d crdy=%zu rdy=%zu "
                             "head=(side%d,%lld,end=%lld,exp=%lld,em=%lld) "
-                            "pend=%d/%d\n",
+                            "pend=%d/%d\n"
+                            "[pop-stall2] cq=%lld cp=%lld qpk=%zu eq=%zu stm=%d "
+                            "gpf=%lld gpc=%lld upf=%lld upc=%lld "
+                            "np=%d si=%d pr=%d kick=%lld/%lld infl=%lld cud=%lld/%lld/%lld\n",
                             (int)s, crdy, rdy,
                             (int)ch.side, (long long)ch.start_pts,
                             (long long)ch.end_pts, (long long)ch.expected,
                             (long long)ch.emitted, (int)side_pending_[0],
-                            (int)side_pending_[1]);
+                            (int)side_pending_[1],
+                            (long long)cpu_.QueueDepth(),
+                            (long long)cpu_.PendingDepth(),
+                            qpk, eqn, stm,
+                            (long long)gpu_pool_.DiagFree(),
+                            (long long)gpu_pool_.DiagCreated(),
+                            (long long)up_pool_.DiagFree(),
+                            (long long)up_pool_.DiagCreated(),
+                            (int)NeedsPackets(), (int)sched_initialized_,
+                            (int)plan_ready_,
+                            (long long)kicks_[0].load(),
+                            (long long)kicks_[1].load(),
+                            (long long)(side_pending_[0] + side_pending_[1]),
+                            cud_p, cud_b, cud_o);
                 }
             }
 #endif

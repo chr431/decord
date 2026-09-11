@@ -374,38 +374,17 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
                     prod_fold_ring_[prod_fold_i_] = r;
                     prod_fold_i_ = (prod_fold_i_ + 1) % kProdFoldRing;
                     if (prod_fold_n_ < kProdFoldRing) ++prod_fold_n_;
-                    static const bool use_sustained =
-                        getenv("DECORD_CPU_RATE_SUSTAINED") != nullptr;
-                    double next;
-                    if (!use_sustained) {
-                        // **默认口径（不变）**：容量跟踪 快升(1.3x封顶)/慢降(5%)。
-                        // 实测缺陷：被解码器预跑存货的排空 burst 棘轮上抬并
-                        // 永久停留高位（见 .h），仅作默认直至 gpu-out 死锁修复。
-                        double prev = prod_rate_.load(std::memory_order_relaxed);
-                        if (prev <= 0) {
-                            next = r;
-                        } else if (r > prev) {
-                            next = std::min(r, prev * 1.3);
-                        } else {
-                            next = 0.95 * prev + 0.05 * r;
-                        }
-                    } else if (prod_fold_n_ >= 4) {
-                        // 产能口径 = 滑窗持续产能 + 慢降锁：
-                        //   sustained = 最近 8 折里"连续 4 折最小值"的最大值
-                        //   prod_rate_ = max(sustained, 上一值 × 0.997/折)
-                        // sustained 排除**孤立排空尖峰**（撑不满 4 折）：
-                        // hevc 从背压封堵脱封时头 1-3 折读到的是解码器预跑
-                        // 存货的排空速度（r=2491..9138 孤峰，真值 754）——
-                        // 旧 EWMA 被逐发 1.3x 棘轮永久卡在 1200-2500，
-                        // hevc CPU 份额高估 3-4x（plan rc=2217 → 混跑 1568
-                        // < 纯 nvdec 2036）。慢降锁保**真实产能**穿越饿供
-                        // 相位：h264 真产能（纯臂 3573）只在整包喂足的采样
-                        // 段显形（sustained≈2500+），发射门控期滑窗只剩
-                        // ~1000 —— 无锁的纯 maxmin 在晚捕获（实测 folds=35
-                        // age=321ms 落进饿相位）把 rc 误读 875 → 52/48
-                        // 错分 → 混跑 1864 << EWMA 的 3537。锁 0.997/折
-                        // 缓降（半衰 231 折≈3700 帧，足以穿越 3000 帧流的
-                        // 饿供段又不至于永不认错）；升只靠 sustained 实测。
+                    // prod_rate_ = 滑窗持续产能 + 慢降锁（唯一口径，2026-09-12
+                    // 起替代容量跟踪 EWMA）：max(最近8折内"连续4折最小值"的
+                    // 最大值, 上一值×0.997)。排除解码器预跑存货的排空孤峰
+                    // （撑不满连续 4 折；旧 EWMA 被逐发 1.3x 棘轮永久卡
+                    // 1200-2500，hevc 真值 ≈754），慢降锁保真实产能穿越饿供
+                    // 相位（h264 纯臂 3573 只在整包喂足段显形）。≥4 折才出版
+                    // （否则 0 = 未学得，调度走 CPU-sample chunk 冷启动）。
+                    // 混合调度两条路径（cpu-out/gpu-out）统一采用：gpu-out 的
+                    // 倾斜计划死锁已由 kick 突发治本（.h KICK_BURST），实测
+                    // hevc 引擎全片 e2e −24%（见 .h 注释数字表）。
+                    if (prod_fold_n_ >= 4) {
                         double best = 0.0;
                         const int oldest = (prod_fold_i_ - prod_fold_n_
                                             + 2 * kProdFoldRing) % kProdFoldRing;
@@ -419,12 +398,12 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
                             if (w > best) best = w;
                         }
                         const double prev = prod_rate_.load(std::memory_order_relaxed);
-                        next = prev > 0 ? std::max(best, prev * 0.997) : best;
-                    } else {
-                        next = 0.0;
+                        prod_rate_.store(
+                            prev > 0 ? std::max(best, prev * 0.997) : best,
+                            std::memory_order_relaxed);
                     }
-                    prod_rate_.store(next, std::memory_order_relaxed);
-                    if (rdbg) fprintf(stderr, "[rate] FOLD t=%.3f r=%.0f rate=%.0f n=%d\n",
+                    if (rdbg) fprintf(stderr,
+                                      "[rate] FOLD t=%.3f r=%.0f rate=%.0f n=%d\n",
                                       std::chrono::duration<double>(
                                           std::chrono::steady_clock::now().time_since_epoch()).count(),
                                       r, prod_rate_.load(), prod_fold_n_);

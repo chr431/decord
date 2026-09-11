@@ -102,6 +102,16 @@ class HybridGpuBufferPool {
     /*! \brief 缓冲回收回调（Deleter 触发）：混合解码器用它即时唤醒
      *  喂包/上载线程（池耗尽时的重试延迟从 1ms 轮询降为即时）。 */
     void SetOnRelease(std::function<void()> cb) { on_release_ = std::move(cb); }
+    /*! \brief 诊断快照（stall 归因）：池的空闲/已建块数（非 const：仅
+     *  工作/消费线程在锁内读，避免把整池 mutex 改 mutable） */
+    std::size_t DiagFree() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return free_.size();
+    }
+    std::size_t DiagCreated() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return created_;
+    }
     /*! \brief 启用回池保序：Deleter 在 legacy 流 record 事件，Acquire
      *  后由调用方 cudaStreamWaitEvent —— 上载 H2D 无需 blocking 流全局
      *  互斥即可与消费侧在途拷贝保序（否则二者互相排队，上载被消费
@@ -314,6 +324,11 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
         const int64_t inflight = side_pending_[0] + side_pending_[1];
         if (!sched_initialized_) {
             const int est = static_cast<int>(est_chunk_frames_);
+            // 盲窗曾试过 +up_pool_frames_（为 "sustained 倾斜计划下
+            // cpu_ready_ 存货吃满盲窗" 的 gpu-out 死锁为解）——该病灶已由
+            // kick 突发治本（本文件 KICK_BURST），而加宽本身让 av1 gpu-out
+            // 盲阶段 CPU 采样存货更深、保序等待拉长，真交付 70%→10%
+            //（3x 崩盘，消融矩阵）。回退。
             const int64_t blind = est > 0 ? 2 * est + 64 : 640;
             return inflight < std::min<int64_t>(
                        static_cast<int64_t>(prefetch_frames_)
@@ -411,6 +426,19 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool routing_active_ = false;   ///< 已见到首包
     Side cur_side_ = SIDE_CPU;      ///< 当前承接 chunk 的侧
     int64_t cur_start_pts_ = 0;
+    /*! \brief kick 突发克隆余量：跨侧切换只 kick 一个 IDR 包**不足以冲开
+     *  hevc/h264 的 open-GOP DPB**——IDR 连同其 leading pictures 要等
+     *  IDR **之后**的包驱动输出（实测挂死现场 DPB 扣 6 帧 = IDR+5
+     *  leading，side_pending[GPU]=6 吻合）。旧交替计划下一 GPU chunk 的
+     *  真包最迟一个 chunk 就到，DPB 滞留是瞬态；GPU 主导的倾斜计划里
+     *  CPU 采样段连跑 3-4 chunk，离场侧等不来任何后续包 → 瞬态变永久
+     *  冻结 → 队头缺帧、盲窗被对侧库存吃满、路由停摆、决策饥饿——
+     *  环环相扣成死锁。修复 = kick 后把新 chunk 的前 KICK_BURST 个包
+     *  也克隆喂给离场侧（其输出走越界 stash / 陈旧丢弃既有兜底，帧
+     *  记账与 kick 同型）。仅 Push 线程读写，无需加锁。 */
+    static constexpr int KICK_BURST = 5;
+    int kick_burst_ = 0;
+    Side kick_burst_side_ = SIDE_CPU;
     /*! \brief 当前包按 pts 归属解析出的目标侧（仅 Push 线程访问） */
     Side cur_route_override_ = SIDE_CPU;
 
@@ -467,6 +495,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::atomic<int64_t> plan_rc_{0}, plan_rg_{0};        ///< BuildPlan 冻结时的两侧速率
     std::atomic<int64_t> plan_frames_[2]{};               ///< BuildPlan 各侧规划帧量
     std::atomic<int64_t> plan_folds_{0};                  ///< BuildPlan 时 CPU 已完成折数
+    std::atomic<int64_t> kicks_[2]{};                     ///< 各侧收到的 kick 冲刷包数
     std::atomic<int64_t> stats_t0_us_{0};                 ///< Push 首包时刻（steady epoch µs）
     std::atomic<int64_t> plan_age_ms_{0};                 ///< BuildPlan 距首包毫秒数
 };
