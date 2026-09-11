@@ -701,6 +701,9 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
     const double rg = std::max(gpu_rate_landed_.load(std::memory_order_relaxed), 1.0);
     int64_t ac = assigned_frames_[SIDE_CPU];
     int64_t ag = assigned_frames_[SIDE_GPU];
+    // 诊断/实验覆盖必须在这里也生效：规划器早先只按贪心份额分侧，force
+    // 模式下会规划出运行时永不喂包的另一侧 chunk（详见 .h ForcedSide 注释）。
+    const Side forced = ForcedSide();
     for (int k = k0; k < static_cast<int>(kf_pts_.size()); ++k) {
         int64_t n = kf_rank_[k + 1] - kf_rank_[k];
         if (k + 1 >= static_cast<int>(kf_pts_.size())) {
@@ -709,6 +712,7 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
         }
         Side s = (static_cast<double>(ac) * rg
                   <= static_cast<double>(ag) * rc) ? SIDE_CPU : SIDE_GPU;
+        if (forced != Side(-1)) s = forced;
         plan_side_[k] = static_cast<int>(s);
         (s == SIDE_CPU ? ac : ag) += n;
     }
@@ -726,15 +730,25 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
     }
 }
 
+HybridThreadedDecoder::Side HybridThreadedDecoder::ForcedSide() const {
+    // DECORD_HYBRID_FORCE_SIDE=cpu|gpu：诊断/实验用的单侧强制路由。
+    // 非 IDR-like 编码（AV1 等）下 force=cpu 退化为 GPU：chunk 边界不落在
+    // IDR 上时纯 CPU 分片无法按序交付（保持旧行为，只是挪到这里统一表达）。
+    static const Side want = [] {
+        const char *e = getenv("DECORD_HYBRID_FORCE_SIDE");
+        if (!e) return Side(-1);
+        return (strcmp(e, "gpu") == 0) ? SIDE_GPU : SIDE_CPU;
+    }();
+    if (want == SIDE_GPU) return SIDE_GPU;
+    if (want == SIDE_CPU) return IsIdrLikeCodec() ? SIDE_CPU : SIDE_GPU;
+    return Side(-1);
+}
+
 HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
-    {/* 诊断/实验开关：DECORD_HYBRID_FORCE_SIDE=cpu|gpu 强制单侧路由 */
-        static const Side forced = [] {
-            const char *e = getenv("DECORD_HYBRID_FORCE_SIDE");
-            if (!e) return Side(-1);
-            return (strcmp(e, "gpu") == 0) ? SIDE_GPU : SIDE_CPU;
-        }();
-        if (forced == SIDE_GPU) return SIDE_GPU;
-        if (forced == SIDE_CPU) return IsIdrLikeCodec() ? SIDE_CPU : SIDE_GPU;
+    {   // 诊断/实验覆盖：与 BuildPlan 共用 ForcedSide（见 .h 注释——两处
+        // 口径不一致会把 force 模式直接锁死）。
+        const Side f = ForcedSide();
+        if (f != Side(-1)) return f;
     }
     // 设计决策（用户拍板，2026-09-07）：所有 codec 统一按实测速率比例
     // 分配（water-filling），**不做慢侧自动回退** —— hybrid 是实验性
@@ -943,7 +957,16 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
             // 分支按 codec 给一个 CPU chunk 采样（与 chunk0 的 GPU 发射
             // 重叠）；hevc/av1 的 gate 判决恒为全 GPU，永远不需要 rc。
             routing_active_ = true;
-            cur_side_ = SIDE_GPU;
+            // 首包默认 GPU（NVDEC 平价起步，见上），但诊断/实验的
+            // DECORD_HYBRID_FORCE_SIDE **必须在这里也生效**：bootstrap 原先
+            // 完全绕过 ChooseSide，force=cpu 时 chunk0 仍归 GPU 却永不落地
+            // ——Pop 卡死在队头（实测 `[pop-stall] side=1 crdy=637 rdy=0
+            // head=(side1,0,…,exp=299,em=293) pend=655/7`：数百帧已上载的
+            // CPU 存货被一个不会有包的 GPU chunk 堵死，且 force-close 安全网
+            // 因 side_pending_[GPU]=7≠0 正确地不敢关它）。未设 force 时
+            // ForcedSide() 返回哨兵 → 行为与本修改前逐字一致。
+            const Side forced_boot = ForcedSide();
+            cur_side_ = (forced_boot != Side(-1)) ? forced_boot : SIDE_GPU;
             cur_start_pts_ = pkt->pts;
             Chunk c{cur_side_, pkt->pts, INT64_MAX, 0, 0};
             emit_queue_.push_back(c);

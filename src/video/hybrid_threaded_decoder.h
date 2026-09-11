@@ -188,6 +188,16 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     void ResetRouting();
     /*! \brief 为起始 pts == key_pts 的新 chunk 选择承接侧（速率感知贪心） */
     Side ChooseSide(int64_t key_pts);
+    /*! \brief 诊断/实验开关 DECORD_HYBRID_FORCE_SIDE 的生效侧；未设时返回
+     *  Side(-1)（哨兵，与本文件既有写法一致）。
+     *
+     *  **ChooseSide 与 BuildPlan 必须共用本函数**：预路由计划早先自己按
+     *  贪心份额算侧、不查这个覆盖，于是 force=cpu 下仍会规划出 GPU chunk，
+     *  而这类 chunk 永远不会被喂包 —— Pop 卡死在队头（实测
+     *  `[pop-stall] side=1 crdy=637 rdy=0 head=(side1,…,exp=299,em=293)`：
+     *  637 帧已上载的 CPU 存货被一个不会来的 GPU chunk 堵在后面），
+     *  且 force-close 安全网因 side_pending_[GPU]≠0 而正确地不敢关 chunk。 */
+    Side ForcedSide() const;
     /*! rief pts 	o 呈现序帧号（kf 表近似，调度用） */
     int64_t RankOfPts(int64_t pts) const;
     /*! \brief chunk [start,end) 的期望帧数（查 kf 索引；0=未知） */
