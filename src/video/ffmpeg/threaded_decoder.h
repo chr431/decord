@@ -67,10 +67,40 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~FFMPEGThreadedDecoder();
-        /*! 生产侧解码速率（帧/秒，段式 EWMA，filter 线程产出点实测）。
-         *  发射速率是消费驱动的（慢消费会把能力低估数倍）；本速率只在
-         *  连续产出段（帧间隔 <50ms）内统计，背压等待/断流重置段不计
-         *  —— 近似真实解码能力，与消费速率解耦。供混合解码调度用。 */
+        /*! 生产侧解码速率（帧/秒）。**默认口径 = 容量跟踪 EWMA**（快升
+         *  1.3x / 慢降 5%/折）—— 与 0.8.3 发布行为一致。
+         *
+         *  `DECORD_CPU_RATE_SUSTAINED=1` 切换到"滑窗持续产能"：最近 8 折
+         *  （16 帧/折）内连续 4 折最小值的最大值，慢降锁 0.997/折，≥4 折
+         *  才出版（此前 0 = 未学得，调度走 CPU-sample chunk 路径）。实测
+         *  动机（DECORD_CPU_RATE_DEBUG trace，hevc hybrid 3000 帧）：
+         *  filter 每次从背压封堵脱封，头 1-3 折读到的是**解码器内部预跑
+         *  存货的排空速度**（r=2491..9138 孤峰），EWMA 的 1.3x 棘轮逐峰
+         *  上抬、5% 缓降追不上 —— 永久卡在 1200-2500 而真实产率 ≈754，
+         *  BuildPlan 冻结高估 → hevc CPU 份额翻倍（plan rc=2217，混跑
+         *  1568-1900 < 纯 nvdec 2036）。sustained 实测收益（decode-only
+         *  3000f×3  reps）：hevc hybrid **2688 vs 1951（+38%）**、h264
+         *  不受排空孤峰影响（4 折窗把启动种子与孤峰都排除；h264 突发段
+         *  连续 20+ 折 → sustained 2500 vs EWMA 4300）、av1 ≈持平。
+         *
+         *  ⚠️ **为何仍是 opt-in**：GPU 驻留（hybrid_gpu，引擎 GPU 管线
+         *  口径）下按真实比例倾斜的计划（hevc 76% GPU）暴露一个**先于
+         *  本改动存在的 hybrid_gpu 死锁**：慢消费者复现 8 折门控与无门控
+         *  各 ~2/8 概率挂死（EWMA 对照 16/16 干净），签名
+         *  `[pop-stall] head=(CPU chunk) crdy=0 rdy=673 pend=1080/3394`
+         *  （CPU 解码器携 1080 帧路由中量**停摆**，673 个已落地 GPU 帧被
+         *  队头搁置）与 `[pop-stall] side=1 …em=235/240 rdy=0 q=0
+         *  pend=538/6`（队头尾 5 帧滞留 NVDEC，等待进不来包的后续包解
+         *  reorder）。份额分布只是改变撞窗概率，根因未定位前不得默认。
+         *  跟进项 = 先修该死锁（疑似 CPU 子解码器输出缓冲
+         *  （VideoReader ndarray_pool_）在倾斜计划下耗尽/回收停摆）。 */
+        double ProductionRate() const {
+            return prod_rate_.load(std::memory_order_relaxed);
+        }
+        /*! \brief 已完成的折数（滑窗冷启动门控用） */
+        int64_t ProductionFolds() const {
+            return prod_folds_.load(std::memory_order_relaxed);
+        }
         /*! 混合解码器用：放大 frame_queue_ 背压深度。默认 32 帧 —— 混合
          *  管线里 CPU chunk 的发射靠 cpu_ready_ 存货瞬时完成，存货攒不到
          *  一个 chunk 帧数（~286）就会退化为实时跟随解码速率
@@ -86,9 +116,6 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         size_t PendingDepth() const {
             return (pkt_queue_ ? pkt_queue_->Size() : 0)
                  + (raw_queue_ ? raw_queue_->Size() : 0);
-        }
-        double ProductionRate() const {
-            return prod_rate_.load(std::memory_order_relaxed);
         }
     private:
         void WorkerThread();
@@ -152,6 +179,11 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         std::chrono::steady_clock::time_point last_prod_tp_{};
         int64_t prod_seg_frames_ = 0;
         double prod_seg_secs_ = 0.0;
+        std::atomic<int64_t> prod_folds_{0};   ///< 已完成折数（计划冷启动门控）
+        static constexpr int kProdFoldRing = 8;  ///< 滑窗折数（8×16=128 帧）
+        double prod_fold_ring_[kProdFoldRing] = {0};
+        int prod_fold_i_ = 0;   ///< 环形写位（仅 filter 线程）
+        int prod_fold_n_ = 0;   ///< 有效样本数（封顶 kProdFoldRing）
         // AV1（dav1d）解码：批量 send 模式（dav1d 帧并行需多 packet 在途）
         bool codec_is_av1_ = false;
         // ── ROI-first 状态（SetRoi）──

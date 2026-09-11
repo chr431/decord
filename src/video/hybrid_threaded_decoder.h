@@ -448,6 +448,27 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
 
     std::atomic<int64_t> frames_out_[2]{};
     std::atomic<bool> started_{false};
+    // ── 非打印测量（2026-09-12，§7.2 先量后做）──────────────────────
+    // 热路径只做 relaxed 整数累加，**不打 stderr**；唯一输出点是 Stop()
+    // 里 `DECORD_HYBRID_STATS` 门控的一次性汇总块（析构时触发，不在被测
+    // 墙钟窗口内）。对照物：DECORD_HYBRID_DEBUG 一次运行 13 万行打印，
+    // 墙钟 2940 vs 3100fps —— 打印本身扰动测量，本轮起归因只用这里。
+    //
+    // HOL 记账口径：dt 累加发生在消费者线程的相邻 Pop 调用之间，因此
+    // "head 空等"只在 decode-only 消费（Pop 背靠背）时等于真实墙钟损失；
+    // 消费者中间干别的活（OCR）时该 dt 含消费工作时间，只能作上限读。
+    std::atomic<int64_t> hol_us_[2]{};          ///< 队头阻塞时长 µs（按 head 侧分桶）
+    std::atomic<int64_t> hol_ev_[2]{};          ///< 阻塞 episode 进入次数（非阻塞→阻塞）
+    std::atomic<int64_t> hol_strand_max_[2]{};  ///< episode 期间观测到的对侧存货峰值
+    int hol_prev_side_ = -1;  ///< 上次 Pop 结束时是否停在 HOL 阻塞（仅消费者线程读写）
+    std::chrono::steady_clock::time_point hol_tp_{};
+    std::atomic<int64_t> up_flush_n_{0}, up_flush_f_{0};  ///< UploadStep 批次数 / 批内帧数
+    std::atomic<int64_t> up_nobuf_{0}, up_cempty_{0};     ///< 池尽 / CPU 断流提前冲刷
+    std::atomic<int64_t> plan_rc_{0}, plan_rg_{0};        ///< BuildPlan 冻结时的两侧速率
+    std::atomic<int64_t> plan_frames_[2]{};               ///< BuildPlan 各侧规划帧量
+    std::atomic<int64_t> plan_folds_{0};                  ///< BuildPlan 时 CPU 已完成折数
+    std::atomic<int64_t> stats_t0_us_{0};                 ///< Push 首包时刻（steady epoch µs）
+    std::atomic<int64_t> plan_age_ms_{0};                 ///< BuildPlan 距首包毫秒数
 };
 
 }  // namespace decord

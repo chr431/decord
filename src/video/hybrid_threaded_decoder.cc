@@ -637,6 +637,43 @@ void HybridThreadedDecoder::Stop() {
     // 先停工作线程（它可能正持有 GPU 侧的包/缓冲），再停子解码器
     StopGpuWorker();
 #endif
+    if (getenv("DECORD_HYBRID_STATS")) {
+        // 一次性汇总（非打印测量协议的唯一输出点；析构时触发，不在被测
+        // 墙钟窗口内）。口径见 .h「非打印测量」注释。
+        fprintf(stderr,
+                "\n[hybrid-stats] mode=%s frames c=%lld g=%lld chunks c=%d g=%d\n",
+#ifdef DECORD_USE_CUDA
+                out_cuda_ ? "gpu-out" : "cpu-out",
+#else
+                "cpu-only",
+#endif
+                (long long)frames_out_[0].load(), (long long)frames_out_[1].load(),
+                chunks_assigned_[0], chunks_assigned_[1]);
+        fprintf(stderr,
+                "[hybrid-stats] plan rc=%lld rg=%lld frames c=%lld g=%lld"
+                " folds=%ld age=%lldms\n",
+                (long long)plan_rc_.load(), (long long)plan_rg_.load(),
+                (long long)plan_frames_[0].load(), (long long)plan_frames_[1].load(),
+                (long)plan_folds_.load(), (long long)plan_age_ms_.load());
+        fprintf(stderr,
+                "[hybrid-stats] hol cpu-head us=%lld ev=%lld strandmax=%lld"
+                " | gpu-head us=%lld ev=%lld strandmax=%lld\n",
+                (long long)hol_us_[0].load(), (long long)hol_ev_[0].load(),
+                (long long)hol_strand_max_[0].load(),
+                (long long)hol_us_[1].load(), (long long)hol_ev_[1].load(),
+                (long long)hol_strand_max_[1].load());
+#ifdef DECORD_USE_CUDA
+        if (out_cuda_) {
+            const long long fn = (long long)up_flush_n_.load();
+            const long long fr = (long long)up_flush_f_.load();
+            fprintf(stderr,
+                    "[hybrid-stats] upload flushes=%lld frames=%lld avg_batch=%.2f"
+                    " nobuf=%lld cpuempty=%lld\n",
+                    fn, fr, fn > 0 ? (double)fr / (double)fn : 0.0,
+                    (long long)up_nobuf_.load(), (long long)up_cempty_.load());
+        }
+#endif
+    }
     cpu_.Stop();
 #ifdef DECORD_USE_CUDA
     if (gpu_) gpu_->Stop();
@@ -697,6 +734,8 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
     if (it == kf_pts_.end() || *it != key_pts) return;
     int k0 = static_cast<int>(it - kf_pts_.begin());
     plan_side_.assign(kf_pts_.size(), -1);
+    plan_frames_[0].store(0, std::memory_order_relaxed);
+    plan_frames_[1].store(0, std::memory_order_relaxed);
     const double rc = std::max(cpu_.ProductionRate(), 1.0);
     const double rg = std::max(gpu_rate_landed_.load(std::memory_order_relaxed), 1.0);
     int64_t ac = assigned_frames_[SIDE_CPU];
@@ -715,7 +754,16 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
         if (forced != Side(-1)) s = forced;
         plan_side_[k] = static_cast<int>(s);
         (s == SIDE_CPU ? ac : ag) += n;
+        plan_frames_[s].fetch_add(n, std::memory_order_relaxed);
     }
+    plan_rc_.store(static_cast<int64_t>(rc), std::memory_order_relaxed);
+    plan_rg_.store(static_cast<int64_t>(rg), std::memory_order_relaxed);
+    plan_folds_.store(cpu_.ProductionFolds(), std::memory_order_relaxed);
+    plan_age_ms_.store(
+        (std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()
+         - stats_t0_us_.load(std::memory_order_relaxed)) / 1000,
+        std::memory_order_relaxed);
     plan_ready_ = true;
     if (getenv("DECORD_HYBRID_DEBUG")) {
         int nc = 0, nf[2] = {0, 0};
@@ -765,8 +813,9 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // 慢侧 CPU —— GPU 越快越早触发，恶性循环锁死在 CPU 实时速率
     // （av1 全量实测 654fps vs 全 GPU 1520）。
     // 积压排空贪心 → 已被 water-filling 份额计数器取代（见下）。
-    // CPU 速率取生产侧实测（filter 线程产出 EWMA，NV12 直出后的有效
-    // 供给口径）：与 GPU 落地速率同口径可比。
+    // CPU 速率取生产侧实测（filter 线程产出，NV12 直出后的有效供给
+    // 口径）：与 GPU 落地速率同口径可比。读数口径与滑窗"持续产能"
+    // 实验（DECORD_CPU_RATE_SUSTAINED）的取舍见 threaded_decoder.h。
     double rate[2] = {cpu_.ProductionRate(),
                       gpu_rate_landed_.load(std::memory_order_relaxed)};
     // rc 未学得：给一个 CPU chunk 采样（所有 codec —— water-filling 需要
@@ -841,6 +890,13 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // 尾滞留帧需要下一个 CPU chunk 的包冲出。
     // 双侧速率就绪 → 一次性规划全部未来 chunk 的侧。FORCE_SHARE
     // env 优先（份额实验旋钮），否则能力比 rc/(rc+rg)。
+    // 不加折数门控（2026-09-12 实测教训）：曾加过 `ProductionFolds()>=8`
+    // —— 计划推迟期间 chunk 决策全走 pending 策略，GPU 倾斜计划下
+    // gp_pending 冲到 1982/pktq 2401，CPU 存货(538)吃满 NeedsPackets
+    // 窗口，队头 GPU chunk 尾 5 帧永无 flush 机会 → hybrid_gpu hevc
+    // 全片活锁（slow-consumer 复现，EWMA 对照组 8/8 干净）。而滑窗
+    // sustained 统计**本身就防启动种子**（4 折窗最小值：hevc 首窗即
+    // 798、h264 2452、av1 ~1010），门控毫无必要。
     if (sched_initialized_ && !plan_ready_) {
         double f = rate[SIDE_CPU] / std::max(rate[SIDE_CPU] + rate[SIDE_GPU], 1.0);
         static const double fs_env = [] {
@@ -957,6 +1013,10 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
             // 分支按 codec 给一个 CPU chunk 采样（与 chunk0 的 GPU 发射
             // 重叠）；hevc/av1 的 gate 判决恒为全 GPU，永远不需要 rc。
             routing_active_ = true;
+            stats_t0_us_.store(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
             // 首包默认 GPU（NVDEC 平价起步，见上），但诊断/实验的
             // DECORD_HYBRID_FORCE_SIDE **必须在这里也生效**：bootstrap 原先
             // 完全绕过 ChooseSide，force=cpu 时 chunk0 仍归 GPU 却永不落地
@@ -1105,6 +1165,20 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
 }
 
 bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
+    // ── HOL 时长累账（非打印，见 .h 注释）：上次调用停在队头阻塞、本
+    // 调用入口之间的墙钟计入该侧；episode 保持开启直到发射成功或双侧
+    // 全空。单消费者线程读写，无并发问题。──
+    if (hol_prev_side_ >= 0) {
+        const auto now_tp = std::chrono::steady_clock::now();
+        int64_t dt = std::chrono::duration_cast<std::chrono::microseconds>(
+                         now_tp - hol_tp_).count();
+        if (dt > 50000) dt = 50000;  // 夹掉消费间隙（GC/probe 收尾等）
+        if (dt > 0) {
+            hol_us_[hol_prev_side_].fetch_add(
+                dt, std::memory_order_relaxed);
+        }
+        hol_tp_ = now_tp;
+    }
     while (true) {
         Chunk ch;
         {
@@ -1169,6 +1243,37 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             }
 #endif
             if (dbg) fprintf(stderr, "[hybrid-p] empty side=%d emitted_total=%lld\n", (int)s, (long long)emitted_total_);
+#ifdef DECORD_USE_CUDA
+            {   // HOL 判定：head 侧空但**对侧有存货** = 保序队头阻塞（对侧
+                // 帧已产出却被排在后面的 chunk 卡住）；双侧全空 = 真·生产
+                // 不足，不计 HOL。
+                int64_t other = 0;
+                if (s == SIDE_GPU) {
+                    if (out_cuda_) {
+                        std::lock_guard<std::mutex> lk(rmtx_);
+                        other = static_cast<int64_t>(cpu_ready_.size());
+                    } else {
+                        other = static_cast<int64_t>(cpu_.QueueDepth());
+                    }
+                } else {
+                    std::lock_guard<std::mutex> lk(rmtx_);
+                    other = static_cast<int64_t>(ready_.size());
+                }
+                if (other > 0) {
+                    if (hol_prev_side_ < 0) {
+                        hol_ev_[s].fetch_add(1, std::memory_order_relaxed);
+                        hol_prev_side_ = static_cast<int>(s);
+                        hol_tp_ = std::chrono::steady_clock::now();
+                    }
+                    int64_t mx = hol_strand_max_[s].load(std::memory_order_relaxed);
+                    while (other > mx
+                           && !hol_strand_max_[s].compare_exchange_weak(
+                               mx, other, std::memory_order_relaxed)) {}
+                } else {
+                    hol_prev_side_ = -1;
+                }
+            }
+#endif
             return false;
         }
         if (IsMarker(f)) {
@@ -1180,6 +1285,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 std::lock_guard<std::mutex> lk(mtx_);
                 emit_queue_.pop_front();
                 emit_queue_.clear();
+                hol_prev_side_ = -1;
                 *frame = f;
                 return true;
             }
@@ -1250,6 +1356,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 }
             }
         }
+        hol_prev_side_ = -1;  // 发射成功：HOL episode 结束
         *frame = f;
         return true;
     }
@@ -1585,6 +1692,8 @@ bool HybridThreadedDecoder::UploadStep() {
     bool did = false;
     auto flush = [&]() {
         if (nf == 0) return;
+        up_flush_n_.fetch_add(1, std::memory_order_relaxed);
+        up_flush_f_.fetch_add(nf, std::memory_order_relaxed);
         cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(up_stream_));
         {
             std::lock_guard<std::mutex> lk(rmtx_);
@@ -1599,12 +1708,14 @@ bool HybridThreadedDecoder::UploadStep() {
     while (nf < kUploadBatch) {
         runtime::NDArray buf;
         if (!up_pool_.Acquire(&buf)) {
+            up_nobuf_.fetch_add(1, std::memory_order_relaxed);
             if (dbg) fprintf(stderr, "[hybrid-u] no-buf");
             flush();  // 上载池耗尽：CPU 帧显存容器已满（背压）
             return did;
         }
         runtime::NDArray f;
         if (!cpu_.Pop(&f) || !f.defined()) {
+            up_cempty_.fetch_add(1, std::memory_order_relaxed);
             if (dbg) fprintf(stderr, "[hybrid-u] cpu-empty");
             flush();  // buf 随析构归还池
             return did;
