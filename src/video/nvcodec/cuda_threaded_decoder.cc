@@ -281,10 +281,18 @@ int CUThreadedDecoder::HandlePictureDecode_(CUVIDPICPARAMS* pic_params) {
     // int tmp;
     // while (permit_queue->Size() < 1) continue;
     // int ret = permit_queue->Pop(&tmp);
+    // NVDEC 服务时间记账（每帧一对时钟调用，~25ns 级；2026-09-12
+    // 混合解码可见性）。relaxed 单写者 = 解析/解码回调线程。
+    const auto dec_busy_t0 = std::chrono::steady_clock::now();
     if (!CHECK_CUDA_CALL(nv::cuvidDecodePicture(decoder_, pic_params))) {
         LOG(FATAL) << "Failed to launch cuvidDecodePicture";
         return 0;
     }
+    dec_busy_us_.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - dec_busy_t0).count(),
+        std::memory_order_relaxed);
+    dec_busy_pics_.fetch_add(1, std::memory_order_relaxed);
     // decoded_cnt_++;
     return 1;
 }

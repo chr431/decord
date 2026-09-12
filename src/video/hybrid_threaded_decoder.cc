@@ -670,6 +670,18 @@ void HybridThreadedDecoder::Stop() {
                 (long long)hol_strand_max_[0].load(),
                 (long long)hol_us_[1].load(), (long long)hol_ev_[1].load(),
                 (long long)hol_strand_max_[1].load());
+        // 忙时分解（2026-09-12 可见性）：cpu_us/gpu_us = 两臂各自实际
+        // 解码墙钟（CPU=worker 取包→解码完成；GPU=cuvidDecodePicture
+        // 提交时长）。与 frames c/g 联合得每臂有效解码速率（busy fps）；
+        // 与墙钟联合得每臂忙碌占比 —— 「臂本身慢」（busy fps 低）与
+        // 「臂被调度闲置」（busy 占比低）自此可分。
+        fprintf(stderr,
+                "[hybrid-stats] busy cpu_us=%lld pkts=%lld"
+                " | gpu_us=%lld pics=%lld\n",
+                (long long)cpu_.DecodeBusyUs(),
+                (long long)cpu_.DecodeBusyPkts(),
+                (long long)(gpu_ ? gpu_->DecodeBusyUs() : 0),
+                (long long)(gpu_ ? gpu_->DecodeBusyPics() : 0));
 #ifdef DECORD_USE_CUDA
         if (out_cuda_) {
             const long long fn = (long long)up_flush_n_.load();

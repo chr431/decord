@@ -111,6 +111,15 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
             return (pkt_queue_ ? pkt_queue_->Size() : 0)
                  + (raw_queue_ ? raw_queue_->Size() : 0);
         }
+        /*! 解码忙时累计（µs）与处理的包数（含 drain 哨兵）。忙时 = worker
+         *  从取到包到该包解码处理完成的墙钟；Pop 阻塞（闲）不计入。混合
+         *  解码器 Stop() 汇总用它区分「CPU 臂本身慢」与「CPU 臂闲置」。 */
+        int64_t DecodeBusyUs() const {
+            return dec_busy_us_.load(std::memory_order_relaxed);
+        }
+        int64_t DecodeBusyPkts() const {
+            return dec_busy_pkts_.load(std::memory_order_relaxed);
+        }
     private:
         void WorkerThread();
         void WorkerThreadImpl();
@@ -158,6 +167,10 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         std::thread t_;          // decode worker
         std::thread filter_t_;   // filter worker
         std::atomic<bool> run_;
+        // 解码忙时记账（2026-09-12 混合解码可见性）：relaxed 累加，单写者
+        // = 解码 worker 线程；读侧仅 Stop() 汇总。
+        std::atomic<long long> dec_busy_us_{0};
+        std::atomic<long long> dec_busy_pkts_{0};
         FFMPEGFilterGraphPtr filter_graph_;
         std::mutex filter_mutex_;   // 保护 filter_graph_ 热切换（SetRoi）
         AVCodecContextPtr dec_ctx_;

@@ -16,6 +16,7 @@
 #include "../ffmpeg/ffmpeg_common.h"
 #include "../threaded_decoder_interface.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <thread>
@@ -73,6 +74,16 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
             *bufs = frame_queue_ ? static_cast<int64_t>(frame_queue_->Size()) : -1;
             *ord = reorder_queue_ ? static_cast<int64_t>(reorder_queue_->Size()) : -1;
         }
+        /*! NVDEC 解码提交忙时（µs）与提交帧数。忙时 = HandlePictureDecode_
+         *  内 cuvidDecodePicture 调用的墙钟（驱动侧异步解码按硬件引擎串行，
+         *  提交时长是标准的服务时间代理）。混合解码器 Stop() 汇总用它
+         *  区分「NVDEC 本身慢」与「NVDEC 闲置」。 */
+        int64_t DecodeBusyUs() const {
+            return dec_busy_us_.load(std::memory_order_relaxed);
+        }
+        int64_t DecodeBusyPics() const {
+            return dec_busy_pics_.load(std::memory_order_relaxed);
+        }
         void SuggestDiscardPTS(std::vector<int64_t> dts);
         void ClearDiscardPTS();
         ~CUThreadedDecoder();
@@ -93,6 +104,10 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         void InitBitStreamFilter(AVCodecParameters *codecpar, const AVInputFormat *iformat);
 
         int device_id_;
+        // NVDEC 忙时记账（2026-09-12 混合解码可见性）：relaxed 累加，
+        // 单写者 = 解析/解码回调线程；读侧仅混合解码器 Stop() 汇总。
+        std::atomic<long long> dec_busy_us_{0};
+        std::atomic<long long> dec_busy_pics_{0};
         CUStream stream_;
         CUdevice device_;
         CUContext ctx_;

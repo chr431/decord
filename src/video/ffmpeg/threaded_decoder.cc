@@ -671,6 +671,9 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
         if (!ret) {
             return;
         }
+        // 忙时起点：Pop 返回即开始计（闲等发生在此前的阻塞里，不计入）。
+        // 每 packet 一对时钟调用，~25ns 级，相对毫秒级解码可忽略。
+        const auto dec_busy_t0 = std::chrono::steady_clock::now();
         if (!pkt) {
             // ── draining mode: pull buffered frames out of avcodec ──
             CHECK_GE(avcodec_send_packet(dec_ctx_.get(), NULL), 0) << "Thread worker: Error entering draining mode.";
@@ -829,6 +832,11 @@ void FFMPEGThreadedDecoder::WorkerThreadImpl() {
         }
         // free raw memories allocated with ffmpeg
         // av_packet_unref(pkt);
+        dec_busy_us_.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - dec_busy_t0).count(),
+            std::memory_order_relaxed);
+        dec_busy_pkts_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
