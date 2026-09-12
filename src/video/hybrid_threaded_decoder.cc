@@ -78,6 +78,11 @@ HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
                                              const AVInputFormat *iformat,
                                              bool output_cuda)
     : cpu_(), device_id_(device_id), out_cuda_(output_cuda) {
+    // DECORD_HYBRID_KICK_BURST 语义（2026-09-12 反馈式清偿起）：
+    // 0 = 关闭反馈克隆（消融对照 = 单包 kick 旧行为）；>0 = 克隆护栏值。
+    if (const char *e = getenv("DECORD_HYBRID_KICK_BURST")) {
+        kick_guard_ = atoi(e);
+    }
 #ifdef DECORD_USE_CUDA
     // GPU 子解码器初始化 bsf (mp4→annexb) 时会就地改写传入的 codecpar。
     // 传副本；CPU 侧继续用 VideoReader 手里的原始 AVCC 参数（其
@@ -642,7 +647,7 @@ void HybridThreadedDecoder::Stop() {
         // 墙钟窗口内）。口径见 .h「非打印测量」注释。
         fprintf(stderr,
                 "\n[hybrid-stats] mode=%s frames c=%lld g=%lld chunks c=%d g=%d"
-                " kicks c=%lld g=%lld\n",
+                " kicks c=%lld g=%lld clones=%lld\n",
 #ifdef DECORD_USE_CUDA
                 out_cuda_ ? "gpu-out" : "cpu-out",
 #else
@@ -650,7 +655,8 @@ void HybridThreadedDecoder::Stop() {
 #endif
                 (long long)frames_out_[0].load(), (long long)frames_out_[1].load(),
                 chunks_assigned_[0], chunks_assigned_[1],
-                (long long)kicks_[0].load(), (long long)kicks_[1].load());
+                (long long)kicks_[0].load(), (long long)kicks_[1].load(),
+                (long long)fb_clones_.load());
         fprintf(stderr,
                 "[hybrid-stats] plan rc=%lld rg=%lld frames c=%lld g=%lld"
                 " folds=%ld age=%lldms\n",
@@ -698,7 +704,8 @@ void HybridThreadedDecoder::ResetRouting() {
     routing_active_ = false;
     cur_side_ = SIDE_CPU;
     cur_start_pts_ = 0;
-    kick_burst_ = 0;
+    kick_side_ = Side(-1);
+    kick_owed_ = kick_cloned_ = 0;
     emit_queue_.clear();
     stash_[0] = runtime::NDArray();
     stash_[1] = runtime::NDArray();
@@ -1063,16 +1070,9 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                 flush_side = old_side;
                 need_flush = true;
                 // kick 只送一个 IDR 冲不开 open-GOP 的 DPB（IDR 与其
-                // leading pictures 要等 IDR **之后**的包）——见 .h
-                // KICK_BURST 注释。武装突发：离场侧继续吃新 chunk 前
-                // KICK_BURST 个包的克隆。DECORD_HYBRID_KICK_BURST 可覆盖
-                //（0 = 退回单包 kick 旧行为，消融对照用）。
-                static const int burst_n = [] {
-                    const char *e = getenv("DECORD_HYBRID_KICK_BURST");
-                    return e ? atoi(e) : KICK_BURST;
-                }();
-                kick_burst_ = burst_n > 0 ? burst_n : 0;
-                kick_burst_side_ = old_side;
+                // leading pictures 要等 IDR **之后**的包）——克隆清偿的
+                // 武装在下方记账块完成（债务快照须含 kick 包）。护栏与
+                // 消融开关见 .h kick_side_ 注释（0 = 单包 kick 旧行为）。
             }
             cur_side_ = s;
             cur_start_pts_ = pkt->pts;
@@ -1106,18 +1106,33 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
         Side tgt = (is_key ? cur_side_ : cur_route_override_);
         ++side_pending_[tgt];
         if (tgt == SIDE_GPU) ++gpu_pending_;
-        // 突发克隆消费（.h KICK_BURST）：新 chunk 的前几个真包同时克隆喂
-        // 给离场侧，驱动其 DPB 交出 IDR+leading。离场侧重新拿到 key 包
-        // （同侧续跑）时剩余突发作废（下个切换会重新武装）。
-        if (!need_flush && kick_burst_ > 0) {
-            if (is_key) {
-                kick_burst_ = 0;
-            } else if (tgt != kick_burst_side_) {
-                ++side_pending_[kick_burst_side_];
-                if (kick_burst_side_ == SIDE_GPU) ++gpu_pending_;
+        // 跨侧切换的反馈式清偿武装（.h kick_side_ 注释）：kick 包已记账，
+        // 此刻快照离场侧债务（含 kick 包自身——它也要出清才算清偿）。
+        if (need_flush && kick_guard_ > 0) {
+            kick_side_ = flush_side;
+            kick_owed_ = side_pending_[flush_side];
+            kick_cloned_ = 0;
+        }
+        // 反馈式克隆（取代定长突发）：债务未清偿（pending − cloned > 0，
+        // 即切换前路由的帧仍有滞留）就持续把新侧的包克隆喂给离场侧，
+        // 驱动其 DPB 交出滞留帧；发射/陈旧丢弃都减 pending，清偿即解除
+        // 武装（NeedsPackets 同步恢复窗口闸）。下个 key 包作废（正常流
+        // 重排深度 ≪ chunk 长度；一整个 chunk 的克隆仍不清偿 = 码流损坏，
+        // 武装保持放行 demux 至 EOF 冲刷兜底）。护栏 kick_guard_ 防无限克隆。
+        if (!need_flush && kick_side_ != Side(-1)) {
+            if (side_pending_[kick_side_] - kick_cloned_ <= 0) {
+                kick_side_ = Side(-1);
+                kick_owed_ = kick_cloned_ = 0;
+            } else if (is_key) {
+                kick_side_ = Side(-1);
+                kick_owed_ = kick_cloned_ = 0;
+            } else if (tgt != kick_side_ && kick_cloned_ < kick_guard_) {
+                ++side_pending_[kick_side_];
+                if (kick_side_ == SIDE_GPU) ++gpu_pending_;
+                ++kick_cloned_;
+                fb_clones_.fetch_add(1, std::memory_order_relaxed);
                 burst_dup = true;
-                burst_dup_side = static_cast<int>(kick_burst_side_);
-                --kick_burst_;
+                burst_dup_side = static_cast<int>(kick_side_);
             }
         }
     }
@@ -1303,7 +1318,8 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                             "pend=%d/%d\n"
                             "[pop-stall2] cq=%lld cp=%lld qpk=%zu eq=%zu stm=%d "
                             "gpf=%lld gpc=%lld upf=%lld upc=%lld "
-                            "np=%d si=%d pr=%d kick=%lld/%lld infl=%lld cud=%lld/%lld/%lld\n",
+                            "np=%d si=%d pr=%d kick=%lld/%lld fb=%d:%d/%d"
+                            " infl=%lld cud=%lld/%lld/%lld\n",
                             (int)s, crdy, rdy,
                             (int)ch.side, (long long)ch.start_pts,
                             (long long)ch.end_pts, (long long)ch.expected,
@@ -1320,6 +1336,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                             (int)plan_ready_,
                             (long long)kicks_[0].load(),
                             (long long)kicks_[1].load(),
+                            (int)kick_side_, kick_cloned_, kick_owed_,
                             (long long)(side_pending_[0] + side_pending_[1]),
                             cud_p, cud_b, cud_o);
                 }

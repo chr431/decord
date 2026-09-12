@@ -330,17 +330,17 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  让路由决策随发射推进、速率学习先于决策就位。 */
     bool NeedsPackets() const override {
         if (eof_pushed_) return false;
-        // 武装中的 kick 突发必须**无条件放行**（≤KICK_BURST 个包）：慢消费者
-        // 把在途窗口顶满时 demux 暂停，若暂停恰好落在跨侧切换后的突发
-        // 递送途中（首包 kick 已克隆、余下克隆等后续 Push），离场侧 DPB
-        // 永远冲不开 → 队头 chunk 缺尾帧 → 发射停 → 在途永不排水 → demux
-        // 不恢复——环死锁（实测 2026-09-12：hybrid 宿主路径 + ONNX 慢消费，
-        // h264lg chunk0 GPU 侧 em=293/300、cud 重排压 5 帧、kick 只到 1/5、
-        // np=0 infl=7050）。TRT 快消费下 inflight 到不了窗口顶，突发瞬间
-        // 送完——gpu-out 全片/压测均测不出该窗口。突发有界（≤5 个压缩包，
-        // 或下个 key 包即取消），对窗口内存上界的扰动可忽略。Push 与
-        // NeedsPackets 同在消费线程（VideoReader 单线程 demux），无竞态。
-        if (kick_burst_ > 0) return true;
+        // 未清偿的跨侧债务必须**无条件放行**：慢消费者把在途窗口顶满时
+        // demux 暂停，若离场侧仍有滞留帧（见 kick_side_ 注释），唯一解法
+        // 是继续供包驱动克隆清偿；窗口闸在此拦包 = §16.1 第一层死锁
+        //（实测：kick 只到 1/5、np=0、队头 em=293/300 永冻）。清偿后
+        // 恢复窗口闸；护栏击穿（损坏码流）时保持放行直到 EOF 冲刷兜底。
+        // Push 与 NeedsPackets 同在消费线程（VideoReader 单线程 demux），
+        // 无竞态。
+        if (kick_side_ != Side(-1)
+                && side_pending_[kick_side_] - kick_cloned_ > 0) {
+            return true;
+        }
         const int64_t inflight = side_pending_[0] + side_pending_[1];
         if (!sched_initialized_) {
             const int est = static_cast<int>(est_chunk_frames_);
@@ -446,35 +446,32 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool routing_active_ = false;   ///< 已见到首包
     Side cur_side_ = SIDE_CPU;      ///< 当前承接 chunk 的侧
     int64_t cur_start_pts_ = 0;
-    /*! \brief kick 突发克隆余量：跨侧切换只 kick 一个 IDR 包**不足以冲开
-     *  hevc/h264 的 open-GOP DPB**——IDR 连同其 leading pictures 要等
-     *  IDR **之后**的包驱动输出（实测挂死现场 DPB 扣 6 帧 = IDR+5
-     *  leading，side_pending[GPU]=6 吻合）。旧交替计划下一 GPU chunk 的
-     *  真包最迟一个 chunk 就到，DPB 滞留是瞬态；GPU 主导的倾斜计划里
-     *  CPU 采样段连跑 3-4 chunk，离场侧等不来任何后续包 → 瞬态变永久
-     *  冻结 → 队头缺帧、盲窗被对侧库存吃满、路由停摆、决策饥饿——
-     *  环环相扣成死锁。修复 = kick 后把新 chunk 的前 KICK_BURST 个包
-     *  也克隆喂给离场侧（其输出走越界 stash / 陈旧丢弃既有兜底，帧
-     *  记账与 kick 同型）。仅 Push 线程读写，无需加锁。
+    /*! \brief 跨侧切换的**反馈式清偿**（2026-09-12 定稿；取代两代定长
+     *  KICK_BURST=5/16 的"猜重排深度"设计——16 对 bf16 金字塔（实测
+     *  重排深度 17）仍不够，调参只是压概率不是消除）：
      *
-     *  承重性判别（2026-09-12）：`DECORD_HYBRID_KICK_BURST=0` 在**引擎
-     *  GPU 管线全片** hevc 上 4/4 挂死（sustained 默认计划），KICK_BURST=5
-     *  同口径数十次运行零挂死——修复确凿承重。注意纯 VideoReader 慢消费
-     *  者配方（含全片）**复现不了**该死锁（kick=0 也 16/16+4/4 干净），
-     *  差异诊断为 2026-09-11 §8.2 的"复现配方（无需引擎）"记载有误。
-     *
-     *  5 → 16（2026-09-12 续）：**5 对深重排流不够**——hybrid 宿主路径 +
-     *  ONNX 慢消费者（test6_h264，libx264 medium B 金字塔）实测 kick+4
-     *  克隆全部喂入后 NVDEC 仍扣 5 帧（cud=0/5/0）、队头 chunk0 em=293/300
-     *  永冻：解码器输入 5 帧只把重排窗口推进 5 格，display 尾帧仍差额度。
-     *  KICK_BURST=16（SPS max_dec_frame_buffering 规格上界）同配置 3/3
-     *  干净。代价 = 每次跨侧切换离场侧多解 ~11 帧陈旧帧（硬件侧可忽略，
-     *  输出走既有越界丢弃）。注意 NeedsPackets 对武装中的突发无条件放行
-     *  （见其注释）——更大突发更需要防被在途窗口截断（同现场 kick 只到
-     *  1/5 的第二致死环）。 */
-    static constexpr int KICK_BURST = 16;
-    int kick_burst_ = 0;
-    Side kick_burst_side_ = SIDE_CPU;
+     *  切换时刻快照离场侧债务 `kick_owed_ = side_pending_[side]`（含
+     *  kick IDR 克隆包）；此后每个非 key 包，只要债务未清偿
+     *  （`side_pending_[side] − kick_cloned_ > 0`：切换前路由的帧仍有
+     *  滞留——发射与陈旧丢弃都减 pending，克隆自身加 pending 故扣除）
+     *  就克隆一份喂给离场侧，驱动其 DPB 交出滞留帧；**清偿由解码器
+     *  实际产出闭环**，不依赖任何重排深度假设。解除/作废：
+     *  · 清偿（pending−cloned ≤ 0）→ 解除武装，NeedsPackets 恢复窗口闸；
+     *  · 下个 key 包 → 作废（正常流重排深度 ≪ chunk 长度，一个整 chunk
+     *    的克隆仍不清偿 = 码流损坏；武装保持放行 demux 至 EOF，EOF 的
+     *    null 冲刷是确定性全量排空，队头必然解冻）；
+     *  · 护栏 KICK_CLONE_GUARD（64）→ 停止克隆防无限克隆（武装保持，
+     *    走 EOF 兜底同上）。`DECORD_HYBRID_KICK_BURST` 语义随迁：
+     *    0 = 关闭反馈克隆（消融对照 = 单包 kick 旧行为），>0 = 护栏值。
+     *  历史：KICK_BURST=5（4ccf889）治 hevc gpu-out 倾斜计划死锁
+     *  （kick=0 消融 4/4 挂）；=16（02c91e6）治 h264lg 宿主路径 ONNX
+     *  慢消费环死锁（两层：突发被在途窗口截断 + 5 包冲不开 B 金字塔）。
+     *  仅 Push/NeedsPackets（同一消费线程）读写，无需加锁。 */
+    static constexpr int KICK_CLONE_GUARD = 64;
+    int kick_guard_ = KICK_CLONE_GUARD;  ///< 构造期读 env（0=消融关闭，>0=护栏值）
+    int kick_owed_ = 0;          ///< 切换时刻债务快照（诊断用；机制只看 pending−cloned）
+    int kick_cloned_ = 0;        ///< 本次切换已克隆包数（同步加 pending）
+    Side kick_side_ = Side(-1);  ///< 债务侧；Side(-1) = 未武装
     /*! \brief 当前包按 pts 归属解析出的目标侧（仅 Push 线程访问） */
     Side cur_route_override_ = SIDE_CPU;
 
@@ -532,6 +529,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::atomic<int64_t> plan_frames_[2]{};               ///< BuildPlan 各侧规划帧量
     std::atomic<int64_t> plan_folds_{0};                  ///< BuildPlan 时 CPU 已完成折数
     std::atomic<int64_t> kicks_[2]{};                     ///< 各侧收到的 kick 冲刷包数
+    std::atomic<int64_t> fb_clones_{};                    ///< 反馈式清偿累计克隆包数
     std::atomic<int64_t> stats_t0_us_{0};                 ///< Push 首包时刻（steady epoch µs）
     std::atomic<int64_t> plan_age_ms_{0};                 ///< BuildPlan 距首包毫秒数
 };
