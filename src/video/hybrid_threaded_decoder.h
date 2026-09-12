@@ -523,6 +523,15 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::atomic<int64_t> hol_strand_max_[2]{};  ///< episode 期间观测到的对侧存货峰值
     int hol_prev_side_ = -1;  ///< 上次 Pop 结束时是否停在 HOL 阻塞（仅消费者线程读写）
     std::chrono::steady_clock::time_point hol_tp_{};
+    // ── stall 取证（默认开，§18 硬化；仅消费者线程读写）─────────────────
+    // 判别器是时间：无进展（PopSide 失败）≥3s 首报 [pop-stall]，之后 1s
+    // 起指数退避至 60s；任何进展（PopSide 成功）清零报警。计数判别不可用
+    // ——正常供帧间隙毫秒级就能凑满任意连败数（实测 2000 连败健康路径每秒
+    // 多次触发）。旧 STATS 门控版在挂死时打 64 万行 stderr。
+    std::chrono::steady_clock::time_point stall_last_tp_{
+        std::chrono::steady_clock::now()};                    ///< 最近进展时刻（构造起算，防启动误报）
+    std::chrono::steady_clock::time_point stall_print_tp_{};  ///< 最近报警时刻
+    int64_t stall_delay_ms_ = 0;  ///< 0 = 未在报警状态
     std::atomic<int64_t> up_flush_n_{0}, up_flush_f_{0};  ///< UploadStep 批次数 / 批内帧数
     std::atomic<int64_t> up_nobuf_{0}, up_cempty_{0};     ///< 池尽 / CPU 断流提前冲刷
     std::atomic<int64_t> plan_rc_{0}, plan_rg_{0};        ///< BuildPlan 冻结时的两侧速率

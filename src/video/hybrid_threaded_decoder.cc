@@ -1282,17 +1282,32 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         if (!PopSide(s, &f)) {
             static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
 #ifdef DECORD_USE_CUDA
-            // 取证采样在 DEBUG 与 STATS 两种口径都可用：挂死复现是时序
-            // 敏感的，DEBUG 打印本身改变时序（实测 DEBUG 下 8/8 干净、
-            // STATS 下 ~1/4 挂）；STATS 模式每 2000 连败一条，扰动可忽略。
-            static const bool foren =
-                dbg || getenv("DECORD_HYBRID_STATS") != nullptr;
-            if (foren) {
-                // 连续取空诊断：头部 chunk 与两侧队列状态（D 类问题定位用）。
-                // 只嵌 rmtx_ 读队列长度；chunk/pend 字段按本文件既有调试
-                // 打印惯例无锁读取（仅诊断，不保证精确快照）。
-                static thread_local int fail_streak = 0;
-                if (++fail_streak % 2000 == 0) {
+            // 取证采样**默认开**（2026-09-12 §18 硬化：挂死现场自带签名，
+            // 无需先复现再开 STATS）。判别器是**时间**不是计数——正常供帧
+            // 间隙（毫秒级）就能凑满任意连败计数（实测健康路径 2000 连败
+            // 每秒触发多次）；无进展 ≥3s 才首报，之后 1s 起指数退避至 60s
+            // 上限。挂死 ≈ 3s 出首条、首分钟 ~10 条、之后 1 条/分钟；健康
+            // 路径供帧间隙远小于 3s，零误报。steady_clock ~20ns/次且只在
+            // 失败路径（本就走锁），扰动可忽略。
+            {
+                const auto now_ = std::chrono::steady_clock::now();
+                bool due = false;
+                if (stall_delay_ms_ == 0) {
+                    due = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now_ - stall_last_tp_).count() >= 3000;
+                } else {
+                    due = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now_ - stall_print_tp_).count() >= stall_delay_ms_;
+                }
+                if (due) {
+                    stall_print_tp_ = now_;
+                    stall_delay_ms_ = stall_delay_ms_
+                        ? std::min<int64_t>(stall_delay_ms_ * 2, 60000)
+                        : 1000;
+                    // 连续取空诊断：头部 chunk 与两侧队列状态（D 类定位用）。
+                    // 只嵌 rmtx_ 读队列长度；chunk/pend 字段按本文件既有
+                    // 调试打印惯例无锁读取（仅诊断，不保证精确快照）。
+                    {
                     std::size_t crdy, rdy;
                     {
                         std::lock_guard<std::mutex> lk(rmtx_);
@@ -1339,6 +1354,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                             (int)kick_side_, kick_cloned_, kick_owed_,
                             (long long)(side_pending_[0] + side_pending_[1]),
                             cud_p, cud_b, cud_o);
+                    }
                 }
             }
 #endif
@@ -1376,6 +1392,10 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
 #endif
             return false;
         }
+        // PopSide 成功 = 有进展（marker/陈旧丢弃/越界暂存/发射同此之后）：
+        // stall 报警状态在此清零（见上方 stall 取证注释）。
+        stall_last_tp_ = std::chrono::steady_clock::now();
+        stall_delay_ms_ = 0;
         if (IsMarker(f)) {
             // 子解码器排空（EOF 后出现）
             if (s == SIDE_CPU && eof_pushed_) {
