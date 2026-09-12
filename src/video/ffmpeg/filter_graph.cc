@@ -141,8 +141,17 @@ void FFMPEGFilterGraph::Init(std::string filters_descr, AVCodecContext *dec_ctx,
 
 void FFMPEGFilterGraph::Push(AVFrame *frame) {
     // push decoded frame into filter graph
-    CHECK_GE(av_buffersrc_add_frame_flags(buffersrc_ctx_, frame, AV_BUFFERSRC_FLAG_KEEP_REF), 0)
-        << "Error while feeding the filter graph";
+    // 损坏帧防御（2026-09-12 §18 硬化）：截断/坏包产出的畸形帧会让
+    // buffersrc 拒收（实测截断尾帧 -12 ENOMEM）。原 CHECK 直接 abort：
+    // hybrid 口径整个进程 0xC0000409 崩溃；异常转换路径下 worker 中断
+    // 后析构 join 卡死（cpu 口径表现为"挂死"）。拒收 = 丢弃该帧——坏流
+    // 本无正确输出，缺帧由 VideoReader 既有的 EOF 代偿机制兜底
+    //（FetchCachedFrame 缓存帧补位 + REWIND_RETRY_MAX，NextFrameImpl）。
+    int ret = av_buffersrc_add_frame_flags(buffersrc_ctx_, frame,
+                                           AV_BUFFERSRC_FLAG_KEEP_REF);
+    if (ret < 0) {
+        return;  // 丢弃拒收帧（count_ 不增，消费侧按缺帧代偿）
+    }
     ++count_;
 }
 

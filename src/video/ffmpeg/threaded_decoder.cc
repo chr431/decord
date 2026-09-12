@@ -416,7 +416,14 @@ void FFMPEGThreadedDecoder::ProcessFrame(AVFramePtr frame, NDArray out_buf) {
     }
     AVFramePtr out_frame = AVFramePool::Get()->Acquire();
     AVFrame *out_frame_p = out_frame.get();
-    CHECK(graph->Pop(&out_frame_p)) << "Error fetch filtered frame.";
+    if (!graph->Pop(&out_frame_p)) {
+        // 损坏帧防御（2026-09-12 §18）：Push 拒收已丢弃（filter_graph.cc）
+        // 或 buffersink EAGAIN（滤镜图内部缓冲）——本帧无产出直接返回，
+        // 缺帧由消费侧 EOF 代偿兜底（FetchCachedFrame 补位）。不可 CHECK：
+        // 坏流会把 filter worker 打死（hybrid 口径进程 0xC0000409 崩溃），
+        // 异常转换路径下 worker 中断 → 析构 join 卡死（cpu 口径"挂死"）。
+        return;
+    }
 
     auto tmp = AsNDArray(out_frame);
     // ── Backpressure: if the frame queue is full, wait for consumer ──
