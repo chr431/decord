@@ -330,6 +330,17 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  让路由决策随发射推进、速率学习先于决策就位。 */
     bool NeedsPackets() const override {
         if (eof_pushed_) return false;
+        // 武装中的 kick 突发必须**无条件放行**（≤KICK_BURST 个包）：慢消费者
+        // 把在途窗口顶满时 demux 暂停，若暂停恰好落在跨侧切换后的突发
+        // 递送途中（首包 kick 已克隆、余下克隆等后续 Push），离场侧 DPB
+        // 永远冲不开 → 队头 chunk 缺尾帧 → 发射停 → 在途永不排水 → demux
+        // 不恢复——环死锁（实测 2026-09-12：hybrid 宿主路径 + ONNX 慢消费，
+        // h264lg chunk0 GPU 侧 em=293/300、cud 重排压 5 帧、kick 只到 1/5、
+        // np=0 infl=7050）。TRT 快消费下 inflight 到不了窗口顶，突发瞬间
+        // 送完——gpu-out 全片/压测均测不出该窗口。突发有界（≤5 个压缩包，
+        // 或下个 key 包即取消），对窗口内存上界的扰动可忽略。Push 与
+        // NeedsPackets 同在消费线程（VideoReader 单线程 demux），无竞态。
+        if (kick_burst_ > 0) return true;
         const int64_t inflight = side_pending_[0] + side_pending_[1];
         if (!sched_initialized_) {
             const int est = static_cast<int>(est_chunk_frames_);
@@ -450,8 +461,18 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  GPU 管线全片** hevc 上 4/4 挂死（sustained 默认计划），KICK_BURST=5
      *  同口径数十次运行零挂死——修复确凿承重。注意纯 VideoReader 慢消费
      *  者配方（含全片）**复现不了**该死锁（kick=0 也 16/16+4/4 干净），
-     *  差异诊断为 2026-09-11 §8.2 的"复现配方（无需引擎）"记载有误。 */
-    static constexpr int KICK_BURST = 5;
+     *  差异诊断为 2026-09-11 §8.2 的"复现配方（无需引擎）"记载有误。
+     *
+     *  5 → 16（2026-09-12 续）：**5 对深重排流不够**——hybrid 宿主路径 +
+     *  ONNX 慢消费者（test6_h264，libx264 medium B 金字塔）实测 kick+4
+     *  克隆全部喂入后 NVDEC 仍扣 5 帧（cud=0/5/0）、队头 chunk0 em=293/300
+     *  永冻：解码器输入 5 帧只把重排窗口推进 5 格，display 尾帧仍差额度。
+     *  KICK_BURST=16（SPS max_dec_frame_buffering 规格上界）同配置 3/3
+     *  干净。代价 = 每次跨侧切换离场侧多解 ~11 帧陈旧帧（硬件侧可忽略，
+     *  输出走既有越界丢弃）。注意 NeedsPackets 对武装中的突发无条件放行
+     *  （见其注释）——更大突发更需要防被在途窗口截断（同现场 kick 只到
+     *  1/5 的第二致死环）。 */
+    static constexpr int KICK_BURST = 16;
     int kick_burst_ = 0;
     Side kick_burst_side_ = SIDE_CPU;
     /*! \brief 当前包按 pts 归属解析出的目标侧（仅 Push 线程访问） */
