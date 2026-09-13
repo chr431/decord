@@ -188,6 +188,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
 
     struct Chunk {
         Side side;
+        int64_t id;              ///< 绝对 GOP 序号（与 GopRec.id 对齐）
         int64_t start_pts;   ///< chunk 首帧（关键帧）pts
         int64_t end_pts;     ///< 下一关键帧 pts；最后一个 chunk 为 INT64_MAX
         int64_t expected;    ///< 该 chunk 应发射的帧数（kf rank 差；0=未知）
@@ -196,17 +197,14 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
 
     /*! \brief 重置路由/合并状态（Seek/Clear 时调用；保留速率 EWMA 与 kf 索引） */
     void ResetRouting();
-    /*! \brief 为起始 pts == key_pts 的新 chunk 选择承接侧（速率感知贪心） */
-    Side ChooseSide(int64_t key_pts);
     /*! \brief 诊断/实验开关 DECORD_HYBRID_FORCE_SIDE 的生效侧；未设时返回
      *  Side(-1)（哨兵，与本文件既有写法一致）。
      *
-     *  **ChooseSide 与 BuildPlan 必须共用本函数**：预路由计划早先自己按
-     *  贪心份额算侧、不查这个覆盖，于是 force=cpu 下仍会规划出 GPU chunk，
-     *  而这类 chunk 永远不会被喂包 —— Pop 卡死在队头（实测
-     *  `[pop-stall] side=1 crdy=637 rdy=0 head=(side1,…,exp=299,em=293)`：
-     *  637 帧已上载的 CPU 存货被一个不会来的 GPU chunk 堵在后面），
-     *  且 force-close 安全网因 side_pending_[GPU]≠0 而正确地不敢关 chunk。 */
+     *  **PickFeedSide 必须查这个覆盖**：force 模式下若派工仍按贪心份额
+     *  给另一侧分 GOP，而这类 chunk 永远不会被喂包 —— Pop 卡死在队头
+     * （实测 `[pop-stall] side=1 crdy=637 rdy=0 …`：数百帧已上载的 CPU
+     *  存货被一个不会来的 GPU chunk 堵死，且 force-close 安全网因
+     *  side_pending_[GPU]≠0 而正确地不敢关它）。 */
     Side ForcedSide() const;
     /*! rief pts 	o 呈现序帧号（kf 表近似，调度用） */
     int64_t RankOfPts(int64_t pts) const;
@@ -304,68 +302,30 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     void ComputeBudgets();
     double vram_budget_ = 768.0 * 1024 * 1024;  ///< 显存预算（ROI 重建池深复用）
     double ram_budget_ = 1536.0 * 1024 * 1024;  ///< 宿主 RAM 预算（ROI 重建 CPU 库存帽用）
-    /*! \brief demux 领先深度建议（自适应预算计算结果）。
-     *  盲阶段（双侧速率未就绪，sched_initialized_ 未置位）收缩到
-     *  ~2 chunks：demux 全速领先（千余包瞬时入队）会让十几个 chunk
-     *  的路由决策跑在速率学习之前 —— hevc 实测 13 chunks 全部
-     *  rc-unknown 盲采 CPU（90% 帧量），water-filling 上线前流已
-     *  耗尽（混跑 1042 vs 纯 GPU 1836）。收缩后决策随发射实时
-     *  推进，首个 CPU-sample chunk 的段速率（16 帧首折）就位后
-     *  即转入稳态全深。 */
+    /*! \brief demux 领先深度建议。包缓存设计下 demux 领先由**字节预算**
+     *  （cache_budget_）在 NeedsPackets 门控，此建议不再承载调度语义，
+     *  恒返回稳态深度。 */
     int SuggestPrefetchDepth() const override {
-        if (!sched_initialized_) {
-            const int est = static_cast<int>(est_chunk_frames_);
-            const int blind = est > 0 ? 2 * est + 64 : 640;
-            return std::min(prefetch_frames_, blind);
-        }
         return prefetch_frames_;
     }
-    /*! 重试推包门控：side_pending_（两侧在途帧，kick 计入、发射/陈旧
-     *  丢弃逐帧核销）是精确在途 —— VideoReader 的包账目因 hybrid 侧
-     *  丢弃永久虚高不可用（D3 教训），而重试无条件推包会让 demux 以
-     *  消费轮询速度跑到解码前面（hevc 实测 10 决策/50ms 全部盲分
-     *  CPU）。窗口必须 ≥ 两侧满库存之和（CPU queue + GPU ready +
-     *  上载容器 + 池在途）：块交替下两侧库存都会顶到各自上限，窗口
-     *  偏小会把 front chunk 后续的包拦死（发射顺序串行 → 死锁，
-     *  hybrid_gpu hevc 实测 1500 帧处挂死）。盲阶段收缩到 ~2 chunks
-     *  让路由决策随发射推进、速率学习先于决策就位。 */
+    /*! 重试推包门控（包缓存版）：demux 继续读 = 缓存未超预算；另有
+     *  **饥饿逃生门**——缓存超预算但某侧银行未满时仍放行（读到的包
+     *  会立刻被供料泵分给饥饿侧、缓存回落），否则会出现"缓存满且两侧
+     *  等料"与"demux 停读"互锁。超预算量被一次泵送有界（≤ 一个银行）。
+     *  kick 债务无条件放行（见 kick_side_ 注释，§16.1 第一层死锁）。
+     *  Push/NeedsPackets/PumpFeed 同在消费线程（VideoReader 单线程
+     *  demux），路由状态无竞态。 */
     bool NeedsPackets() const override {
-        if (eof_pushed_) return false;
-        // 未清偿的跨侧债务必须**无条件放行**：慢消费者把在途窗口顶满时
-        // demux 暂停，若离场侧仍有滞留帧（见 kick_side_ 注释），唯一解法
-        // 是继续供包驱动克隆清偿；窗口闸在此拦包 = §16.1 第一层死锁
-        //（实测：kick 只到 1/5、np=0、队头 em=293/300 永冻）。清偿后
-        // 恢复窗口闸；护栏击穿（损坏码流）时保持放行直到 EOF 冲刷兜底。
-        // Push 与 NeedsPackets 同在消费线程（VideoReader 单线程 demux），
-        // 无竞态。
+        if (eof_cache_) return false;
         if (kick_side_ != Side(-1)
                 && side_pending_[kick_side_] - kick_cloned_ > 0) {
             return true;
         }
-        const int64_t inflight = side_pending_[0] + side_pending_[1];
-        if (!sched_initialized_) {
-            const int est = static_cast<int>(est_chunk_frames_);
-            // 盲窗曾试过 +up_pool_frames_（为 "sustained 倾斜计划下
-            // cpu_ready_ 存货吃满盲窗" 的 gpu-out 死锁为解）——该病灶已由
-            // kick 突发治本（本文件 KICK_BURST），而加宽本身让 av1 gpu-out
-            // 盲阶段 CPU 采样存货更深、保序等待拉长，真交付 70%→10%
-            //（3x 崩盘，消融矩阵）。回退。
-            const int64_t blind = est > 0 ? 2 * est + 64 : 640;
-            return inflight < std::min<int64_t>(
-                       static_cast<int64_t>(prefetch_frames_)
-                           + queue_frames_ + ready_cap_frames_ + 512,
-                       blind);
-        }
-        // 稳态窗口 = min(旧公式, 视界+3072)：demux 领先必须盖住两侧银行
-        //（CPU 队列 + GPU ready）但**不得超过视界太多** —— 深预售会让
-        // 视界重建全部发生在速率收敛前（demux 几秒内跑完全流路由），
-        // 等于没重建。视界关（=0）时保持旧公式。
-        int64_t window = static_cast<int64_t>(prefetch_frames_)
-                         + queue_frames_ + ready_cap_frames_ + 512;
-        if (plan_horizon_frames_ > 0) {
-            window = std::min(window, plan_horizon_frames_ + 3072);
-        }
-        return inflight < window;
+        if (cache_bytes_ < cache_budget_) return true;
+        const int64_t cpu_cap = static_cast<int64_t>(queue_frames_);
+        const int64_t gpu_cap = static_cast<int64_t>(ready_cap_frames_);
+        return side_pending_[SIDE_CPU] < cpu_cap
+            || side_pending_[SIDE_GPU] < gpu_cap;
     }
 
 #ifdef DECORD_USE_CUDA
@@ -453,8 +413,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
 
     // ── 路由状态（仅 Push 调用线程访问：VideoReader 单线程 demux）──
     bool routing_active_ = false;   ///< 已见到首包
-    Side cur_side_ = SIDE_CPU;      ///< 当前承接 chunk 的侧
-    int64_t cur_start_pts_ = 0;
     /*! \brief 跨侧切换的**反馈式清偿**（2026-09-12 定稿；取代两代定长
      *  KICK_BURST=5/16 的"猜重排深度"设计——16 对 bf16 金字塔（实测
      *  重排深度 17）仍不够，调参只是压概率不是消除）：
@@ -482,7 +440,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int kick_cloned_ = 0;        ///< 本次切换已克隆包数（同步加 pending）
     Side kick_side_ = Side(-1);  ///< 债务侧；Side(-1) = 未武装
     /*! \brief 当前包按 pts 归属解析出的目标侧（仅 Push 线程访问） */
-    Side cur_route_override_ = SIDE_CPU;
 
     // ── 合并状态（Push 与 Pop 并发访问，mutex 保护）──
     mutable std::mutex mtx_;
@@ -495,26 +452,48 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int chunks_assigned_[2] = {0, 0};
     int64_t assigned_frames_[2] = {0, 0};  ///< 各侧累计分账帧数（chunk 关闭
                                            ///< 时按 expected 累计；份额 governor 用）
-    // ── chunk 预路由（2026-09-10）：双侧速率就绪即按能力比配额一次性
-    // 规划全部未来 chunk 的侧；demux 一读到 keyframe 包即查表路由，
-    // 两解码器持续有包（混跑从"交替"变"并发"）。plan_side_ 按 kf 索引
-    // 对齐，-1 = 未规划（回退 pending 策略）。──
-    std::vector<int> plan_side_;
-    bool plan_ready_ = false;
-    void BuildPlan(int64_t key_pts, double cpu_share);
-    /*! \brief 计划滑动视界（帧数；0 = 旧行为=全流一次冻结）。
-     *  BuildPlan 只规划 [k0, plan_end_k_)；demux 路由到 plan_end_k_ 即以
-     *  当时实测速率重建（累计分账保留，全局配比不失衡）。动机（2026-09-13
-     *  缺口分解）：冻结计划的 rg 取自 EWMA 爬升期（实测同码两次运行
-     *  1742~2221 漂 ±13%），hevc 份额因此偏 CPU 0.05+，GPU 臂队尾闲置
-     *  ~2s；变长 chunk 下贪心量化还会单向过冲（h264 目标 0.76 实排
-     *  0.818）。视界重建让两个误差都只影响一个视界。与深银行兼容：
-     *  NeedsPackets 窗口同缩（视界+3072），否则 demux 深预售会让重建
-     *  全部发生在速率收敛前、等于没重建。`DECORD_HYBRID_PLAN_HORIZON`
-     *  可覆盖（帧数，0=关）。 */
-    int64_t plan_horizon_frames_ = 4096;
-    int plan_end_k_ = 0;             ///< 一个越过末已规划 chunk 的索引
-    std::atomic<int64_t> plan_rebuilds_{0};
+    // ── 包缓存 + 供料期派工（2026-09-13 层0/1 重设计，取代预路由计划）──
+    // 旧路径：demux 读包时即按冻结/滑动视界计划路由（路由=不可撤销），
+    // 路由领先深度（NeedsPackets 窗口）被迫与银行深度/计划时效互相妥协。
+    // 新路径：Push 只进包缓存（压缩包，字节预算有界）；供料泵在
+    // **分配时点**（PumpFeed，demux 线程内逐包驱动）按当前速率比给饥饿
+    // 侧分配整个 GOP——分配永远发生在两侧速率成熟之后，窗口妥协消失。
+    // 交付端（emit_queue_/expected/kick/陈旧丢弃）零改动。
+    struct GopRec {
+        int64_t id;              ///< 绝对 GOP 序号（与 emit_queue_ Chunk.id 对齐）
+        int64_t start_pts;       ///< GOP 首帧（关键帧）pts（迟到包归属用）
+        int64_t pkt_begin;       ///< cache 序列区间 [begin, end)
+        int64_t pkt_end;         ///< 关闭时 = cache_seq_（主区间终点）
+        int64_t fed_upto = 0;    ///< 主区间已供到的绝对序列
+        int64_t straggler_idx = 0;  ///< stragglers 已供下标
+        Side side = static_cast<Side>(-1);  ///< 分配侧（-1 = 未分配）
+        bool closed = false;     ///< 下一关键帧已到 / EOF
+        bool counted = false;    ///< expected 已累计进 assigned_frames_
+        std::vector<ffmpeg::AVPacketPtr> stragglers;  ///< 关闭后迟到的非 key 包
+    };
+    std::deque<ffmpeg::AVPacketPtr> pkt_cache_;  ///< 压缩包缓存（demux 写/泵消费）
+    int64_t cache_seq_ = 0;        ///< 下一包的绝对序列号
+    int64_t cache_base_seq_ = 0;   ///< pkt_cache_.front() 的绝对序列号
+    size_t cache_bytes_ = 0;       ///< 在缓压缩字节（预算 NeedsPackets 用）
+    size_t cache_peak_bytes_ = 0;  ///< 峰值（stats）
+    size_t cache_budget_ = 512u << 20;  ///< 默认 512MB（构造期读 env）
+    int64_t gop_seq_ = 0;          ///< 下一 GOP 的绝对 id
+    int64_t cur_gop_pkt_begin_ = 0;   ///< 当前打开 GOP 的 cache 起始序列
+    std::vector<GopRec> gops_;     ///< 全部 GOP 的缓存记账（Clear 才清）
+    int64_t feed_gop_idx_ = 0;     ///< 下一个未供 GOP 的 gops_ 下标
+    Side last_fed_side_ = Side(-1); ///< 供料侧（kick 判定用；Side(-1)=尚无）
+    bool eof_cache_ = false;       ///< demux EOF 已入缓
+    bool arm_flush_sent_ = false;  ///< EOF 后排空标记已发（幂等）
+    void PumpFeed();               ///< 供料泵（仅 Push 调用线程=demux 执行）
+    /*! \brief 供料侧选择：供水式贪心（累计分账水位）+ 尾部最少积压。
+     *  f = rc/(rc+rg)（当前 EWMA，FORCE_SHARE 可覆盖）；rc 未学得时
+     *  用启动启发（gop0 GPU / gop1 CPU 采样）。非 IDR 编码恒 GPU。 */
+    Side PickFeedSide();
+    /*! 打开/关闭当前 GOP（仅 Push 线程持 mtx_ 时调用；Close 从
+     *  emit_queue_.back().end_pts 取终点，expected 写回 chunk）。 */
+    void OpenGopLocked(int64_t pts);
+    void CloseGopLocked();
+    bool eof_flush_out_ = false;  ///< EOF 臂排空标记已实际发出（锁外发送）
     int64_t emitted_total_ = 0;          ///< 全局已发射帧数（消费位置）
     int64_t side_pending_[2] = {0, 0};   ///< 各侧已路由未发射帧数（真积压，
                                          ///< 含在途解码与存货，包粒度精确）
@@ -556,13 +535,9 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int64_t stall_delay_ms_ = 0;  ///< 0 = 未在报警状态
     std::atomic<int64_t> up_flush_n_{0}, up_flush_f_{0};  ///< UploadStep 批次数 / 批内帧数
     std::atomic<int64_t> up_nobuf_{0}, up_cempty_{0};     ///< 池尽 / CPU 断流提前冲刷
-    std::atomic<int64_t> plan_rc_{0}, plan_rg_{0};        ///< BuildPlan 冻结时的两侧速率
-    std::atomic<int64_t> plan_frames_[2]{};               ///< BuildPlan 各侧规划帧量
-    std::atomic<int64_t> plan_folds_{0};                  ///< BuildPlan 时 CPU 已完成折数
     std::atomic<int64_t> kicks_[2]{};                     ///< 各侧收到的 kick 冲刷包数
     std::atomic<int64_t> fb_clones_{};                    ///< 反馈式清偿累计克隆包数
     std::atomic<int64_t> stats_t0_us_{0};                 ///< Push 首包时刻（steady epoch µs）
-    std::atomic<int64_t> plan_age_ms_{0};                 ///< BuildPlan 距首包毫秒数
 };
 
 }  // namespace decord

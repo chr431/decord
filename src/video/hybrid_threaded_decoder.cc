@@ -79,15 +79,19 @@ HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
                                              const AVInputFormat *iformat,
                                              bool output_cuda)
     : cpu_(), device_id_(device_id), out_cuda_(output_cuda) {
-    // DECORD_HYBRID_KICK_BURST 语义（2026-09-12 反馈式清偿起）：
-    // 0 = 关闭反馈克隆（消融对照 = 单包 kick 旧行为）；>0 = 克隆护栏值。
+    // 包缓存字节预算（供料期派工的 demux 领先界；最小 64MB）。
+    // kick_guard_ 默认 0 = 只发单个 IDR kick、不做债务克隆——旧反馈式
+    // 清偿在本架构下会洪泛（分配领先交付 ⇒ 换侧债务快照=巨额 pending，
+    // 每次换侧克隆数十包到离场侧，离场侧解出整段错侧 GOP → 无限陈旧帧
+    // 活锁，实测 hevc 12000 帧挂死）。离场侧 DPB 尾帧由其下一次自身
+    // GOP 的 IDR 自然冲刷；>0 可恢复克隆护栏（酷刑流复测用）。
+    kick_guard_ = 0;
     if (const char *e = getenv("DECORD_HYBRID_KICK_BURST")) {
         kick_guard_ = atoi(e);
     }
-    // 计划滑动视界（0 = 关：全流一次冻结的旧行为）
-    if (const char *e = getenv("DECORD_HYBRID_PLAN_HORIZON")) {
-        plan_horizon_frames_ = atoll(e);
-        if (plan_horizon_frames_ < 0) plan_horizon_frames_ = 0;
+    if (const char *e = getenv("DECORD_HYBRID_PKT_CACHE_MB")) {
+        const long long v = atoll(e);
+        if (v > 0) cache_budget_ = static_cast<size_t>(v) << 20;
     }
 #ifdef DECORD_USE_CUDA
     // GPU 子解码器初始化 bsf (mp4→annexb) 时会就地改写传入的 codecpar。
@@ -682,14 +686,13 @@ void HybridThreadedDecoder::Stop() {
                 (long long)kicks_[0].load(), (long long)kicks_[1].load(),
                 (long long)fb_clones_.load());
         fprintf(stderr,
-                "[hybrid-stats] plan rc=%lld rg=%lld frames c=%lld g=%lld"
-                " folds=%ld age=%lldms horizon=%lld rebuilds=%lld rg_now=%.0f\n",
-                (long long)plan_rc_.load(), (long long)plan_rg_.load(),
-                (long long)plan_frames_[0].load(), (long long)plan_frames_[1].load(),
-                (long)plan_folds_.load(), (long long)plan_age_ms_.load(),
-                (long long)plan_horizon_frames_,
-                (long long)plan_rebuilds_.load(),
-                gpu_rate_landed_.load(std::memory_order_relaxed));
+                "[hybrid-stats] disp gops c=%d g=%d cache_peak=%zuMB rc_now=%.0f"
+                " rg_now=%.0f assigned c=%lld g=%lld\n",
+                chunks_assigned_[0], chunks_assigned_[1],
+                cache_peak_bytes_ >> 20,
+                cpu_.ProductionRate(),
+                gpu_rate_landed_.load(std::memory_order_relaxed),
+                (long long)assigned_frames_[0], (long long)assigned_frames_[1]);
         fprintf(stderr,
                 "[hybrid-stats] hol cpu-head us=%lld ev=%lld strandmax=%lld"
                 " | gpu-head us=%lld ev=%lld strandmax=%lld\n",
@@ -741,8 +744,6 @@ void HybridThreadedDecoder::Clear() {
 void HybridThreadedDecoder::ResetRouting() {
     std::lock_guard<std::mutex> lk(mtx_);
     routing_active_ = false;
-    cur_side_ = SIDE_CPU;
-    cur_start_pts_ = 0;
     kick_side_ = Side(-1);
     kick_owed_ = kick_cloned_ = 0;
     emit_queue_.clear();
@@ -752,9 +753,17 @@ void HybridThreadedDecoder::ResetRouting() {
     eof_pushed_ = false;
     chunks_assigned_[0] = chunks_assigned_[1] = 0;
     assigned_frames_[0] = assigned_frames_[1] = 0;
-    plan_ready_ = false;
-    plan_side_.clear();
-    plan_end_k_ = 0;
+    pkt_cache_.clear();
+    cache_seq_ = 0;
+    cache_base_seq_ = 0;
+    cache_bytes_ = 0;
+    gops_.clear();
+    feed_gop_idx_ = 0;
+    gop_seq_ = 0;
+    last_fed_side_ = Side(-1);
+    eof_cache_ = false;
+    arm_flush_sent_ = false;
+    eof_flush_out_ = false;
     emitted_total_ = 0;
     sched_initialized_ = false;
     side_pending_[0] = side_pending_[1] = 0;
@@ -774,79 +783,6 @@ void HybridThreadedDecoder::ResetRouting() {
     // kf 索引保留：Seek 后复用帧数表
 }
 
-void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
-    // 规划 [k0, plan_end_k_)：贪心配额 —— 每个候选 chunk 分给
-    // 「累计分账帧数加权后落后」的一侧（cpu_assigned*rg <= gpu_assigned*rc
-    // ⇔ CPU 份额低于 rc/(rc+rg)）。chunk 帧数直接取 kf rank 差（精确）。
-    // 视界（plan_horizon_frames_ > 0，默认 4096）：只规划约一个视界的
-    // chunk，demux 走到 plan_end_k_ 时 ChooseSide 以**当时**的实测速率
-    // 重建（本函数即重建入口）——冻结远端速率比的代价（EWMA 爬升期噪声
-    // ±13%、变长 chunk 贪心过冲）被限制在一个视界内。累计分账
-    //（assigned_frames_）跨重建保留，全局配比不失衡。
-    if (kf_pts_.empty()) return;
-    auto it = std::lower_bound(kf_pts_.begin(), kf_pts_.end(), key_pts);
-    if (it == kf_pts_.end() || *it != key_pts) return;
-    int k0 = static_cast<int>(it - kf_pts_.begin());
-    plan_side_.assign(kf_pts_.size(), -1);
-    plan_frames_[0].store(0, std::memory_order_relaxed);
-    plan_frames_[1].store(0, std::memory_order_relaxed);
-    const double rc = std::max(cpu_.ProductionRate(), 1.0);
-    const double rg = std::max(gpu_rate_landed_.load(std::memory_order_relaxed), 1.0);
-    int64_t ac = assigned_frames_[SIDE_CPU];
-    int64_t ag = assigned_frames_[SIDE_GPU];
-    // 诊断/实验覆盖必须在这里也生效：规划器早先只按贪心份额分侧，force
-    // 模式下会规划出运行时永不喂包的另一侧 chunk（详见 .h ForcedSide 注释）。
-    const Side forced = ForcedSide();
-    int k_end = static_cast<int>(kf_pts_.size());
-    if (plan_horizon_frames_ > 0 && est_chunk_frames_ > 0) {
-        const int64_t hor = std::max<int64_t>(
-            plan_horizon_frames_ / est_chunk_frames_, 1);
-        k_end = std::min<int>(k_end, k0 + static_cast<int>(hor));
-    }
-    for (int k = k0; k < k_end; ++k) {
-        int64_t n = kf_rank_[k + 1] - kf_rank_[k];
-        if (k + 1 >= static_cast<int>(kf_pts_.size())) {
-            n = k > k0 ? (kf_rank_[k] - kf_rank_[k - 1])
-                       : (est_chunk_frames_ > 0 ? est_chunk_frames_ : 200);
-        }
-        // 份额水位（2026-09-13 修）：改用调用方给的 cpu_share 作水位，使
-        // DECORD_HYBRID_FORCE_SHARE 真正生效（此前 cpu_share 只被打印，分配
-        // 恒按 rc/rg ⇒ 份额扫描扫到的是噪声）。f = rc/(rc+rg) 时与旧式
-        // `ac*rg <= ag*rc` 代数等价，故默认分配不变：
-        //   ac/(ac+ag) <= f  ⟺  ac*(1-f) <= ag*f
-        const double _f = std::min(std::max(cpu_share, 0.0), 1.0);
-        Side s = (static_cast<double>(ac) * (1.0 - _f)
-                  <= static_cast<double>(ag) * _f) ? SIDE_CPU : SIDE_GPU;
-        if (forced != Side(-1)) s = forced;
-        plan_side_[k] = static_cast<int>(s);
-        (s == SIDE_CPU ? ac : ag) += n;
-        plan_frames_[s].fetch_add(n, std::memory_order_relaxed);
-    }
-    plan_end_k_ = k_end;
-    plan_rc_.store(static_cast<int64_t>(rc), std::memory_order_relaxed);
-    plan_rg_.store(static_cast<int64_t>(rg), std::memory_order_relaxed);
-    plan_folds_.store(cpu_.ProductionFolds(), std::memory_order_relaxed);
-    plan_age_ms_.store(
-        (std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count()
-         - stats_t0_us_.load(std::memory_order_relaxed)) / 1000,
-        std::memory_order_relaxed);
-    if (plan_ready_) plan_rebuilds_.fetch_add(1, std::memory_order_relaxed);
-    plan_ready_ = true;
-    if (getenv("DECORD_HYBRID_DEBUG")) {
-        int nc = 0, nf[2] = {0, 0};
-        for (int k = k0; k < k_end; ++k) {
-            if (plan_side_[k] >= 0) {
-                ++nc;
-                ++nf[plan_side_[k]];
-            }
-        }
-        fprintf(stderr, "[hybrid-plan] k0=%d..%d chunks=%d frames cpu=%d gpu=%d "
-                "(share=%.2f rebuilds=%lld)\n", k0, k_end, nc, nf[0], nf[1],
-                cpu_share, (long long)plan_rebuilds_.load(std::memory_order_relaxed));
-    }
-}
-
 HybridThreadedDecoder::Side HybridThreadedDecoder::ForcedSide() const {
     // DECORD_HYBRID_FORCE_SIDE=cpu|gpu：诊断/实验用的单侧强制路由。
     // 非 IDR-like 编码（AV1 等）下 force=cpu 退化为 GPU：chunk 边界不落在
@@ -861,205 +797,276 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ForcedSide() const {
     return Side(-1);
 }
 
-HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
-    {   // 诊断/实验覆盖：与 BuildPlan 共用 ForcedSide（见 .h 注释——两处
-        // 口径不一致会把 force 模式直接锁死）。
+HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
+    // 供水式贪心（分配时点，速率=当下 sustained/EWMA 读数）：
+    //   ac/(ac+ag) <= f ⟺ ac*(1-f) <= ag*f   （f = rc/(rc+rg)，env 可覆盖）
+    // 启动启发：gop0 GPU（NVDEC 平价起步）；gop1 CPU 采样（IDR 码）——
+    // rc 只有喂过 CPU 块才学得到；采样块与 gop0 的 GPU 解码重叠。
+    // 速率未熟（采样块在解）：交替保守起点。
+    // 尾部（EOF 且未供 GOP ≤4）：最少积压侧，两侧一同收尾。
+    {
         const Side f = ForcedSide();
         if (f != Side(-1)) return f;
     }
-    // 设计决策（用户拍板，2026-09-07）：所有 codec 统一按实测速率比例
-    // 分配（water-filling），**不做慢侧自动回退** —— hybrid 是实验性
-    // 接口，用户已被告知可能更慢；内部尊重用户选择（decord.hybrid 显式
-    // 选它 = 明确要求 CPU+GPU 混跑），即使 hevc/av1 混跑实测劣于全 GPU
-    // （rc 是隔离产率，混跑时软解与消费/喂包线程抢核致有效供给缩水 +
-    // 块交替发射固有损耗；自动回退会让"选了 hybrid"静默变成"跑 gpu"，
-    // 实验语义失真）。后续优化方向是压低混跑损耗而非代用户跳过。
-    // （历史：AV1 曾因 dav1d CPU 块尾滞留 + kGpuAheadBytes 门锁死而走
-    // 零 CPU 块回避；两者均已移除/修复，AV1 恢复标准混跑路径。）
-    // （GPU 待发射字节硬预算已移除）总在途由 demux prefetch 窗口 +
-    // ready_ 预算 + 池深三重硬上限兜底。旧的 kGpuAheadBytes 预算把
-    // "CPU 块实时发射期 GPU 存货正常偏斜"误判为调度失衡并强制切给
-    // 慢侧 CPU —— GPU 越快越早触发，恶性循环锁死在 CPU 实时速率
-    // （av1 全量实测 654fps vs 全 GPU 1520）。
-    // 积压排空贪心 → 已被 water-filling 份额计数器取代（见下）。
-    // CPU 速率取生产侧实测（filter 线程产出，NV12 直出后的有效供给
-    // 口径）：与 GPU 落地速率同口径可比。读数 = 滑窗持续产能（唯一口径，
-    // 2026-09-12 起替代容量跟踪 EWMA；机制与两路统一采用的依据见
-    // threaded_decoder.h）。
-    double rate[2] = {cpu_.ProductionRate(),
-                      gpu_rate_landed_.load(std::memory_order_relaxed)};
-    // rc 未学得：给一个 CPU chunk 采样（所有 codec —— water-filling 需要
-    // rc）。该 chunk 与 chunk0 的 GPU 发射重叠，且 GPU-first 下盲决策全落
-    // GPU，采样安全（旧版曾因水位门控屏蔽速率学习把整条流钉死 CPU）。
-    if (rate[SIDE_CPU] <= 0) {
-        // 2026-09-13 修正：只采样**一个** CPU chunk，其后立即回 GPU 直供，
-        // 直到 rc 学到为止。原先无条件 return SIDE_CPU 会让盲阶段连续两块
-        // 压在慢腿上（实测 hevc：chunk1/chunk2 均判 CPU，plan 直到 k0=3 才
-        // 建立），交付严格保序 => 队头被慢腿串行占住，短片启动摊销约 0.5s。
-        const Side blind_pick =
-            chunks_assigned_[SIDE_CPU] == 0 ? SIDE_CPU : SIDE_GPU;
-        if (getenv("DECORD_HYBRID_DEBUG")) {
-            fprintf(stderr, "[hybrid-sched] t=%.3f key=%lld rc-unknown -> %d%s\n",
-                    std::chrono::duration<double>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count(),
-                    (long long)key_pts, (int)blind_pick,
-                    blind_pick == SIDE_CPU ? " (CPU-sample)" : "");
-        }
-        return blind_pick;
+    // AV1（非 IDR 语义）：允许 CPU 混跑（keyframe 仍是随机访问点），但
+    // kick 不武装（IsIdrLikeCodec 门控在 kick 处）——show_existing 的输出
+    // pts 回落靠陈旧丢弃 + force-close 安全网兜底（旧设计同款取舍）。
+    if (eof_cache_ && gop_seq_ - feed_gop_idx_ <= 4) {
+        return side_pending_[SIDE_CPU] <= side_pending_[SIDE_GPU]
+                   ? SIDE_CPU : SIDE_GPU;
     }
-    if (rate[SIDE_GPU] <= 0) {
-        // rg 未学得（决策跑在解码前面，NVDEC 落地慢一拍）：交替试探，
-        // 让两侧份额从对称起点再平衡（盲阶段单边灌满 alloc 会让
-        // water-filling 失去再平衡能力）。
-        Side pick = chunks_assigned_[SIDE_CPU] <= chunks_assigned_[SIDE_GPU]
-                        ? SIDE_CPU : SIDE_GPU;
-        if (getenv("DECORD_HYBRID_DEBUG")) {
-            fprintf(stderr, "[hybrid-sched] key=%lld rg-unknown rc=%.0f -> %d\n",
-                    (long long)key_pts, rate[SIDE_CPU], (int)pick);
-        }
-        return pick;
+    if (chunks_assigned_[SIDE_CPU] == 0) {
+        return chunks_assigned_[SIDE_GPU] >= 1 ? SIDE_CPU : SIDE_GPU;
+    }
+    const double rc = cpu_.ProductionRate();
+    const double rg = gpu_rate_landed_.load(std::memory_order_relaxed);
+    if (rc <= 0.0 || rg <= 0.0) {
+        return chunks_assigned_[SIDE_CPU] <= chunks_assigned_[SIDE_GPU]
+                   ? SIDE_CPU : SIDE_GPU;
     }
     if (!sched_initialized_) {
-        // 首次双侧速率就绪：解除盲阶段（NeedsPackets 的窄窗口门控随之
-        // 放开），并按产率比分账两侧库存帽（仅 CPU-out；引擎口径的
-        // ready 由显存池决定不可动）。相位帧量 ∝ 产率：GPU 主导码流
-        // （hevc: rg≈2×rc）的 GPU 相位更长、ready 需要更深，45/45 均分
-        // 会把 ready 压浅（实测 hevc CPU-out ready 1141 时 1645 中位，
-        // ready 1745 时 1756）。分账只重排 RAM 帽，窗口/硬顶公式随动。
+        // 首次双侧速率就绪：cpu-out 的库存帽按产率比分账（旧 inv-split
+        // 语义不变；gpu-out 的 ready 由显存池决定不可动）
         sched_initialized_ = true;
         if (!out_cuda_) {
             const int64_t total_inv =
                 static_cast<int64_t>(queue_frames_) + ready_cap_frames_;
-            const double rr = rate[SIDE_CPU]
-                / std::max(rate[SIDE_CPU] + rate[SIDE_GPU], 1.0);
-            int64_t q = static_cast<int64_t>(total_inv * rr);
-            q = std::max<int64_t>(q, 96);
+            const double rr = rc / std::max(rc + rg, 1.0);
+            int64_t q = std::max<int64_t>(
+                static_cast<int64_t>(total_inv * rr), 96);
             int64_t rd = std::max<int64_t>(total_inv - q, 96);
             queue_frames_ = static_cast<int>(q);
             ready_cap_frames_ = static_cast<int>(rd);
             cpu_.SetQueueDepth(queue_frames_);
-            // pinned 池上限随新 ready 同步抬高：池帽 < ReadyCap 会出现
-            // "池尽但 ready 未满" 的窗口 —— lander 停止 pop 而 FeedStep
-            // 仍在喂包，NVDEC 事件环溢出 FATAL（lockstep 实测）。
             if (pinned_pool_ && !out_cuda_) {
                 pinned_pool_->Reset(
                     static_cast<std::size_t>(rd) + kD2HRingSlots + 16,
                     pinned_pool_->frame_bytes(), gpu_frame_shape_);
             }
-            if (getenv("DECORD_HYBRID_DEBUG")) {
-                fprintf(stderr, "\n[hybrid-sched] inv-split rc=%.0f rg=%.0f -> queue=%d ready=%d\n",
-                        rate[SIDE_CPU], rate[SIDE_GPU], queue_frames_,
-                        ready_cap_frames_);
-            }
         }
     }
-    // ── 最少剩余工作量调度（least-remaining-work）──
-    // 每次决策把新 chunk 分给"剩余解码时间"更小的一侧：剩余 = 该侧
-    // 在途帧数（已路由未发射，side_pending_/gpu_pending_）/ 实测产率。
-    // 稳态下两侧剩余时间相等 → 在途比 = 产率比 → 份额自发收敛到
-    // rc/(rc+rg)：直接以真实积压做反馈，无份额计数器、无 EWMA 走步、
-    // 无收敛期（三代前作的教训：alloc 走步每 chunk 只漂 ±est，hevc
-    // 3000 帧份额停在 52/48；速率比块长被 rc 抖动污染反复误配；库存
-    // 水位 q 在"产出≈发射"时恒悬在阈值上方永不切换，hevc 实测 CPU
-    // 在途 3729 帧无界膨胀、GPU 完全饿死）。
-    // 迟滞：对侧剩余 < 本侧 70% 才切（边界抖动 + dav1d 断流冷启动）。
-    // CPU 管线空（无任何在途）时无条件给 CPU —— 前块保供 + dav1d 块
-    // 尾滞留帧需要下一个 CPU chunk 的包冲出。
-    // 双侧速率就绪 → 一次性规划全部未来 chunk 的侧。FORCE_SHARE
-    // env 优先（份额实验旋钮），否则能力比 rc/(rc+rg)。
-    // 不加折数门控（消融定论）：EWMA 的病在口径（排空孤峰棘轮，8 折内
-    // 照样卡 2000+，门控救不了 hevc：门控下仍 rc=2363 → 混跑 1655）；
-    // sustained 首窗（4 折）即给出 hevc 798 / h264 2452 / av1 ~1010 的
-    // 好读数，无须等 8 折。门控+盲窗加宽反而在 av1 gpu-out 把真交付
-    // 70%→10%（盲阶段 CPU 采样存货加深、保序等待拉长）——一并回退。
-    // 倾斜计划（两路皆然）的队头尾帧死锁由 kick 突发治本（.h
-    // KICK_BURST）：24/24 慢消费者压测 + 引擎金标 28/28 + 全片 e2e
-    // hevc −24%（配对 3 遍，sustained 转默认的依据，见 threaded_decoder.h）。
-    if (sched_initialized_ && !plan_ready_) {
-        // f = CPU 份额水位：默认按速率比（与旧水位等价），env 可覆盖
-        double f = rate[SIDE_CPU] / std::max(rate[SIDE_CPU] + rate[SIDE_GPU], 1.0);
-        static const double fs_env = [] {
-            const char *e = getenv("DECORD_HYBRID_FORCE_SHARE");
-            if (!e) return -1.0;
-            double v = atof(e);
-            return (v > 0.0 && v < 1.0) ? v : -1.0;
-        }();
-        if (fs_env > 0) f = fs_env;
-        BuildPlan(key_pts, f);
-    }
-    // 预路由查表：规划覆盖的 chunk 直接返回（绕过 pending/迟滞策略）。
-    // 视界滑动：demux 走到 plan_end_k_（越过末已规划 chunk）时以当前
-    // 实测速率重建 —— 取代旧的 MaybeReplan（速率漂移触发、opt-in）：
-    // 漂移触发被 h264 证伪（混跑实测速率含自我争用，rc 下沉会把份额
-    // 错推向 GPU，+1.11% 真回归）；视界重建不判漂移方向，只按节奏
-    // 用成熟速率重排未路由尾部，两个方向的失真都收敛。
-    if (plan_ready_) {
-        auto pit = std::lower_bound(kf_pts_.begin(), kf_pts_.end(), key_pts);
-        if (pit != kf_pts_.end() && *pit == key_pts) {
-            int k = static_cast<int>(pit - kf_pts_.begin());
-            if (k < static_cast<int>(plan_side_.size())
-                    && plan_side_[k] < 0 && k >= plan_end_k_) {
-                // f = CPU 份额水位：默认按当前速率比，env 可覆盖（同首建）
-                double f = rate[SIDE_CPU]
-                    / std::max(rate[SIDE_CPU] + rate[SIDE_GPU], 1.0);
-                static const double fs_env = [] {
-                    const char *e = getenv("DECORD_HYBRID_FORCE_SHARE");
-                    if (!e) return -1.0;
-                    double v = atof(e);
-                    return (v > 0.0 && v < 1.0) ? v : -1.0;
-                }();
-                if (fs_env > 0) f = fs_env;
-                BuildPlan(key_pts, f);
-            }
-            if (k < static_cast<int>(plan_side_.size()) && plan_side_[k] >= 0) {
-                Side s = static_cast<Side>(plan_side_[k]);
-                if (getenv("DECORD_HYBRID_DEBUG")) {
-                    fprintf(stderr, "[hybrid-sched] plan key=%lld k=%d -> %d\n",
-                            (long long)key_pts, k, (int)s);
+    static const double fs_env = [] {
+        const char *e = getenv("DECORD_HYBRID_FORCE_SHARE");
+        if (!e) return -1.0;
+        double v = atof(e);
+        return (v > 0.0 && v < 1.0) ? v : -1.0;
+    }();
+    double f = fs_env > 0 ? fs_env : rc / std::max(rc + rg, 1.0);
+    f = std::min(std::max(f, 0.0), 1.0);
+    return (static_cast<double>(assigned_frames_[SIDE_CPU]) * (1.0 - f)
+            <= static_cast<double>(assigned_frames_[SIDE_GPU]) * f)
+               ? SIDE_CPU : SIDE_GPU;
+}
+
+void HybridThreadedDecoder::PumpFeed() {
+    // 供料泵（层0/1 重设计核心）：Push 只入缓存，这里在**分配时点**把
+    // 包喂给臂。仅 Push 调用线程（VideoReader 单线程 demux）执行，
+    // 沿用"路由状态单线程"不变量；每包一次 mtx_。
+    //
+    // 严格游标序供料：只供 cursor 指向的 GOP，供完才前进。曾试两档
+    // 乱序（全乱序/同侧保序+跨侧前瞻）：跨侧乱序会让换侧 kick 帧失去
+    // 流序相邻性（离场侧缺参考 → ffmpeg RPS 丢帧 → pending 泄漏挂死，
+    // 实测 hevc 15k 帧 "Could not find ref with POC"）；严格序下供料序
+    // =流序=分配序，换侧恒相邻，kick 语义与旧设计逐字一致。代价：
+    // cursor 侧银行满时整泵暂停（对侧靠深库存撑住，利用率损失有界）。
+    //
+    // EOF（eof_cache_）：无视饥饿门排空全部剩余包——否则 demux 停读后
+    // 无人再驱动泵，尾死锁。
+    for (int guard = 0; guard < 1000000; ++guard) {
+        Side s = Side(-1);
+        ffmpeg::AVPacketPtr pkt;
+        bool is_key = false;
+        bool arm_kick = false;
+        Side kick_dst = SIDE_CPU;
+        bool clone_debt = false;
+        Side debt_dst = SIDE_CPU;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            // 1. 跳过已供完的 GOP。⚠️ 开放 GOP（未关闭）即使瞬时供完也
+            // 不能越过——后续还有包到达，越过=该 GOP 剩余包永远无人供。
+            while (feed_gop_idx_ < static_cast<int64_t>(gops_.size())) {
+                const GopRec &g = gops_[feed_gop_idx_];
+                if (!g.closed) break;
+                if (g.fed_upto < g.pkt_end) break;
+                if (g.straggler_idx
+                        < static_cast<int64_t>(g.stragglers.size())) {
+                    break;
                 }
-                return s;
+                ++feed_gop_idx_;
+            }
+            // 2. 严格游标序：只处理 cursor GOP
+            int64_t gi = -1;
+            if (feed_gop_idx_ < static_cast<int64_t>(gops_.size())) {
+                GopRec &g = gops_[feed_gop_idx_];
+                const int64_t avail_end = g.closed ? g.pkt_end : cache_seq_;
+                const bool has_pkt = g.fed_upto < avail_end
+                    || (g.closed && g.straggler_idx
+                                    < static_cast<int64_t>(g.stragglers.size()));
+                if (has_pkt) {
+                    if (g.side == Side(-1)) {
+                        g.side = PickFeedSide();
+                        for (Chunk &c : emit_queue_) {
+                            if (c.id == g.id) {
+                                c.side = g.side;
+                                if (c.expected > 0 && !g.counted) {
+                                    assigned_frames_[g.side] += c.expected;
+                                    g.counted = true;
+                                }
+                                break;
+                            }
+                        }
+                        ++chunks_assigned_[g.side];
+                        // 跨侧判定在**分配时**做（严格序下分配序=供料序；
+                        // last_fed_side_ 恒更新——只在 kick 分支更新会让它
+                        // 永停 -1，零 kick）
+                        if (g.side != last_fed_side_ && last_fed_side_ != Side(-1)
+                                && IsIdrLikeCodec()) {
+                            arm_kick = true;
+                            kick_dst = last_fed_side_;
+                        }
+                        last_fed_side_ = g.side;
+                    }
+                    bool hungry = true;
+                    if (!eof_cache_) {
+                        const int64_t cap = (g.side == SIDE_CPU)
+                            ? static_cast<int64_t>(queue_frames_)
+                            : static_cast<int64_t>(ready_cap_frames_);
+                        hungry = side_pending_[g.side] < cap;
+                    }
+                    if (hungry) gi = feed_gop_idx_;
+                }
+            }
+            if (gi < 0) {
+                // 3. 无可供工作：EOF 且全部供完 → 置排空标记（锁外发送）
+                if (eof_cache_ && !arm_flush_sent_
+                        && feed_gop_idx_ >= static_cast<int64_t>(gops_.size())) {
+                    arm_flush_sent_ = true;
+                    eof_pushed_ = true;   // Pop 的 EOF 语义在此就位
+                }
+                break;
+            }
+            GopRec &g = gops_[gi];
+            s = g.side;
+            // 取一个包（主区间优先，随后迟到包）
+            const int64_t avail_end = g.closed ? g.pkt_end : cache_seq_;
+            if (g.fed_upto < avail_end) {
+                const int64_t seq = g.fed_upto;
+                pkt = std::move(pkt_cache_[seq - cache_base_seq_]);
+                cache_bytes_ -= static_cast<size_t>(pkt->size);
+                is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+                ++g.fed_upto;
+            } else {
+                pkt = std::move(g.stragglers[g.straggler_idx++]);
+                is_key = false;
+            }
+            if (arm_kick) {
+                // kick 包记账先于本包（旧路径语义）
+                ++side_pending_[kick_dst];
+                if (kick_dst == SIDE_GPU) ++gpu_pending_;
+            }
+            ++side_pending_[s];
+            if (s == SIDE_GPU) ++gpu_pending_;
+            if (arm_kick && kick_guard_ > 0) {
+                kick_side_ = kick_dst;
+                kick_owed_ = side_pending_[kick_dst];
+                kick_cloned_ = 0;
+            }
+            if (!arm_kick && kick_side_ != Side(-1)) {
+                if (side_pending_[kick_side_] - kick_cloned_ <= 0) {
+                    kick_side_ = Side(-1);
+                    kick_owed_ = kick_cloned_ = 0;
+                } else if (is_key) {
+                    kick_side_ = Side(-1);
+                    kick_owed_ = kick_cloned_ = 0;
+                } else if (s != kick_side_ && kick_cloned_ < kick_guard_) {
+                    ++side_pending_[kick_side_];
+                    if (kick_side_ == SIDE_GPU) ++gpu_pending_;
+                    ++kick_cloned_;
+                    fb_clones_.fetch_add(1, std::memory_order_relaxed);
+                    clone_debt = true;
+                    debt_dst = kick_side_;
+                }
+            }
+        }  // ~lock
+        if (!pkt) break;   // 防御（不应发生）
+        if (arm_kick) {
+            kicks_[kick_dst].fetch_add(1, std::memory_order_relaxed);
+            AVPacket *kick = av_packet_clone(pkt.get());
+            CHECK(kick != nullptr) << "av_packet_clone failed";
+            ffmpeg::AVPacketPtr kick_ptr(kick, [](AVPacket *p) { av_packet_free(&p); });
+            if (kick_dst == SIDE_CPU) {
+                cpu_.Push(std::move(kick_ptr), runtime::NDArray());
+            } else {
+#ifdef DECORD_USE_CUDA
+                std::lock_guard<std::mutex> lk(lcv_mtx_);
+                gpu_pkt_q_.push_back(std::move(kick_ptr));
+                lcv_.notify_all();
+#endif
+            }
+        }
+        if (clone_debt) {
+            AVPacket *dup = av_packet_clone(pkt.get());
+            CHECK(dup != nullptr) << "av_packet_clone failed";
+            ffmpeg::AVPacketPtr dup_ptr(dup, [](AVPacket *p) { av_packet_free(&p); });
+            if (debt_dst == SIDE_CPU) {
+                cpu_.Push(std::move(dup_ptr), runtime::NDArray());
+            } else {
+#ifdef DECORD_USE_CUDA
+                std::lock_guard<std::mutex> lk(lcv_mtx_);
+                gpu_pkt_q_.push_back(std::move(dup_ptr));
+                lcv_.notify_all();
+#endif
+            }
+        }
+        if (s == SIDE_CPU) {
+            cpu_.Push(std::move(pkt), runtime::NDArray());
+        } else {
+#ifdef DECORD_USE_CUDA
+            {
+                std::lock_guard<std::mutex> lk(lcv_mtx_);
+                gpu_pkt_q_.push_back(std::move(pkt));
+            }
+            lcv_.notify_all();
+#endif
+        }
+        // 缓存回收：弹出已消费前缀（取包时已扣字节，这里只收槽位）
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            int64_t front = INT64_MAX;
+            for (int64_t k = feed_gop_idx_;
+                 k < static_cast<int64_t>(gops_.size()); ++k) {
+                const GopRec &g2 = gops_[k];
+                const int64_t avail_end2 = g2.closed ? g2.pkt_end : cache_seq_;
+                if (g2.fed_upto < avail_end2) {
+                    front = g2.fed_upto;
+                    break;
+                }
+            }
+            while (!pkt_cache_.empty() && cache_base_seq_ < front) {
+                pkt_cache_.pop_front();
+                ++cache_base_seq_;
             }
         }
     }
-    const double tc = static_cast<double>(side_pending_[SIDE_CPU])
-                      / std::max(rate[SIDE_CPU], 1.0);
-    const double tg = static_cast<double>(gpu_pending_)
-                      / std::max(rate[SIDE_GPU], 1.0);
-    Side chosen = cur_side_;
-    if (side_pending_[SIDE_CPU] == 0) {
-        chosen = SIDE_CPU;
-    } else if (cur_side_ == SIDE_CPU) {
-        if (tg * 10 < tc * 7) chosen = SIDE_GPU;
-    } else {
-        if (tc * 10 < tg * 7) chosen = SIDE_CPU;
-    }
-    if (getenv("DECORD_HYBRID_DEBUG")) {
-        fprintf(stderr, "[hybrid-sched] key=%lld rc=%.0f rg=%.0f side=%d q=%lld pend=%lld spt=%lld gp=%lld tc=%.2f tg=%.2f -> %d\n",
-                (long long)key_pts, rate[SIDE_CPU], rate[SIDE_GPU],
-                (int)cur_side_, (long long)cpu_.QueueDepth(),
-                (long long)cpu_.PendingDepth(),
-                (long long)side_pending_[SIDE_CPU],
-                (long long)gpu_pending_, tc, tg, (int)chosen);
-    }
-    // GPU 领先硬顶（决策级）：GPU 在途帧（已路由未发射）超过上限时
-    // 强制下一 chunk 给 CPU。超过部分毫无吞吐意义 —— 喂包闸关死后
-    // 只是压缩包在宿主队列堆积；更致命的是它会占满 demux 在途窗口，
-    // 把后续 CPU chunk 的包拦在门外 —— dav1d 的 CPU 块尾帧（~8-16 帧
-    // 滞留）必须由下一个 CPU chunk 的包穿过同一解码器才冲出，GPU
-    // 领先无界 = 前块永久缺帧 + 消费端死等（av1 lockstep 实测 11 帧
-    // 缺口 + GPU 领先 2323 死锁）。上限 = 在途窗口（prefetch+queue+
-    // ready+512，NeedsPackets 口径）− CPU 侧不可避免库存（queue + 上载
-    // 容器）− 256 余量：既不发生窗口内死锁，又保留深领先的长 GPU 块
-    // 收益（av1 lockstep 死锁阈值实测 ~2330 = 窗口 2350）。
+    // EOF 排空标记（锁外发送，一次）
+    bool send_flush = false;
     {
-        const int64_t gpu_cap = static_cast<int64_t>(prefetch_frames_)
-            + ready_cap_frames_ + 248
-            - (out_cuda_ ? up_pool_frames_ : 0);
-        if (chosen == SIDE_GPU && gpu_pending_ > gpu_cap) {
-            chosen = SIDE_CPU;
-        }
+        std::lock_guard<std::mutex> lk(mtx_);
+        send_flush = arm_flush_sent_ && !eof_flush_out_;
+        if (send_flush) eof_flush_out_ = true;
     }
-    return chosen;
+    if (send_flush) {
+        cpu_.Push(nullptr, runtime::NDArray());
+#ifdef DECORD_USE_CUDA
+        if (gpu_) {
+            {
+                std::lock_guard<std::mutex> lk(lcv_mtx_);
+                gpu_flush_left_ = ThreadedDecoderInterface::kMaxOutputSurfaces;
+            }
+            lcv_.notify_all();
+        }
+#endif
+    }
 }
 
 int64_t HybridThreadedDecoder::RankOfPts(int64_t pts) const {
@@ -1074,203 +1081,127 @@ int64_t HybridThreadedDecoder::RankOfPts(int64_t pts) const {
 }
 
 void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) {
-    // VideoReader 对 hybrid 一律推 NDArray()（与 CPU 分支一致）；
-    // GPU 侧需要的 CUDA 输出缓冲由工作线程从有界池 Acquire。
+    // 包缓存版（层0/1）：Push 只入缓存 + GOP 记账，供料泵在分配时点
+    // 派工（见 PumpFeed）。VideoReader 对 hybrid 一律推 NDArray()（与
+    // CPU 分支一致）；GPU 侧输出缓冲由工作线程从有界池 Acquire。
     if (!pkt) {
-        // EOF flush
-        {
+        {   // EOF：关闭当前 GOP，泵排空后由 PumpFeed 发臂排空标记
             std::lock_guard<std::mutex> lk(mtx_);
-            if (routing_active_) {
-                Chunk last{cur_side_, cur_start_pts_, INT64_MAX, 0, 0};
-                emit_queue_.push_back(last);
+            if (routing_active_ && !gops_.empty() && !gops_.back().closed) {
+                CloseGopLocked();
             }
-            eof_pushed_ = true;
+            eof_cache_ = true;
         }
-        cpu_.Push(nullptr, runtime::NDArray());
-#ifdef DECORD_USE_CUDA
-        if (gpu_) {
-            // GPU 侧 flush 由工作线程在包队列排空后执行（Push 永不阻塞）
-            {
-                std::lock_guard<std::mutex> lk(lcv_mtx_);
-                gpu_flush_left_ = ThreadedDecoderInterface::kMaxOutputSurfaces;
-            }
-            lcv_.notify_all();
-        }
-#endif
+        PumpFeed();
         return;
     }
-    bool is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
-    Side flush_side = SIDE_CPU;
-    bool need_flush = false;
-    bool burst_dup = false;
-    int burst_dup_side = -1;
+    const bool is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (!routing_active_) {
-            // 首包一律 GPU：NVDEC 平价起步，chunk0 的 CPU 串行解码
-            // （~0.3s @ 软解速率，hevc 全量 0.3/1.7s ≈ 15% 纯损耗）完全
-            // 消除。rc 采样仅 h264 有意义（混跑有净收益）——由 rc-unknown
-            // 分支按 codec 给一个 CPU chunk 采样（与 chunk0 的 GPU 发射
-            // 重叠）；hevc/av1 的 gate 判决恒为全 GPU，永远不需要 rc。
             routing_active_ = true;
             stats_t0_us_.store(
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count(),
                 std::memory_order_relaxed);
-            // 首包默认 GPU（NVDEC 平价起步，见上），但诊断/实验的
-            // DECORD_HYBRID_FORCE_SIDE **必须在这里也生效**：bootstrap 原先
-            // 完全绕过 ChooseSide，force=cpu 时 chunk0 仍归 GPU 却永不落地
-            // ——Pop 卡死在队头（实测 `[pop-stall] side=1 crdy=637 rdy=0
-            // head=(side1,0,…,exp=299,em=293) pend=655/7`：数百帧已上载的
-            // CPU 存货被一个不会有包的 GPU chunk 堵死，且 force-close 安全网
-            // 因 side_pending_[GPU]=7≠0 正确地不敢关它）。未设 force 时
-            // ForcedSide() 返回哨兵 → 行为与本修改前逐字一致。
-            const Side forced_boot = ForcedSide();
-            cur_side_ = (forced_boot != Side(-1)) ? forced_boot : SIDE_GPU;
-            cur_start_pts_ = pkt->pts;
-            Chunk c{cur_side_, pkt->pts, INT64_MAX, 0, 0};
-            emit_queue_.push_back(c);
-            ++chunks_assigned_[cur_side_];
-        } else if (is_key) {
-            // 关闭当前 chunk（end = 本关键帧 pts），为新 chunk 选侧
-            if (!emit_queue_.empty()) {
-                Chunk &last = emit_queue_.back();
-                last.end_pts = pkt->pts;
-                last.expected = ExpectedFrames(last.start_pts, pkt->pts);
-                if (last.expected > 0) {
-                    est_chunk_frames_ = last.expected;
-                    assigned_frames_[last.side] += last.expected;
+        }
+        if (is_key) {
+            if (!gops_.empty() && !gops_.back().closed) {
+                if (!emit_queue_.empty()) {
+                    emit_queue_.back().end_pts = pkt->pts;  // 先写 end
+                }
+                CloseGopLocked();
+            }
+            OpenGopLocked(pkt->pts);
+        }
+        // 迟到包（重排：非 key 且 pts 早于当前 GOP 起点）归属更早的 GOP：
+        // 已供 → 直供其侧（旧行为）；未供 → 挂 stragglers 随主区间供。
+        // 非 IDR 型（AV1）无法归属的包跟随当前 GOP（旧语义：孤立中段包
+        // 喂软解会 dav1d parse 崩溃，其输出旧帧由陈旧丢弃兜底）。
+        bool stashed = false;
+        if (!is_key && gops_.size() >= 2) {
+            const int64_t cur_start = gops_.back().start_pts;
+            if (pkt->pts < cur_start) {
+                GopRec *own = nullptr;
+                if (IsIdrLikeCodec()) {
+                    for (auto it = gops_.rbegin() + 1;
+                         it != gops_.rend(); ++it) {
+                        if (pkt->pts >= it->start_pts) { own = &*it; break; }
+                    }
+                } else {
+                    own = &gops_[gops_.size() - 2];   // 前一 GOP
+                }
+                if (own) {
+                    if (own->fed_upto >= (own->closed ? own->pkt_end
+                                                      : cache_seq_)) {
+                        const Side s2 = own->side;
+                        if (s2 != Side(-1)) {
+                            ++side_pending_[s2];
+                            if (s2 == SIDE_GPU) ++gpu_pending_;
+                            if (s2 == SIDE_CPU) {
+                                cpu_.Push(std::move(pkt), runtime::NDArray());
+                            } else {
+#ifdef DECORD_USE_CUDA
+                                std::lock_guard<std::mutex> lk2(lcv_mtx_);
+                                gpu_pkt_q_.push_back(std::move(pkt));
+#endif
+                            }
+                            stashed = true;
+                        }
+                    } else {
+                        own->stragglers.push_back(std::move(pkt));
+                        stashed = true;
+                    }
                 }
             }
-            Side old_side = cur_side_;
-            Side s = ChooseSide(pkt->pts);
-            // kick 冲刷：跨侧切换时克隆新 chunk 的关键帧包推给离场侧，
-            // 驱动其交出滞留的尾部帧（NVDEC 的 display 延迟需要后续包
-            // 驱动；离场侧断流后末帧滞留 → 发射端死等 → 消费侧重试把
-            // 文件 demux 完、EOF 语义污染中途读取，av1 实测 599/600 帧
-            // + 重复帧）。IDR 型：kick 帧重置参考状态、输出 pts == 包
-            // pts（stash 闭环）。AV1：kick 帧输出可能回落上一 chunk
-            // （show_existing 映射）→ 陈旧丢弃兜底；迟到的块尾帧 pts
-            // 属于本 chunk → 正常发射补满 expected。
-            if (s != old_side && IsIdrLikeCodec()) {
-                flush_side = old_side;
-                need_flush = true;
-                // kick 只送一个 IDR 冲不开 open-GOP 的 DPB（IDR 与其
-                // leading pictures 要等 IDR **之后**的包）——克隆清偿的
-                // 武装在下方记账块完成（债务快照须含 kick 包）。护栏与
-                // 消融开关见 .h kick_side_ 注释（0 = 单包 kick 旧行为）。
+        }
+        if (!stashed) {
+            cache_bytes_ += static_cast<size_t>(pkt->size);
+            if (cache_bytes_ > cache_peak_bytes_) {
+                cache_peak_bytes_ = cache_bytes_;
             }
-            cur_side_ = s;
-            cur_start_pts_ = pkt->pts;
-            Chunk c{s, pkt->pts, INT64_MAX, 0, 0};
-            emit_queue_.push_back(c);
-            ++chunks_assigned_[s];
+            pkt_cache_.push_back(std::move(pkt));
+            ++cache_seq_;
+        }
+    }
+    PumpFeed();
+}
 
-        } else {
-            // 非 key 包：按 pts 归属路由。解码序与 pts 序不一致的码流
-            //（重排帧的包迟到）仍属于更早的 chunk，必须喂给那侧。
-            cur_route_override_ = SIDE_CPU;
-            for (auto it = emit_queue_.rbegin(); it != emit_queue_.rend(); ++it) {
-                if (pkt->pts >= it->start_pts) {
-                    cur_route_override_ = it->side;
-                    break;
-                }
-            }
-            if (!IsIdrLikeCodec()) {
-                // 非 IDR 型（AV1）无法归属的包（show_existing 的回退 pts、
-                // 无 pts 等）：跟随当前 chunk 的侧。fallback CPU 会在全 GPU
-                // 码流上把孤立中段包喂给软解（libdav1d "Error parsing OBU
-                // data" → 进程崩溃）；其输出旧帧由 Pop 的陈旧丢弃兜底。
-                // IDR 流保持 CPU fallback：迟到重排帧喂软解状态连续。
-                cur_route_override_ = cur_side_;
-            }
-        }
-        // 各侧待发射帧计数（包粒度，1 包 = 1 帧；含在途解码与存货）：
-        // kick 包与本包。gpu_pending_ 保留作 GPU 字节预算依据。
-        if (need_flush && flush_side == SIDE_GPU) { ++gpu_pending_; ++side_pending_[SIDE_GPU]; }
-        else if (need_flush && flush_side == SIDE_CPU) { ++side_pending_[SIDE_CPU]; }
-        Side tgt = (is_key ? cur_side_ : cur_route_override_);
-        ++side_pending_[tgt];
-        if (tgt == SIDE_GPU) ++gpu_pending_;
-        // 跨侧切换的反馈式清偿武装（.h kick_side_ 注释）：kick 包已记账，
-        // 此刻快照离场侧债务（含 kick 包自身——它也要出清才算清偿）。
-        if (need_flush && kick_guard_ > 0) {
-            kick_side_ = flush_side;
-            kick_owed_ = side_pending_[flush_side];
-            kick_cloned_ = 0;
-        }
-        // 反馈式克隆（取代定长突发）：债务未清偿（pending − cloned > 0，
-        // 即切换前路由的帧仍有滞留）就持续把新侧的包克隆喂给离场侧，
-        // 驱动其 DPB 交出滞留帧；发射/陈旧丢弃都减 pending，清偿即解除
-        // 武装（NeedsPackets 同步恢复窗口闸）。下个 key 包作废（正常流
-        // 重排深度 ≪ chunk 长度；一整个 chunk 的克隆仍不清偿 = 码流损坏，
-        // 武装保持放行 demux 至 EOF 冲刷兜底）。护栏 kick_guard_ 防无限克隆。
-        if (!need_flush && kick_side_ != Side(-1)) {
-            if (side_pending_[kick_side_] - kick_cloned_ <= 0) {
-                kick_side_ = Side(-1);
-                kick_owed_ = kick_cloned_ = 0;
-            } else if (is_key) {
-                kick_side_ = Side(-1);
-                kick_owed_ = kick_cloned_ = 0;
-            } else if (tgt != kick_side_ && kick_cloned_ < kick_guard_) {
-                ++side_pending_[kick_side_];
-                if (kick_side_ == SIDE_GPU) ++gpu_pending_;
-                ++kick_cloned_;
-                fb_clones_.fetch_add(1, std::memory_order_relaxed);
-                burst_dup = true;
-                burst_dup_side = static_cast<int>(kick_side_);
-            }
-        }
+void HybridThreadedDecoder::OpenGopLocked(int64_t pts) {
+    // 打开 GOP：交付 chunk（side 待分配）+ 缓存记账记录。仅 Push 线程
+    //（持 mtx_）调用。
+    GopRec g;
+    g.id = gop_seq_;
+    g.pkt_begin = cache_seq_;
+    g.pkt_end = cache_seq_;
+    g.fed_upto = cache_seq_;   // 绝对序列语义：初始=区间起点
+    g.start_pts = pts;
+    gops_.push_back(std::move(g));
+    Chunk c{Side(-1), gop_seq_, pts, INT64_MAX, 0, 0};
+    emit_queue_.push_back(c);
+    ++gop_seq_;
+}
+
+void HybridThreadedDecoder::CloseGopLocked() {
+    // 关闭当前 GOP（end_pts 已由调用方写入 chunk）。expected 从 kf 索引
+    // 取；分配时累计进 assigned_frames_（counted 防双计）。
+    if (gops_.empty() || emit_queue_.empty()) return;
+    GopRec &g = gops_.back();
+    const Chunk &last = emit_queue_.back();
+    const int64_t end_pts = last.end_pts;
+    g.closed = true;
+    g.pkt_end = cache_seq_;
+    int64_t exp = ExpectedFrames(last.start_pts, end_pts);
+    if (end_pts == INT64_MAX && exp <= 0) {
+        exp = est_chunk_frames_ > 0 ? est_chunk_frames_ : 0;
     }
-    if (need_flush) {
-        // kick（锁外执行）。与原型"块尾多解一帧"同型：克隆新 chunk 的
-        // 关键帧包推给离场侧，触发其交出滞留的重排帧。kick 帧与迟到帧
-        // 的顺序由 Pop 的 expected 帧数对齐保证（kick 帧 stash 扣住，
-        // 迟到帧先发）。
-        kicks_[flush_side].fetch_add(1, std::memory_order_relaxed);
-        AVPacket *kick = av_packet_clone(pkt.get());
-        CHECK(kick != nullptr) << "av_packet_clone failed";
-        ffmpeg::AVPacketPtr kick_ptr(kick, [](AVPacket *p) { av_packet_free(&p); });
-        if (flush_side == SIDE_CPU) {
-            cpu_.Push(std::move(kick_ptr), runtime::NDArray());
-        } else {
-#ifdef DECORD_USE_CUDA
-            {
-                std::lock_guard<std::mutex> lk(lcv_mtx_);
-                gpu_pkt_q_.push_back(std::move(kick_ptr));
-            }
-#endif
-        }
+    if (exp > 0) est_chunk_frames_ = exp;
+    for (auto it = emit_queue_.rbegin(); it != emit_queue_.rend(); ++it) {
+        if (it->id == g.id) { it->expected = exp; it->end_pts = end_pts; break; }
     }
-    Side target = is_key ? cur_side_ : cur_route_override_;
-    if (burst_dup) {
-        // 突发克隆包：内容=本包，去向=离场侧（记账已在锁内完成）。
-        AVPacket *dup = av_packet_clone(pkt.get());
-        CHECK(dup != nullptr) << "av_packet_clone failed";
-        ffmpeg::AVPacketPtr dup_ptr(dup, [](AVPacket *p) { av_packet_free(&p); });
-        if (burst_dup_side == SIDE_CPU) {
-            cpu_.Push(std::move(dup_ptr), runtime::NDArray());
-        }
-#ifdef DECORD_USE_CUDA
-        else {
-            std::lock_guard<std::mutex> lk(lcv_mtx_);
-            gpu_pkt_q_.push_back(std::move(dup_ptr));
-            lcv_.notify_all();
-        }
-#endif
-    }
-    if (target == SIDE_CPU) {
-        cpu_.Push(std::move(pkt), runtime::NDArray());
-    } else {
-#ifdef DECORD_USE_CUDA
-        // GPU 包进宿主队列（压缩包很小），由工作线程按 ready_ 余量喂给
-        // GPU —— demux 线程永不阻塞，显存占用由有界池决定。
-        {
-            std::lock_guard<std::mutex> lk(lcv_mtx_);
-            gpu_pkt_q_.push_back(std::move(pkt));
-        }
-        lcv_.notify_all();
-#endif
+    if (exp > 0 && g.side != Side(-1) && !g.counted) {
+        assigned_frames_[g.side] += exp;
+        g.counted = true;
     }
 }
 
@@ -1337,6 +1268,12 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 break;
             }
             ch = emit_queue_.front();
+        }
+        // 未分配的队头（供料泵尚未派工——只在启动瞬态出现）：等同"暂无
+        // 帧可取"，返回 false 等泵供上（force-close 安全网也依赖 side
+        // 合法，先挡掉）。
+        if (ch.side == Side(-1)) {
+            return false;
         }
         // force-close 安全网：该侧已路由的包全部出清（pending==0）但
         // expected 未补满 —— 重排流的跨侧切换残留（无 kick 的 AV1 混合
@@ -1434,7 +1371,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                             (long long)up_pool_.DiagFree(),
                             (long long)up_pool_.DiagCreated(),
                             (int)NeedsPackets(), (int)sched_initialized_,
-                            (int)plan_ready_,
+                            (int)eof_cache_,
                             (long long)kicks_[0].load(),
                             (long long)kicks_[1].load(),
                             (int)kick_side_, kick_cloned_, kick_owed_,
