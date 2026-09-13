@@ -64,6 +64,7 @@
 #include "../runtime/cuda/cudart_shim.h"
 #endif
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace decord {
@@ -729,6 +730,7 @@ void HybridThreadedDecoder::ResetRouting() {
     plan_side_.clear();
     emitted_total_ = 0;
     sched_initialized_ = false;
+    chunks_since_replan_ = 0;
     side_pending_[0] = side_pending_[1] = 0;
 #ifdef DECORD_USE_CUDA
     {
@@ -804,6 +806,42 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
         fprintf(stderr, "[hybrid-plan] k0=%d chunks=%d frames cpu=%d gpu=%d "
                 "(share=%.2f)\n", k0, nc, nf[0], nf[1], cpu_share);
     }
+}
+
+void HybridThreadedDecoder::MaybeReplan(int64_t key_pts) {
+    // 计划重规划（opt-in）：water-filling 计划在首个 keyframe 冻结后就不再变，
+    // 而运行中的实测速率会漂（热降/后台占用/核数格局/素材相位差）。实测证据：
+    // 用"上一次运行"的速率播种会在 w=3000 上倒亏 8.5% ⇒ 冻结错速率比的代价真实。
+    // 这里让计划在**漂移显著**时按当前实测重建，并带迟滞避免反复重排。
+    static const double thr_pct = [] {
+        const char *e = getenv("DECORD_HYBRID_REPLAN_PCT");
+        return e ? atof(e) : 0.0;        // 未设 = 关闭（铁律 10：新功能默认关）
+    }();
+    if (thr_pct <= 0.0 || !plan_ready_) return;
+    static const int64_t gap = [] {
+        const char *e = getenv("DECORD_HYBRID_REPLAN_GAP");
+        const int64_t v = e ? atoll(e) : 8;
+        return v > 0 ? v : 8;
+    }();
+    if (chunks_since_replan_ < gap) { ++chunks_since_replan_; return; }
+    const double rc_now = cpu_.ProductionRate();
+    const double rg_now = gpu_rate_landed_.load(std::memory_order_relaxed);
+    const double rc_plan = static_cast<double>(plan_rc_.load(std::memory_order_relaxed));
+    const double rg_plan = static_cast<double>(plan_rg_.load(std::memory_order_relaxed));
+    if (rc_now <= 0.0 || rg_now <= 0.0 || rc_plan <= 0.0 || rg_plan <= 0.0) return;
+    const double d_c = std::fabs(rc_now - rc_plan) / rc_plan;
+    const double d_g = std::fabs(rg_now - rg_plan) / rg_plan;
+    if (d_c < thr_pct / 100.0 && d_g < thr_pct / 100.0) return;
+    const double f_now = rc_now / (rc_now + rg_now);
+    if (!(f_now > 0.0 && f_now < 1.0)) return;
+    if (getenv("DECORD_HYBRID_DEBUG")) {
+        fprintf(stderr, "[hybrid-replan] key=%lld rc %.0f->%.0f rg %.0f->%.0f "
+                "(d=%.0f%%/%.0f%%) share->%.2f\n",
+                (long long)key_pts, rc_plan, rc_now, rg_plan, rg_now,
+                d_c * 100.0, d_g * 100.0, f_now);
+    }
+    BuildPlan(key_pts, f_now);
+    chunks_since_replan_ = 0;
 }
 
 HybridThreadedDecoder::Side HybridThreadedDecoder::ForcedSide() const {
@@ -949,6 +987,7 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
         if (pit != kf_pts_.end() && *pit == key_pts) {
             int k = static_cast<int>(pit - kf_pts_.begin());
             if (k < static_cast<int>(plan_side_.size()) && plan_side_[k] >= 0) {
+                MaybeReplan(key_pts);        // opt-in：速率漂移显著时重建计划
                 Side s = static_cast<Side>(plan_side_[k]);
                 if (getenv("DECORD_HYBRID_DEBUG")) {
                     fprintf(stderr, "[hybrid-sched] plan key=%lld k=%d -> %d\n",

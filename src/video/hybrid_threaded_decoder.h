@@ -198,6 +198,10 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     void ResetRouting();
     /*! \brief 为起始 pts == key_pts 的新 chunk 选择承接侧（速率感知贪心） */
     Side ChooseSide(int64_t key_pts);
+    /*! \brief 计划重规划（opt-in，DECORD_HYBRID_REPLAN_PCT>0 才生效）。
+     *  速率漂移超过阈值且距上次重规划 >= DECORD_HYBRID_REPLAN_GAP 个
+     *  chunk 时，按当前实测速率重建计划（从 key_pts 起覆盖未消费部分）。 */
+    void MaybeReplan(int64_t key_pts);
     /*! \brief 诊断/实验开关 DECORD_HYBRID_FORCE_SIDE 的生效侧；未设时返回
      *  Side(-1)（哨兵，与本文件既有写法一致）。
      *
@@ -498,6 +502,9 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
                                          ///< 含在途解码与存货，包粒度精确）
     int64_t est_chunk_frames_ = 0;       ///< chunk 帧数估计（份额累计用）
     bool sched_initialized_ = false;     ///< 双侧速率首次就绪后已重置 alloc
+    /*! 计划重规划（opt-in，见 DECORD_HYBRID_REPLAN_PCT）：记录自上次重建计划
+     *  以来走过的 chunk 数，用于迟滞（避免速率抖动导致反复重排）。 */
+    int chunks_since_replan_ = 0;
 
     std::vector<int64_t> gpu_frame_shape_;
     // ── 硬件自适应预算（SetCodecContext 计算；全部有界）──
