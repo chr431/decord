@@ -487,11 +487,20 @@ void FFMPEGThreadedDecoder::EnqueueRawFrame(AVFramePtr frame) {
         // 条件变量背压（替代 1ms 睡眠轮询）：睡眠量子会把解码节流到
         // ~1ms/帧上限（rgb 实测 803fps 封顶）。Pop 侧唤醒，精确随消费
         // 步进；内存上界不变。
+        // raw_cap_frames_ > 0（混合解码 ROI 路径）：背压只看 raw 队列
+        //（按全帧字节预算折算的帧数上限），frame 队列（ROI 帧仅 KB 级）
+        // 由 EmitOrdered 的 max_queue_frames_ 单独约束 —— 旧合并计价
+        // 把 ROI 存货按全帧内存错杀，对侧值日期银行深度被压死
+        //（见 .h SetRawQueueFrames 注释）。
         size_t cap = static_cast<size_t>(max_queue_frames_ + DECORD_RAW_SLACK_FRAMES);
         std::unique_lock<std::mutex> lk(bp_mutex_);
         bp_cv_.wait(lk, [&] {
-            return !run_.load()
-                   || raw_queue_->Size() + frame_queue_->Size() < cap;
+            if (!run_.load()) return true;
+            if (raw_cap_frames_ > 0) {
+                return raw_queue_->Size()
+                    < static_cast<size_t>(raw_cap_frames_);
+            }
+            return raw_queue_->Size() + frame_queue_->Size() < cap;
         });
         if (!run_.load()) return;
     }

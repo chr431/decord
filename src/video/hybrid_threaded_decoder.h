@@ -198,10 +198,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     void ResetRouting();
     /*! \brief 为起始 pts == key_pts 的新 chunk 选择承接侧（速率感知贪心） */
     Side ChooseSide(int64_t key_pts);
-    /*! \brief 计划重规划（opt-in，DECORD_HYBRID_REPLAN_PCT>0 才生效）。
-     *  速率漂移超过阈值且距上次重规划 >= DECORD_HYBRID_REPLAN_GAP 个
-     *  chunk 时，按当前实测速率重建计划（从 key_pts 起覆盖未消费部分）。 */
-    void MaybeReplan(int64_t key_pts);
     /*! \brief 诊断/实验开关 DECORD_HYBRID_FORCE_SIDE 的生效侧；未设时返回
      *  Side(-1)（哨兵，与本文件既有写法一致）。
      *
@@ -307,6 +303,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief 硬件自适应预算计算（空闲显存/内存 → 各池深/队列/prefetch） */
     void ComputeBudgets();
     double vram_budget_ = 768.0 * 1024 * 1024;  ///< 显存预算（ROI 重建池深复用）
+    double ram_budget_ = 1536.0 * 1024 * 1024;  ///< 宿主 RAM 预算（ROI 重建 CPU 库存帽用）
     /*! \brief demux 领先深度建议（自适应预算计算结果）。
      *  盲阶段（双侧速率未就绪，sched_initialized_ 未置位）收缩到
      *  ~2 chunks：demux 全速领先（千余包瞬时入队）会让十几个 chunk
@@ -359,8 +356,16 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
                            + queue_frames_ + ready_cap_frames_ + 512,
                        blind);
         }
-        return inflight < static_cast<int64_t>(prefetch_frames_)
-                          + queue_frames_ + ready_cap_frames_ + 512;
+        // 稳态窗口 = min(旧公式, 视界+3072)：demux 领先必须盖住两侧银行
+        //（CPU 队列 + GPU ready）但**不得超过视界太多** —— 深预售会让
+        // 视界重建全部发生在速率收敛前（demux 几秒内跑完全流路由），
+        // 等于没重建。视界关（=0）时保持旧公式。
+        int64_t window = static_cast<int64_t>(prefetch_frames_)
+                         + queue_frames_ + ready_cap_frames_ + 512;
+        if (plan_horizon_frames_ > 0) {
+            window = std::min(window, plan_horizon_frames_ + 3072);
+        }
+        return inflight < window;
     }
 
 #ifdef DECORD_USE_CUDA
@@ -497,14 +502,24 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::vector<int> plan_side_;
     bool plan_ready_ = false;
     void BuildPlan(int64_t key_pts, double cpu_share);
+    /*! \brief 计划滑动视界（帧数；0 = 旧行为=全流一次冻结）。
+     *  BuildPlan 只规划 [k0, plan_end_k_)；demux 路由到 plan_end_k_ 即以
+     *  当时实测速率重建（累计分账保留，全局配比不失衡）。动机（2026-09-13
+     *  缺口分解）：冻结计划的 rg 取自 EWMA 爬升期（实测同码两次运行
+     *  1742~2221 漂 ±13%），hevc 份额因此偏 CPU 0.05+，GPU 臂队尾闲置
+     *  ~2s；变长 chunk 下贪心量化还会单向过冲（h264 目标 0.76 实排
+     *  0.818）。视界重建让两个误差都只影响一个视界。与深银行兼容：
+     *  NeedsPackets 窗口同缩（视界+3072），否则 demux 深预售会让重建
+     *  全部发生在速率收敛前、等于没重建。`DECORD_HYBRID_PLAN_HORIZON`
+     *  可覆盖（帧数，0=关）。 */
+    int64_t plan_horizon_frames_ = 4096;
+    int plan_end_k_ = 0;             ///< 一个越过末已规划 chunk 的索引
+    std::atomic<int64_t> plan_rebuilds_{0};
     int64_t emitted_total_ = 0;          ///< 全局已发射帧数（消费位置）
     int64_t side_pending_[2] = {0, 0};   ///< 各侧已路由未发射帧数（真积压，
                                          ///< 含在途解码与存货，包粒度精确）
     int64_t est_chunk_frames_ = 0;       ///< chunk 帧数估计（份额累计用）
     bool sched_initialized_ = false;     ///< 双侧速率首次就绪后已重置 alloc
-    /*! 计划重规划（opt-in，见 DECORD_HYBRID_REPLAN_PCT）：记录自上次重建计划
-     *  以来走过的 chunk 数，用于迟滞（避免速率抖动导致反复重排）。 */
-    int chunks_since_replan_ = 0;
 
     std::vector<int64_t> gpu_frame_shape_;
     // ── 硬件自适应预算（SetCodecContext 计算；全部有界）──

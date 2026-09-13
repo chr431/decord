@@ -100,6 +100,15 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
          *  一个 chunk 帧数（~286）就会退化为实时跟随解码速率
          *  （hevc CPU 侧 ~700fps，实测整体被拖到 0.70x）。 */
         void SetQueueDepth(int n) { max_queue_frames_ = n; }
+        /*! \brief 解码线程背压的 raw 队列上限（帧数），0 = 旧行为。
+         *  旧行为把 raw(全帧) 与 frame(滤镜后) 合并计入同一上限
+         *  （max_queue + slack）：ROI 输出下 frame 项只有 KB 级，合并
+         *  上限把"廉价可深囤的 ROI 存货"错按全帧内存计价，混合解码
+         *  对侧值日期的银行深度被压到 1536 帧 —— 解码线程提前停转
+         *  （h264 实测 CPU 臂 27% 闲置）。设正数后背压只看 raw 队列
+         *  （调用方按全帧字节预算折算），frame 队列仍由 max_queue_frames_
+         *  单独约束。仅混合解码器调用；其余调用方保持旧行为。 */
+        void SetRawQueueFrames(int n) { raw_cap_frames_ = n; }
         /*! \brief 可发射存货深度（filter 后帧队列）。混合调度的库存迟滞
          *  切换信号：GPU 块把它灌满、CPU 块把它排空 —— 份额自发涌现。 */
         size_t QueueDepth() const {
@@ -171,6 +180,8 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
         // = 解码 worker 线程；读侧仅 Stop() 汇总。
         std::atomic<long long> dec_busy_us_{0};
         std::atomic<long long> dec_busy_pkts_{0};
+        /*! raw 队列独立上限（SetRawQueueFrames；0 = 旧行为 raw+frame 合并） */
+        int raw_cap_frames_ = 0;
         FFMPEGFilterGraphPtr filter_graph_;
         std::mutex filter_mutex_;   // 保护 filter_graph_ 热切换（SetRoi）
         AVCodecContextPtr dec_ctx_;

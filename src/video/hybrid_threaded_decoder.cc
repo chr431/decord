@@ -84,6 +84,11 @@ HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
     if (const char *e = getenv("DECORD_HYBRID_KICK_BURST")) {
         kick_guard_ = atoi(e);
     }
+    // 计划滑动视界（0 = 关：全流一次冻结的旧行为）
+    if (const char *e = getenv("DECORD_HYBRID_PLAN_HORIZON")) {
+        plan_horizon_frames_ = atoll(e);
+        if (plan_horizon_frames_ < 0) plan_horizon_frames_ = 0;
+    }
 #ifdef DECORD_USE_CUDA
     // GPU 子解码器初始化 bsf (mp4→annexb) 时会就地改写传入的 codecpar。
     // 传副本；CPU 侧继续用 VideoReader 手里的原始 AVCC 参数（其
@@ -308,6 +313,7 @@ void HybridThreadedDecoder::ComputeBudgets() {
     { long pages = sysconf(_SC_AVPHYS_PAGES); long ps = sysconf(_SC_PAGE_SIZE);
       if (pages > 0 && ps > 0) ram_budget = static_cast<double>(pages) * ps * 0.45; }
 #endif
+    ram_budget_ = ram_budget;
     if (const char *e = getenv("DECORD_HYBRID_VRAM_BUDGET_MB"))
         if (atof(e) > 0) vram_budget_ = atof(e) * 1024 * 1024;
     if (const char *e = getenv("DECORD_HYBRID_RAM_BUDGET_MB"))
@@ -535,6 +541,23 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
                 up_pool_frames_ = clampi(vram_budget_ * 0.35 / fb_roi,
                                          48, 4096);
                 ready_cap_frames_ = gpu_pool_frames_ + up_pool_frames_ + 64;
+                // CPU 臂银行（2026-09-13 缺口分解）：ComputeBudgets 的
+                // queue_frames_ 按**全帧**字节算出 1536 帧帽（4.8GB RAM 时代
+                // 的保守界），但 ROI 输出下 frame 项只有 KB 级 —— 1536 帧
+                // 仅 ~8MB，对侧（GPU）值日期的发射停顿盖不住（h264 GPU 头
+                // 阻塞 1.39s 期间 CPU 臂银行只够 ~0.5s，实测 27% 闲置）。
+                // 重算：ROI 帧按 RAM 预算放开到 4096；解码线程背压解耦到
+                // raw 队列并按全帧字节预算（768MB）封顶 —— 全帧内存风险
+                // 由 raw 帽独立承担，ROI 银行不再被合并计价错杀。
+                queue_frames_ = clampi(ram_budget_ * 0.45 / fb_roi, 96, 4096);
+                cpu_.SetQueueDepth(queue_frames_);
+                const int64_t raw_bytes = static_cast<int64_t>(width_) > 0
+                    && static_cast<int64_t>(height_) > 0
+                        ? static_cast<int64_t>(width_) * height_ * 3 / 2
+                        : 3 * 1024 * 1024;
+                cpu_.SetRawQueueFrames(clampi(
+                    768.0 * 1024 * 1024 / static_cast<double>(raw_bytes),
+                    128, 4096));
             }
         }
         gpu_pool_.Reset(gpu_pool_frames_,
@@ -660,10 +683,13 @@ void HybridThreadedDecoder::Stop() {
                 (long long)fb_clones_.load());
         fprintf(stderr,
                 "[hybrid-stats] plan rc=%lld rg=%lld frames c=%lld g=%lld"
-                " folds=%ld age=%lldms\n",
+                " folds=%ld age=%lldms horizon=%lld rebuilds=%lld rg_now=%.0f\n",
                 (long long)plan_rc_.load(), (long long)plan_rg_.load(),
                 (long long)plan_frames_[0].load(), (long long)plan_frames_[1].load(),
-                (long)plan_folds_.load(), (long long)plan_age_ms_.load());
+                (long)plan_folds_.load(), (long long)plan_age_ms_.load(),
+                (long long)plan_horizon_frames_,
+                (long long)plan_rebuilds_.load(),
+                gpu_rate_landed_.load(std::memory_order_relaxed));
         fprintf(stderr,
                 "[hybrid-stats] hol cpu-head us=%lld ev=%lld strandmax=%lld"
                 " | gpu-head us=%lld ev=%lld strandmax=%lld\n",
@@ -728,9 +754,9 @@ void HybridThreadedDecoder::ResetRouting() {
     assigned_frames_[0] = assigned_frames_[1] = 0;
     plan_ready_ = false;
     plan_side_.clear();
+    plan_end_k_ = 0;
     emitted_total_ = 0;
     sched_initialized_ = false;
-    chunks_since_replan_ = 0;
     side_pending_[0] = side_pending_[1] = 0;
 #ifdef DECORD_USE_CUDA
     {
@@ -749,10 +775,14 @@ void HybridThreadedDecoder::ResetRouting() {
 }
 
 void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
-    // 一次性规划全部未来 chunk：贪心配额 —— 每个候选 chunk 分给
+    // 规划 [k0, plan_end_k_)：贪心配额 —— 每个候选 chunk 分给
     // 「累计分账帧数加权后落后」的一侧（cpu_assigned*rg <= gpu_assigned*rc
     // ⇔ CPU 份额低于 rc/(rc+rg)）。chunk 帧数直接取 kf rank 差（精确）。
-    // 规划冻结规划时的速率比；运行中速率漂移不做重规划（v1 取舍）。
+    // 视界（plan_horizon_frames_ > 0，默认 4096）：只规划约一个视界的
+    // chunk，demux 走到 plan_end_k_ 时 ChooseSide 以**当时**的实测速率
+    // 重建（本函数即重建入口）——冻结远端速率比的代价（EWMA 爬升期噪声
+    // ±13%、变长 chunk 贪心过冲）被限制在一个视界内。累计分账
+    //（assigned_frames_）跨重建保留，全局配比不失衡。
     if (kf_pts_.empty()) return;
     auto it = std::lower_bound(kf_pts_.begin(), kf_pts_.end(), key_pts);
     if (it == kf_pts_.end() || *it != key_pts) return;
@@ -767,7 +797,13 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
     // 诊断/实验覆盖必须在这里也生效：规划器早先只按贪心份额分侧，force
     // 模式下会规划出运行时永不喂包的另一侧 chunk（详见 .h ForcedSide 注释）。
     const Side forced = ForcedSide();
-    for (int k = k0; k < static_cast<int>(kf_pts_.size()); ++k) {
+    int k_end = static_cast<int>(kf_pts_.size());
+    if (plan_horizon_frames_ > 0 && est_chunk_frames_ > 0) {
+        const int64_t hor = std::max<int64_t>(
+            plan_horizon_frames_ / est_chunk_frames_, 1);
+        k_end = std::min<int>(k_end, k0 + static_cast<int>(hor));
+    }
+    for (int k = k0; k < k_end; ++k) {
         int64_t n = kf_rank_[k + 1] - kf_rank_[k];
         if (k + 1 >= static_cast<int>(kf_pts_.size())) {
             n = k > k0 ? (kf_rank_[k] - kf_rank_[k - 1])
@@ -786,6 +822,7 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
         (s == SIDE_CPU ? ac : ag) += n;
         plan_frames_[s].fetch_add(n, std::memory_order_relaxed);
     }
+    plan_end_k_ = k_end;
     plan_rc_.store(static_cast<int64_t>(rc), std::memory_order_relaxed);
     plan_rg_.store(static_cast<int64_t>(rg), std::memory_order_relaxed);
     plan_folds_.store(cpu_.ProductionFolds(), std::memory_order_relaxed);
@@ -794,54 +831,20 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
             std::chrono::steady_clock::now().time_since_epoch()).count()
          - stats_t0_us_.load(std::memory_order_relaxed)) / 1000,
         std::memory_order_relaxed);
+    if (plan_ready_) plan_rebuilds_.fetch_add(1, std::memory_order_relaxed);
     plan_ready_ = true;
     if (getenv("DECORD_HYBRID_DEBUG")) {
         int nc = 0, nf[2] = {0, 0};
-        for (int k = k0; k < static_cast<int>(kf_pts_.size()); ++k) {
+        for (int k = k0; k < k_end; ++k) {
             if (plan_side_[k] >= 0) {
                 ++nc;
                 ++nf[plan_side_[k]];
             }
         }
-        fprintf(stderr, "[hybrid-plan] k0=%d chunks=%d frames cpu=%d gpu=%d "
-                "(share=%.2f)\n", k0, nc, nf[0], nf[1], cpu_share);
+        fprintf(stderr, "[hybrid-plan] k0=%d..%d chunks=%d frames cpu=%d gpu=%d "
+                "(share=%.2f rebuilds=%lld)\n", k0, k_end, nc, nf[0], nf[1],
+                cpu_share, (long long)plan_rebuilds_.load(std::memory_order_relaxed));
     }
-}
-
-void HybridThreadedDecoder::MaybeReplan(int64_t key_pts) {
-    // 计划重规划（opt-in）：water-filling 计划在首个 keyframe 冻结后就不再变，
-    // 而运行中的实测速率会漂（热降/后台占用/核数格局/素材相位差）。实测证据：
-    // 用"上一次运行"的速率播种会在 w=3000 上倒亏 8.5% ⇒ 冻结错速率比的代价真实。
-    // 这里让计划在**漂移显著**时按当前实测重建，并带迟滞避免反复重排。
-    static const double thr_pct = [] {
-        const char *e = getenv("DECORD_HYBRID_REPLAN_PCT");
-        return e ? atof(e) : 0.0;        // 未设 = 关闭（铁律 10：新功能默认关）
-    }();
-    if (thr_pct <= 0.0 || !plan_ready_) return;
-    static const int64_t gap = [] {
-        const char *e = getenv("DECORD_HYBRID_REPLAN_GAP");
-        const int64_t v = e ? atoll(e) : 8;
-        return v > 0 ? v : 8;
-    }();
-    if (chunks_since_replan_ < gap) { ++chunks_since_replan_; return; }
-    const double rc_now = cpu_.ProductionRate();
-    const double rg_now = gpu_rate_landed_.load(std::memory_order_relaxed);
-    const double rc_plan = static_cast<double>(plan_rc_.load(std::memory_order_relaxed));
-    const double rg_plan = static_cast<double>(plan_rg_.load(std::memory_order_relaxed));
-    if (rc_now <= 0.0 || rg_now <= 0.0 || rc_plan <= 0.0 || rg_plan <= 0.0) return;
-    const double d_c = std::fabs(rc_now - rc_plan) / rc_plan;
-    const double d_g = std::fabs(rg_now - rg_plan) / rg_plan;
-    if (d_c < thr_pct / 100.0 && d_g < thr_pct / 100.0) return;
-    const double f_now = rc_now / (rc_now + rg_now);
-    if (!(f_now > 0.0 && f_now < 1.0)) return;
-    if (getenv("DECORD_HYBRID_DEBUG")) {
-        fprintf(stderr, "[hybrid-replan] key=%lld rc %.0f->%.0f rg %.0f->%.0f "
-                "(d=%.0f%%/%.0f%%) share->%.2f\n",
-                (long long)key_pts, rc_plan, rc_now, rg_plan, rg_now,
-                d_c * 100.0, d_g * 100.0, f_now);
-    }
-    BuildPlan(key_pts, f_now);
-    chunks_since_replan_ = 0;
 }
 
 HybridThreadedDecoder::Side HybridThreadedDecoder::ForcedSide() const {
@@ -889,17 +892,20 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // rc）。该 chunk 与 chunk0 的 GPU 发射重叠，且 GPU-first 下盲决策全落
     // GPU，采样安全（旧版曾因水位门控屏蔽速率学习把整条流钉死 CPU）。
     if (rate[SIDE_CPU] <= 0) {
-        if (getenv("DECORD_HYBRID_DEBUG")) {
-            fprintf(stderr, "[hybrid-sched] t=%.3f key=%lld rc-unknown -> CPU-sample\n",
-                    std::chrono::duration<double>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count(),
-                    (long long)key_pts);
-        }
         // 2026-09-13 修正：只采样**一个** CPU chunk，其后立即回 GPU 直供，
         // 直到 rc 学到为止。原先无条件 return SIDE_CPU 会让盲阶段连续两块
         // 压在慢腿上（实测 hevc：chunk1/chunk2 均判 CPU，plan 直到 k0=3 才
         // 建立），交付严格保序 => 队头被慢腿串行占住，短片启动摊销约 0.5s。
-        return chunks_assigned_[SIDE_CPU] == 0 ? SIDE_CPU : SIDE_GPU;
+        const Side blind_pick =
+            chunks_assigned_[SIDE_CPU] == 0 ? SIDE_CPU : SIDE_GPU;
+        if (getenv("DECORD_HYBRID_DEBUG")) {
+            fprintf(stderr, "[hybrid-sched] t=%.3f key=%lld rc-unknown -> %d%s\n",
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count(),
+                    (long long)key_pts, (int)blind_pick,
+                    blind_pick == SIDE_CPU ? " (CPU-sample)" : "");
+        }
+        return blind_pick;
     }
     if (rate[SIDE_GPU] <= 0) {
         // rg 未学得（决策跑在解码前面，NVDEC 落地慢一拍）：交替试探，
@@ -981,13 +987,31 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
         if (fs_env > 0) f = fs_env;
         BuildPlan(key_pts, f);
     }
-    // 预路由查表：规划覆盖的 chunk 直接返回（绕过 pending/迟滞策略）
+    // 预路由查表：规划覆盖的 chunk 直接返回（绕过 pending/迟滞策略）。
+    // 视界滑动：demux 走到 plan_end_k_（越过末已规划 chunk）时以当前
+    // 实测速率重建 —— 取代旧的 MaybeReplan（速率漂移触发、opt-in）：
+    // 漂移触发被 h264 证伪（混跑实测速率含自我争用，rc 下沉会把份额
+    // 错推向 GPU，+1.11% 真回归）；视界重建不判漂移方向，只按节奏
+    // 用成熟速率重排未路由尾部，两个方向的失真都收敛。
     if (plan_ready_) {
         auto pit = std::lower_bound(kf_pts_.begin(), kf_pts_.end(), key_pts);
         if (pit != kf_pts_.end() && *pit == key_pts) {
             int k = static_cast<int>(pit - kf_pts_.begin());
+            if (k < static_cast<int>(plan_side_.size())
+                    && plan_side_[k] < 0 && k >= plan_end_k_) {
+                // f = CPU 份额水位：默认按当前速率比，env 可覆盖（同首建）
+                double f = rate[SIDE_CPU]
+                    / std::max(rate[SIDE_CPU] + rate[SIDE_GPU], 1.0);
+                static const double fs_env = [] {
+                    const char *e = getenv("DECORD_HYBRID_FORCE_SHARE");
+                    if (!e) return -1.0;
+                    double v = atof(e);
+                    return (v > 0.0 && v < 1.0) ? v : -1.0;
+                }();
+                if (fs_env > 0) f = fs_env;
+                BuildPlan(key_pts, f);
+            }
             if (k < static_cast<int>(plan_side_.size()) && plan_side_[k] >= 0) {
-                MaybeReplan(key_pts);        // opt-in：速率漂移显著时重建计划
                 Side s = static_cast<Side>(plan_side_[k]);
                 if (getenv("DECORD_HYBRID_DEBUG")) {
                     fprintf(stderr, "[hybrid-sched] plan key=%lld k=%d -> %d\n",
