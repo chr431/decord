@@ -561,7 +561,9 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::atomic<int64_t> up_flush_n_{0}, up_flush_f_{0};  ///< UploadStep 批次数 / 批内帧数
     std::atomic<int64_t> up_nobuf_{0}, up_cempty_{0};     ///< 池尽 / CPU 断流提前冲刷
     std::atomic<int64_t> kicks_[2]{};                     ///< 各侧收到的 kick 冲刷包数
-    std::atomic<int64_t> fb_clones_{};                    ///< 反馈式清偿累计克隆包数
+    std::atomic<int64_t> fb_clones_{};
+    std::atomic<int64_t> late_feeds_{0};  ///< 迟到包直供次数（GOP 已供完后到达）
+    std::atomic<int64_t> strag_total_{0};  ///< 迟到包挂 straggler 列表总次数                    ///< 反馈式清偿累计克隆包数
     std::atomic<int64_t> stats_t0_us_{0};                 ///< Push 首包时刻（steady epoch µs）
 };
 

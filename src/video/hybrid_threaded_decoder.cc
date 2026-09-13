@@ -730,10 +730,12 @@ void HybridThreadedDecoder::Stop() {
                 (long long)kicks_[0].load(), (long long)kicks_[1].load(),
                 (long long)fb_clones_.load());
         fprintf(stderr,
-                "[hybrid-stats] disp gops c=%d g=%d cache_peak=%zuMB rc_now=%.0f"
+                "[hybrid-stats] disp gops c=%d g=%d cache_peak=%zuMB late=%lld strag=%lld rc_now=%.0f"
                 " rg_now=%.0f assigned c=%lld g=%lld\n",
                 chunks_assigned_[0], chunks_assigned_[1],
                 cache_peak_bytes_ >> 20,
+                (long long)late_feeds_.load(std::memory_order_relaxed),
+                (long long)strag_total_.load(std::memory_order_relaxed),
                 cpu_.ProductionRate(),
                 gpu_rate_landed_.load(std::memory_order_relaxed),
                 (long long)assigned_frames_[0], (long long)assigned_frames_[1]);
@@ -1131,24 +1133,16 @@ void HybridThreadedDecoder::PumpFeed() {
                     if (g.side != last_fed_side_ && last_fed_side_ != Side(-1)
                             && IsIdrLikeCodec()) {
                         // 换侧 kick：克隆本 GOP 首包（此刻必在缓存，未供）
+                        // ⚠️ kick 一律挂起、由泵在流序位置注入（分配时
+                        // 即发/游标触发都会在前瞻供料下落到离场侧队列尾
+                        // = IDR 重置错位 → cuvid 冲掉被打断 GOP 的在途
+                        // 重排窗（引擎时序下 ~50 帧遮蔽损坏 → 段数漂移
+                        // 8340→8346/8353/8371；fork 均匀消费不触发故
+                        // 逐帧 hash 全绿——"解码器完美但段数漂移"的谜底）。
                         ffmpeg::AVPacketPtr kp = CloneCachePacket(g.pkt_begin);
-                        if (kp) {
-                            const GopRec &prev = gops_[k - 1];
-                            const int64_t pae = prev.closed ? prev.pkt_end
-                                                            : cache_seq_;
-                            const bool prev_partial = prev.fed_upto < pae
-                                || (prev.closed && prev.straggler_idx
-                                       < static_cast<int64_t>(prev.stragglers.size()));
-                            if (prev_partial) {
-                                if (pending_kicks_.size() < 8) {
-                                    pending_kicks_.push_back(PendingKick{
-                                        std::move(kp), last_fed_side_, k - 1});
-                                }
-                            } else {
-                                arm_kick = true;
-                                kick_dst = last_fed_side_;
-                                kick_pkt = std::move(kp);
-                            }
+                        if (kp && pending_kicks_.size() < 8) {
+                            pending_kicks_.push_back(PendingKick{
+                                std::move(kp), last_fed_side_, k - 1});
                         }
                     }
                     last_fed_side_ = g.side;
@@ -1166,19 +1160,6 @@ void HybridThreadedDecoder::PumpFeed() {
                 }
                 gi = k;
                 break;
-            }
-            // 延迟 kick 冲刷：触发 GOP 已被游标越过 → 本轮发出
-            for (auto it = pending_kicks_.begin();
-                 it != pending_kicks_.end(); ) {
-                if (feed_gop_idx_ > it->after_gop) {
-                    ++side_pending_[it->dst];
-                    if (it->dst == SIDE_GPU) ++gpu_pending_;
-                    kicks_to_send.emplace_back(it->dst, std::move(it->pkt));
-                    kicks_[it->dst].fetch_add(1, std::memory_order_relaxed);
-                    it = pending_kicks_.erase(it);
-                } else {
-                    ++it;
-                }
             }
             if (gi < 0) {
                 // 3. 无可供工作：EOF 且全部供完 → 置排空标记（锁外发送）
@@ -1203,10 +1184,28 @@ void HybridThreadedDecoder::PumpFeed() {
                 pkt = std::move(g.stragglers[g.straggler_idx++]);
                 is_key = false;
             }
-            if (arm_kick) {
-                // kick 包记账先于本包（旧路径语义）
-                ++side_pending_[kick_dst];
-                if (kick_dst == SIDE_GPU) ++gpu_pending_;
+            // kick 泵注入：本包是 dst 侧在 after_gop 之后的首个被供
+            // GOP 主区间首包 → kick 先发（记账锁内、推包锁外）。位置 =
+            // K-1 末包之后、后续 GOP 之前——与 main 的流内 kick 等价。
+            if (g.fed_upto == g.pkt_begin + 1) {   // 刚取的是主区间首包
+                static const bool koff = [] {
+                    const char *e = getenv("DECORD_HYBRID_KICK_OFF");
+                    return e != nullptr && atoi(e) > 0;
+                }();
+                if (!koff) {
+                    for (auto it = pending_kicks_.begin();
+                         it != pending_kicks_.end(); ) {
+                        if (it->dst == s && g.id > it->after_gop) {
+                            ++side_pending_[s];
+                            if (s == SIDE_GPU) ++gpu_pending_;
+                            kicks_[s].fetch_add(1, std::memory_order_relaxed);
+                            kicks_to_send.emplace_back(s, std::move(it->pkt));
+                            it = pending_kicks_.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
             }
             ++side_pending_[s];
             if (s == SIDE_GPU) ++gpu_pending_;
@@ -1233,18 +1232,10 @@ void HybridThreadedDecoder::PumpFeed() {
             }
         }  // ~lock
         if (!pkt) break;   // 防御（不应发生）
-        if (arm_kick && kick_pkt) {
-            // 记账已在锁内（arm_kick 分支）
-            if (kick_dst == SIDE_CPU) {
-                cpu_.Push(std::move(kick_pkt), runtime::NDArray());
-            } else {
-#ifdef DECORD_USE_CUDA
-                std::lock_guard<std::mutex> lk(lcv_mtx_);
-                gpu_pkt_q_.push_back(std::move(kick_pkt));
-                lcv_.notify_all();
-#endif
-            }
-        }
+        static const bool kick_off = [] {
+            const char *e = getenv("DECORD_HYBRID_KICK_OFF");
+            return e != nullptr && atoi(e) > 0;
+        }();
         for (auto &ks : kicks_to_send) {
             if (ks.first == SIDE_CPU) {
                 cpu_.Push(std::move(ks.second), runtime::NDArray());
@@ -1302,10 +1293,33 @@ void HybridThreadedDecoder::PumpFeed() {
     }
     // EOF 排空标记（锁外发送，一次）
     bool send_flush = false;
+    std::vector<std::pair<Side, ffmpeg::AVPacketPtr>> eof_kicks;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         send_flush = arm_flush_sent_ && !eof_flush_out_;
-        if (send_flush) eof_flush_out_ = true;
+        if (send_flush) {
+            eof_flush_out_ = true;
+            // EOF 兜底：未注入的 kick 全发（IDR 重置冲刷离场侧尾帧）
+            for (auto it = pending_kicks_.begin();
+                 it != pending_kicks_.end(); ) {
+                ++side_pending_[it->dst];
+                if (it->dst == SIDE_GPU) ++gpu_pending_;
+                kicks_[it->dst].fetch_add(1, std::memory_order_relaxed);
+                eof_kicks.emplace_back(it->dst, std::move(it->pkt));
+                it = pending_kicks_.erase(it);
+            }
+        }
+    }
+    for (auto &ks : eof_kicks) {
+        if (ks.first == SIDE_CPU) {
+            cpu_.Push(std::move(ks.second), runtime::NDArray());
+        } else {
+#ifdef DECORD_USE_CUDA
+            std::lock_guard<std::mutex> lk(lcv_mtx_);
+            gpu_pkt_q_.push_back(std::move(ks.second));
+            lcv_.notify_all();
+#endif
+        }
     }
     if (send_flush) {
         cpu_.Push(nullptr, runtime::NDArray());
@@ -1386,6 +1400,7 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                 if (own) {
                     if (own->fed_upto >= (own->closed ? own->pkt_end
                                                       : cache_seq_)) {
+                        late_feeds_.fetch_add(1, std::memory_order_relaxed);
                         const Side s2 = own->side;
                         if (s2 != Side(-1)) {
                             ++side_pending_[s2];
@@ -1402,6 +1417,7 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                         }
                     } else {
                         own->stragglers.push_back(std::move(pkt));
+                        strag_total_.fetch_add(1, std::memory_order_relaxed);
                         stashed = true;
                     }
                 }
