@@ -485,6 +485,20 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool eof_cache_ = false;       ///< demux EOF 已入缓
     bool arm_flush_sent_ = false;  ///< EOF 后排空标记已发（幂等）
     void PumpFeed();               ///< 供料泵（仅 Push 调用线程=demux 执行）
+    // ── 层2/3 亲和分区（env 门控，默认关）────────────────────────────
+    // 两组掩码：decode（ffmpeg 帧线程，物理核×N 的 SMT 对）与 service
+    //（喂料/落地/上载/消费/OCR 宿主线程）。动机：混跑干扰税实测 CPU 臂
+    // busy-rate −15~17%（32T 与服务线程抢 SMT/LLC，线程档扫描证明加/
+    // 减线程无解，需空间分区）。DECORD_HYBRID_DECODE_CORES=N（物理核数，
+    // 0=关）；存量线程在 Start() 时归 service（除已被钉为 decode 的）。
+    void InitAffinityMasks();      ///< 拓扑感知计算 decode/service 掩码
+    void PinFfmpegThreads();       ///< avcodec_open2 前后快照差分
+    void PinRemainingToService();  ///< Start() 时存量 + 本类服务线程
+    uintptr_t decode_mask_ = 0;
+    uintptr_t service_mask_ = 0;
+    bool affinity_on_ = false;
+    std::vector<unsigned long> decode_tids_;  ///< 已钉 decode 的线程 id
+    std::vector<unsigned long> aff_baseline_; ///< avcodec_open2 前的线程快照
     /*! \brief 从缓存克隆一个包（供 kick 用；越界/已回收返回空） */
     ffmpeg::AVPacketPtr CloneCachePacket(int64_t seq);
     /*! \brief 延迟 kick：换侧时离场侧当前 GOP 未供完 → 克隆包挂起，

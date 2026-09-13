@@ -66,12 +66,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace decord {
 
 namespace {
 /*! 调度粘性：同侧最少连续分配的 chunk 数（块状分配，防流水线冷启动） */
 constexpr int kStickyMinChunks = 4;
+#if defined(_WIN32)
+std::vector<unsigned long> SnapshotThreads();   // 定义见亲和分区节
+bool SetThreadAffinity(unsigned long tid, uintptr_t mask);
+#endif
 }  // namespace
 
 HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
@@ -385,7 +390,14 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
     // 深存货队列：CPU chunk 的发射靠 cpu_ready_/cpu_ 内部存货瞬时完成，
     // 默认 32 帧背压会让每个 CPU chunk 退化为实时跟随解码（hevc 0.70x）。
     cpu_.SetQueueDepth(queue_frames_);  // 存货深度与 prefetch 匹配（~1.2GB RAM@1080p）
+#if defined(_WIN32)
+    InitAffinityMasks();
+    if (affinity_on_) aff_baseline_ = SnapshotThreads();
+#endif
     cpu_.SetCodecContext(dec_ctx, width, height, rotation, output_format);
+#if defined(_WIN32)
+    PinFfmpegThreads();
+#endif
 #ifdef DECORD_USE_CUDA
     if (gpu_) {
         // GPU 子解码器需要自己的 AVCodecContext（CUThreadedDecoder 的
@@ -584,6 +596,10 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
 
 void HybridThreadedDecoder::Start() {
     started_.store(true);
+#if defined(_WIN32)
+    std::vector<unsigned long> pre_tids;
+    if (affinity_on_) pre_tids = SnapshotThreads();
+#endif
     cpu_.Start();
 #ifdef DECORD_USE_CUDA
     if (gpu_) gpu_->Start();
@@ -606,6 +622,34 @@ void HybridThreadedDecoder::Start() {
             std::thread u(&HybridThreadedDecoder::UploaderLoop, this);
             uploader_ = std::move(u);
         }
+    }
+#endif
+#if defined(_WIN32)
+    if (affinity_on_) {
+        // 差分本轮新增线程：lander/uploader → service；其余新增（cpu_
+        // 解码 worker / filter worker）→ decode。此前直接把存量+新增
+        // 全归 service，把 cpu_ worker 也钉去服务核 → CPU 臂饿死。
+        const unsigned long lander_tid = lander_.joinable()
+            ? GetThreadId(lander_.native_handle()) : 0;
+        const unsigned long uploader_tid = uploader_.joinable()
+            ? GetThreadId(uploader_.native_handle()) : 0;
+        auto after = SnapshotThreads();
+        std::sort(after.begin(), after.end());
+        std::sort(pre_tids.begin(), pre_tids.end());
+        std::vector<unsigned long> added;
+        std::set_difference(after.begin(), after.end(),
+                            pre_tids.begin(), pre_tids.end(),
+                            std::back_inserter(added));
+        for (DWORD tid : added) {
+            if (tid == lander_tid || tid == uploader_tid) {
+                SetThreadAffinity(tid, service_mask_);
+            } else {
+                if (SetThreadAffinity(tid, decode_mask_)) {
+                    decode_tids_.push_back(tid);
+                }
+            }
+        }
+        PinRemainingToService();   // 存量（python/TRT/引擎）
     }
 #endif
 }
@@ -856,6 +900,136 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
     return (static_cast<double>(assigned_frames_[SIDE_CPU]) * (1.0 - f)
             <= static_cast<double>(assigned_frames_[SIDE_GPU]) * f)
                ? SIDE_CPU : SIDE_GPU;
+}
+
+#if defined(_WIN32)
+#include <tlhelp32.h>
+namespace {
+std::vector<unsigned long> SnapshotThreads() {
+    std::vector<unsigned long> out;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return out;
+    THREADENTRY32 te{}; te.dwSize = sizeof(te);
+    DWORD pid = GetCurrentProcessId();
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid && te.th32ThreadID != 0) {
+                out.push_back(te.th32ThreadID);
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return out;
+}
+bool SetThreadAffinity(DWORD tid, uintptr_t mask) {
+    HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
+                          FALSE, tid);
+    if (!h) return false;
+    BOOL ok = SetThreadAffinityMask(h, static_cast<DWORD_PTR>(mask));
+    CloseHandle(h);
+    return ok != FALSE;
+}
+}  // namespace
+#endif  // _WIN32
+
+void HybridThreadedDecoder::InitAffinityMasks() {
+#if defined(_WIN32)
+    // env：DECORD_HYBRID_DECODE_CORES=物理核数（0/未设=关；-1=默认
+    // total-3）。仅在单 processor group（逻辑核 ≤64）平台生效。
+    int want = 0;
+    if (const char *e = getenv("DECORD_HYBRID_DECODE_CORES")) want = atoi(e);
+    if (want == 0) return;   // 未设/0 = 关（引擎在 TRT 路径显式开）
+    if (want < 0) want = -1;  // -1 = 默认 total-3 分区
+    DWORD need = 0;
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &need)
+            && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        return;
+    }
+    std::vector<char> buf(need);
+    if (!GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()),
+            &need)) {
+        return;
+    }
+    std::vector<uintptr_t> core_masks;   // 每物理核的 SMT 掩码
+    size_t off = 0;
+    while (off < need) {
+        auto *pi = reinterpret_cast<
+            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
+        if (pi->Relationship == RelationProcessorCore) {
+            uintptr_t m = 0;
+            for (WORD g = 0; g < pi->Processor.GroupCount; ++g) {
+                if (pi->Processor.GroupMask[g].Group == 0) {
+                    m |= static_cast<uintptr_t>(
+                        pi->Processor.GroupMask[g].Mask);
+                }
+            }
+            if (m) core_masks.push_back(m);
+        }
+        off += pi->Size;
+    }
+    if (core_masks.empty()) return;
+    const int total = static_cast<int>(core_masks.size());
+    int ndec = want > 0 ? want : (total - 3);
+    if (ndec < 2) ndec = 2;
+    if (ndec > total - 1) ndec = total - 1;   // service 至少 1 物理核
+    uintptr_t dm = 0, sm = 0;
+    for (int i = 0; i < total; ++i) {
+        if (i < ndec) dm |= core_masks[i]; else sm |= core_masks[i];
+    }
+    if (!dm || !sm) return;
+    decode_mask_ = dm;
+    service_mask_ = sm;
+    affinity_on_ = true;
+    if (getenv("DECORD_HYBRID_DEBUG")) {
+        fprintf(stderr, "[hybrid-affinity] phys=%d decode=%llu service=%llu\n",
+                total, (unsigned long long)dm, (unsigned long long)sm);
+    }
+#endif
+}
+
+void HybridThreadedDecoder::PinFfmpegThreads() {
+#if defined(_WIN32)
+    if (!affinity_on_) return;
+    auto after = SnapshotThreads();
+    std::sort(after.begin(), after.end());
+    std::vector<unsigned long> added;
+    std::set_difference(after.begin(), after.end(),
+                        aff_baseline_.begin(), aff_baseline_.end(),
+                        std::back_inserter(added));
+    int pinned = 0;
+    for (DWORD tid : added) {
+        if (SetThreadAffinity(tid, decode_mask_)) {
+            decode_tids_.push_back(tid);
+            ++pinned;
+        }
+    }
+    if (getenv("DECORD_HYBRID_DEBUG")) {
+        fprintf(stderr, "[hybrid-affinity] pinned %d ffmpeg threads to decode set\n",
+                pinned);
+    }
+#endif
+}
+
+void HybridThreadedDecoder::PinRemainingToService() {
+#if defined(_WIN32)
+    if (!affinity_on_) return;
+    std::sort(decode_tids_.begin(), decode_tids_.end());
+    auto all = SnapshotThreads();
+    std::sort(all.begin(), all.end());
+    std::vector<unsigned long> others;
+    std::set_difference(all.begin(), all.end(),
+                        decode_tids_.begin(), decode_tids_.end(),
+                        std::back_inserter(others));
+    int pinned = 0;
+    for (DWORD tid : others) {
+        if (SetThreadAffinity(tid, service_mask_)) ++pinned;
+    }
+    if (getenv("DECORD_HYBRID_DEBUG")) {
+        fprintf(stderr, "[hybrid-affinity] %d threads -> service set\n", pinned);
+    }
+#endif
 }
 
 ffmpeg::AVPacketPtr HybridThreadedDecoder::CloneCachePacket(int64_t seq) {
