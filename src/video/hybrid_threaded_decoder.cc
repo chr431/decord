@@ -852,15 +852,11 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
         const Side f = ForcedSide();
         if (f != Side(-1)) return f;
     }
-    // AV1（非 IDR 语义）：默认恒 GPU——引擎 A/B 实测 CPU 混跑 +2.2% 真回归
-    //（7/8 符号）。DECORD_HYBRID_AV1_CPU=1 可重开混跑（复评用）。
-    if (!IsIdrLikeCodec()) {
-        static const bool av1_cpu = [] {
-            const char *e = getenv("DECORD_HYBRID_AV1_CPU");
-            return e != nullptr && atoi(e) > 0;
-        }();
-        if (!av1_cpu) return SIDE_GPU;
-    }
+    // AV1（非 IDR 语义）：CPU 混跑保留（默认开）。⚠️ 2026-09-14 二次实测
+    // 否决了"GPU-only 修回归"的尝试：GPU-only = 15.1s（纯 NVDEC 水平，
+    // +54% 大回归）——main 的 av1 快**正因为** CPU 混跑（引擎 10.6 vs 纯
+    // NVDEC 15.2）；+2.2% 小回归另有原因（份额/切换模式差异，未归因）。
+    // DECORD_HYBRID_AV1_CPU=0 可关混跑（复评用）。
     if (eof_cache_ && gop_seq_ - feed_gop_idx_ <= 4) {
         return side_pending_[SIDE_CPU] <= side_pending_[SIDE_GPU]
                    ? SIDE_CPU : SIDE_GPU;
