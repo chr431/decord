@@ -851,7 +851,11 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
                         std::chrono::steady_clock::now().time_since_epoch()).count(),
                     (long long)key_pts);
         }
-        return SIDE_CPU;
+        // 2026-09-13 修正：只采样**一个** CPU chunk，其后立即回 GPU 直供，
+        // 直到 rc 学到为止。原先无条件 return SIDE_CPU 会让盲阶段连续两块
+        // 压在慢腿上（实测 hevc：chunk1/chunk2 均判 CPU，plan 直到 k0=3 才
+        // 建立），交付严格保序 => 队头被慢腿串行占住，短片启动摊销约 0.5s。
+        return chunks_assigned_[SIDE_CPU] == 0 ? SIDE_CPU : SIDE_GPU;
     }
     if (rate[SIDE_GPU] <= 0) {
         // rg 未学得（决策跑在解码前面，NVDEC 落地慢一拍）：交替试探，
