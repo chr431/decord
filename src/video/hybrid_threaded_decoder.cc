@@ -852,9 +852,15 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
         const Side f = ForcedSide();
         if (f != Side(-1)) return f;
     }
-    // AV1（非 IDR 语义）：允许 CPU 混跑（keyframe 仍是随机访问点），但
-    // kick 不武装（IsIdrLikeCodec 门控在 kick 处）——show_existing 的输出
-    // pts 回落靠陈旧丢弃 + force-close 安全网兜底（旧设计同款取舍）。
+    // AV1（非 IDR 语义）：默认恒 GPU——引擎 A/B 实测 CPU 混跑 +2.2% 真回归
+    //（7/8 符号）。DECORD_HYBRID_AV1_CPU=1 可重开混跑（复评用）。
+    if (!IsIdrLikeCodec()) {
+        static const bool av1_cpu = [] {
+            const char *e = getenv("DECORD_HYBRID_AV1_CPU");
+            return e != nullptr && atoi(e) > 0;
+        }();
+        if (!av1_cpu) return SIDE_GPU;
+    }
     if (eof_cache_ && gop_seq_ - feed_gop_idx_ <= 4) {
         return side_pending_[SIDE_CPU] <= side_pending_[SIDE_GPU]
                    ? SIDE_CPU : SIDE_GPU;
