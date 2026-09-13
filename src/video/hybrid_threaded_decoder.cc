@@ -771,8 +771,14 @@ void HybridThreadedDecoder::BuildPlan(int64_t key_pts, double cpu_share) {
             n = k > k0 ? (kf_rank_[k] - kf_rank_[k - 1])
                        : (est_chunk_frames_ > 0 ? est_chunk_frames_ : 200);
         }
-        Side s = (static_cast<double>(ac) * rg
-                  <= static_cast<double>(ag) * rc) ? SIDE_CPU : SIDE_GPU;
+        // 份额水位（2026-09-13 修）：改用调用方给的 cpu_share 作水位，使
+        // DECORD_HYBRID_FORCE_SHARE 真正生效（此前 cpu_share 只被打印，分配
+        // 恒按 rc/rg ⇒ 份额扫描扫到的是噪声）。f = rc/(rc+rg) 时与旧式
+        // `ac*rg <= ag*rc` 代数等价，故默认分配不变：
+        //   ac/(ac+ag) <= f  ⟺  ac*(1-f) <= ag*f
+        const double _f = std::min(std::max(cpu_share, 0.0), 1.0);
+        Side s = (static_cast<double>(ac) * (1.0 - _f)
+                  <= static_cast<double>(ag) * _f) ? SIDE_CPU : SIDE_GPU;
         if (forced != Side(-1)) s = forced;
         plan_side_[k] = static_cast<int>(s);
         (s == SIDE_CPU ? ac : ag) += n;
@@ -926,6 +932,7 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ChooseSide(int64_t key_pts) {
     // KICK_BURST）：24/24 慢消费者压测 + 引擎金标 28/28 + 全片 e2e
     // hevc −24%（配对 3 遍，sustained 转默认的依据，见 threaded_decoder.h）。
     if (sched_initialized_ && !plan_ready_) {
+        // f = CPU 份额水位：默认按速率比（与旧水位等价），env 可覆盖
         double f = rate[SIDE_CPU] / std::max(rate[SIDE_CPU] + rate[SIDE_GPU], 1.0);
         static const double fs_env = [] {
             const char *e = getenv("DECORD_HYBRID_FORCE_SHARE");
