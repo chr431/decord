@@ -485,6 +485,17 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool eof_cache_ = false;       ///< demux EOF 已入缓
     bool arm_flush_sent_ = false;  ///< EOF 后排空标记已发（幂等）
     void PumpFeed();               ///< 供料泵（仅 Push 调用线程=demux 执行）
+    /*! \brief 从缓存克隆一个包（供 kick 用；越界/已回收返回空） */
+    ffmpeg::AVPacketPtr CloneCachePacket(int64_t seq);
+    /*! \brief 延迟 kick：换侧时离场侧当前 GOP 未供完 → 克隆包挂起，
+     *  待触发 GOP 供完（游标越过）再发——kick 抢先插入会打乱同侧流序
+     * （ffmpeg RPS 丢帧 → pending 泄漏挂死，实测 hevc 15k 帧）。 */
+    struct PendingKick {
+        ffmpeg::AVPacketPtr pkt;
+        Side dst;
+        int64_t after_gop;   ///< 该 GOP 供完（游标越过）才发送
+    };
+    std::vector<PendingKick> pending_kicks_;
     /*! \brief 供料侧选择：供水式贪心（累计分账水位）+ 尾部最少积压。
      *  f = rc/(rc+rg)（当前 EWMA，FORCE_SHARE 可覆盖）；rc 未学得时
      *  用启动启发（gop0 GPU / gop1 CPU 采样）。非 IDR 编码恒 GPU。 */

@@ -858,6 +858,16 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
                ? SIDE_CPU : SIDE_GPU;
 }
 
+ffmpeg::AVPacketPtr HybridThreadedDecoder::CloneCachePacket(int64_t seq) {
+    // 仅 Push/泵线程（持 mtx_ 的调用方）使用
+    if (seq < cache_base_seq_ || seq >= cache_seq_) return nullptr;
+    const auto &src = pkt_cache_[seq - cache_base_seq_];
+    if (!src) return nullptr;
+    AVPacket *c = av_packet_clone(src.get());
+    if (!c) return nullptr;
+    return ffmpeg::AVPacketPtr(c, [](AVPacket *p) { av_packet_free(&p); });
+}
+
 void HybridThreadedDecoder::PumpFeed() {
     // 供料泵（层0/1 重设计核心）：Push 只入缓存，这里在**分配时点**把
     // 包喂给臂。仅 Push 调用线程（VideoReader 单线程 demux）执行，
@@ -878,8 +888,10 @@ void HybridThreadedDecoder::PumpFeed() {
         bool is_key = false;
         bool arm_kick = false;
         Side kick_dst = SIDE_CPU;
+        ffmpeg::AVPacketPtr kick_pkt;   // 即发 kick 的克隆包（扫描时备好）
         bool clone_debt = false;
         Side debt_dst = SIDE_CPU;
+        std::vector<std::pair<Side, ffmpeg::AVPacketPtr>> kicks_to_send;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             // 1. 跳过已供完的 GOP。⚠️ 开放 GOP（未关闭）即使瞬时供完也
@@ -894,46 +906,102 @@ void HybridThreadedDecoder::PumpFeed() {
                 }
                 ++feed_gop_idx_;
             }
-            // 2. 严格游标序：只处理 cursor GOP
+            // 2. 供料扫描：cursor 起、**同侧保序**的前瞻供料。
+            // · 分配（供水式贪心）按扫描序 = 流序推进；
+            // · 同侧乱序禁止（解码器流内序）；跨侧前瞻合法——严格序曾
+            //   实测把混跑打回"交替串行"（h264 两臂各闲 26~33%）；
+            // · kick（换侧 IDR 克隆）延迟化：换侧时离场侧的当前 GOP
+            //   未供完 → 克隆包挂起（pending_kicks_），游标越过该 GOP
+            //   再发。kick 抢先插入会打乱同侧流序（RPS 丢帧 → pending
+            //   泄漏挂死，实测 "Could not find ref with POC"）。
             int64_t gi = -1;
+            bool earlier_pending[2] = {false, false};
             if (feed_gop_idx_ < static_cast<int64_t>(gops_.size())) {
-                GopRec &g = gops_[feed_gop_idx_];
+                const GopRec &gc = gops_[feed_gop_idx_];
+                if (gc.side != Side(-1)) {
+                    const int64_t ae = gc.closed ? gc.pkt_end : cache_seq_;
+                    const bool partial = gc.fed_upto < ae
+                        || (gc.closed && gc.straggler_idx
+                                       < static_cast<int64_t>(gc.stragglers.size()));
+                    if (partial) earlier_pending[(int)gc.side] = true;
+                }
+            }
+            for (int64_t k = feed_gop_idx_;
+                 k < static_cast<int64_t>(gops_.size()); ++k) {
+                GopRec &g = gops_[k];
                 const int64_t avail_end = g.closed ? g.pkt_end : cache_seq_;
                 const bool has_pkt = g.fed_upto < avail_end
                     || (g.closed && g.straggler_idx
                                     < static_cast<int64_t>(g.stragglers.size()));
-                if (has_pkt) {
-                    if (g.side == Side(-1)) {
-                        g.side = PickFeedSide();
-                        for (Chunk &c : emit_queue_) {
-                            if (c.id == g.id) {
-                                c.side = g.side;
-                                if (c.expected > 0 && !g.counted) {
-                                    assigned_frames_[g.side] += c.expected;
-                                    g.counted = true;
+                if (k > feed_gop_idx_ && g.side != Side(-1)
+                        && earlier_pending[(int)g.side]) {
+                    continue;   // 同侧序约束（只约束游标之后的 GOP——
+                                // 游标自身是最早，永不被自己的阻断跳过）
+                }
+                if (g.side == Side(-1)) {
+                    if (!has_pkt) continue;   // 未开 GOP 无包不分配
+                    g.side = PickFeedSide();
+                    for (Chunk &c : emit_queue_) {
+                        if (c.id == g.id) {
+                            c.side = g.side;
+                            if (c.expected > 0 && !g.counted) {
+                                assigned_frames_[g.side] += c.expected;
+                                g.counted = true;
+                            }
+                            break;
+                        }
+                    }
+                    ++chunks_assigned_[g.side];
+                    if (g.side != last_fed_side_ && last_fed_side_ != Side(-1)
+                            && IsIdrLikeCodec()) {
+                        // 换侧 kick：克隆本 GOP 首包（此刻必在缓存，未供）
+                        ffmpeg::AVPacketPtr kp = CloneCachePacket(g.pkt_begin);
+                        if (kp) {
+                            const GopRec &prev = gops_[k - 1];
+                            const int64_t pae = prev.closed ? prev.pkt_end
+                                                            : cache_seq_;
+                            const bool prev_partial = prev.fed_upto < pae
+                                || (prev.closed && prev.straggler_idx
+                                       < static_cast<int64_t>(prev.stragglers.size()));
+                            if (prev_partial) {
+                                if (pending_kicks_.size() < 8) {
+                                    pending_kicks_.push_back(PendingKick{
+                                        std::move(kp), last_fed_side_, k - 1});
                                 }
-                                break;
+                            } else {
+                                arm_kick = true;
+                                kick_dst = last_fed_side_;
+                                kick_pkt = std::move(kp);
                             }
                         }
-                        ++chunks_assigned_[g.side];
-                        // 跨侧判定在**分配时**做（严格序下分配序=供料序；
-                        // last_fed_side_ 恒更新——只在 kick 分支更新会让它
-                        // 永停 -1，零 kick）
-                        if (g.side != last_fed_side_ && last_fed_side_ != Side(-1)
-                                && IsIdrLikeCodec()) {
-                            arm_kick = true;
-                            kick_dst = last_fed_side_;
-                        }
-                        last_fed_side_ = g.side;
                     }
-                    bool hungry = true;
-                    if (!eof_cache_) {
-                        const int64_t cap = (g.side == SIDE_CPU)
-                            ? static_cast<int64_t>(queue_frames_)
-                            : static_cast<int64_t>(ready_cap_frames_);
-                        hungry = side_pending_[g.side] < cap;
+                    last_fed_side_ = g.side;
+                    if (earlier_pending[(int)g.side]) continue;
+                }
+                if (!has_pkt) continue;
+                if (!eof_cache_) {
+                    const int64_t cap = (g.side == SIDE_CPU)
+                        ? static_cast<int64_t>(queue_frames_)
+                        : static_cast<int64_t>(ready_cap_frames_);
+                    if (side_pending_[g.side] >= cap) {
+                        earlier_pending[(int)g.side] = true;
+                        continue;
                     }
-                    if (hungry) gi = feed_gop_idx_;
+                }
+                gi = k;
+                break;
+            }
+            // 延迟 kick 冲刷：触发 GOP 已被游标越过 → 本轮发出
+            for (auto it = pending_kicks_.begin();
+                 it != pending_kicks_.end(); ) {
+                if (feed_gop_idx_ > it->after_gop) {
+                    ++side_pending_[it->dst];
+                    if (it->dst == SIDE_GPU) ++gpu_pending_;
+                    kicks_to_send.emplace_back(it->dst, std::move(it->pkt));
+                    kicks_[it->dst].fetch_add(1, std::memory_order_relaxed);
+                    it = pending_kicks_.erase(it);
+                } else {
+                    ++it;
                 }
             }
             if (gi < 0) {
@@ -989,17 +1057,25 @@ void HybridThreadedDecoder::PumpFeed() {
             }
         }  // ~lock
         if (!pkt) break;   // 防御（不应发生）
-        if (arm_kick) {
-            kicks_[kick_dst].fetch_add(1, std::memory_order_relaxed);
-            AVPacket *kick = av_packet_clone(pkt.get());
-            CHECK(kick != nullptr) << "av_packet_clone failed";
-            ffmpeg::AVPacketPtr kick_ptr(kick, [](AVPacket *p) { av_packet_free(&p); });
+        if (arm_kick && kick_pkt) {
+            // 记账已在锁内（arm_kick 分支）
             if (kick_dst == SIDE_CPU) {
-                cpu_.Push(std::move(kick_ptr), runtime::NDArray());
+                cpu_.Push(std::move(kick_pkt), runtime::NDArray());
             } else {
 #ifdef DECORD_USE_CUDA
                 std::lock_guard<std::mutex> lk(lcv_mtx_);
-                gpu_pkt_q_.push_back(std::move(kick_ptr));
+                gpu_pkt_q_.push_back(std::move(kick_pkt));
+                lcv_.notify_all();
+#endif
+            }
+        }
+        for (auto &ks : kicks_to_send) {
+            if (ks.first == SIDE_CPU) {
+                cpu_.Push(std::move(ks.second), runtime::NDArray());
+            } else {
+#ifdef DECORD_USE_CUDA
+                std::lock_guard<std::mutex> lk(lcv_mtx_);
+                gpu_pkt_q_.push_back(std::move(ks.second));
                 lcv_.notify_all();
 #endif
             }
