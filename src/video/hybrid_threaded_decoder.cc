@@ -900,22 +900,6 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
         return (v > 0.0 && v < 1.0) ? v : -1.0;
     }();
     double f = fs_env > 0 ? fs_env : rc / std::max(rc + rg, 1.0);
-    // ── CPU 快侧非对称修正（2026-09-14，h264 达成率 78% 归因）──
-    // water-filling 均衡的是 decode 时长，但严格顺序交付下两臂是接力：
-    // 慢侧（GPU）的每帧除自身 decode 外还要占用交付头（等它落地/上载，
-    // 期间快侧 CPU 银行顶帽停转——h264 实测 share=0.73 不动点 CPU busy
-    // 85%、GPU 仅吃 27% 帧量；share 扫描 0.73→3734、0.95→4014、
-    // 0.99→3971 **单调上升**，速率比不动点是假最优）。修正：CPU 明显
-    // 快侧（f>0.6）时给 rg 乘 γ（GPU 帧的等效头占用放大 1/γ 倍）把
-    // 水位推向 CPU；γ=0 回退旧 water-filling。hevc（f≈0.31）/av1
-    // （恒 GPU）不在触发区，逐字不变。
-    static const double gamma = [] {
-        const char *e = getenv("DECORD_HYBRID_GPU_GAMMA");
-        return e ? atof(e) : 0.25;
-    }();
-    if (fs_env <= 0 && gamma > 0.0 && f > 0.6) {
-        f = rc / std::max(rc + gamma * rg, 1.0);
-    }
     f = std::min(std::max(f, 0.0), 1.0);
     return (static_cast<double>(assigned_frames_[SIDE_CPU]) * (1.0 - f)
             <= static_cast<double>(assigned_frames_[SIDE_GPU]) * f)
