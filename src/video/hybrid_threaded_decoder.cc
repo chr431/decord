@@ -27,7 +27,8 @@
  *  前提（仅 IDR 型码流成立）：kick 帧输出 pts == 包 pts，被 stash 扣住，
  *  迟到的重排帧先发，expected 补满关 chunk —— 全局顺序天然正确。
  *  AV1 的 show_existing/时间戳映射使 kick 帧输出 pts 落回上一 chunk
- *  区间（实测双发错位），故 AV1 固定单侧 GPU（见 ChooseSide）。
+ *  区间（实测双发错位）——AV1 的 CPU 混跑默认保留（GPU-only 二次实测
+ *  +54% 大回归，见 PickFeedSide 注释；DECORD_HYBRID_AV1_CPU=0 消融）。
  *
  * 其余要点：
  *  - Seek/Clear 先停 GPU 工作线程，再清两子解码器并重置路由状态；
