@@ -159,6 +159,14 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetAverageFPS")
     *rv = fps;
   });
 
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderHybridStats")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    // hybrid 遥测直通（2026-09-17）：引擎在 vr.close() 前取走快照；
+    // 非 hybrid 解码器返回空串（python 侧转 None）。SetRoi 同款下转。
+    *rv = static_cast<VideoReader*>(handle)->HybridStats();
+  });
+
 DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetCodec")
 .set_body([] (DECORDArgs args, DECORDRetValue* rv) {
     VideoReaderInterfaceHandle handle = args[0];

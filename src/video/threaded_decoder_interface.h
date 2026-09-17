@@ -63,6 +63,11 @@ class ThreadedDecoderInterface {
         virtual bool NeedsPackets() const { return true; }
         virtual void SuggestDiscardPTS(std::vector<int64_t> dts) = 0;
         virtual void ClearDiscardPTS() = 0;
+        /*! hybrid 遥测快照（"k=v;k=v" 协议字符串；非 hybrid 实现返回空）。
+         *  引擎层经 VideoReader.hybrid_stats() 取走并入 RunReport——一次
+         *  extract 拿全部 fork 侧数据，不再依赖 stderr 文本/环境变量
+         *  （2026-09-17 引擎穿透轮）。原子计数器快照，任意时刻可调。 */
+        virtual std::string HybridStatsProbe() { return ""; }
         virtual ~ThreadedDecoderInterface() = default;
 };  // class ThreadedDecoderInterface
 

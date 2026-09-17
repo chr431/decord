@@ -166,6 +166,10 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     void SetRoi(int x1, int y1, int x2, int y2) override;
     void Start() override;
     void Stop() override;
+    /*! 遥测直通：全部计数器 + HOL 直方图 + 份额轨迹（k=v; 协议）。
+     *  与 Stop() 的 stderr 汇总同源（原子快照），供引擎层
+     *  VideoReader.hybrid_stats() 在 close 前取走。 */
+    std::string HybridStatsProbe() override;
     void Clear() override;
     void Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) override;
     bool Pop(runtime::NDArray *frame) override;
@@ -564,6 +568,18 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::atomic<int64_t> fb_clones_{};
     std::atomic<int64_t> late_feeds_{0};  ///< 迟到包直供次数（GOP 已供完后到达）
     std::atomic<int64_t> strag_total_{0};  ///< 迟到包挂 straggler 列表总次数                    ///< 反馈式清偿累计克隆包数
+    // ── 遥测直通（2026-09-17 引擎穿透轮）──────────────────────────
+    // HOL episode 入口的对侧存货分布（log2 桶 ×24，per-episode 一次
+    // 数组写，默认累计——成本≈零）：sum/max 之外补形状，"连续中等
+    // 存货"与"偶发深峰"自此可分（对齐引擎侧直方图口径）。
+    std::atomic<int64_t> hol_hist_[2][24]{};
+    // 份额适应轨迹（DECORD_HYBRID_TRACE=1 才记录）：速率就绪后的每次
+    // 派工决策记 [t_us, share_bp, rc, rg]，首 1024 点（非环形——首段
+    // 适应过程最有信息量）。仅泵线程写、快照读，double 非原子（诊断
+    // 读数容忍撕裂），trace_n_ 原子定界。
+    double trace_ring_[1024 * 4]{};
+    std::atomic<size_t> trace_n_{0};
+    bool trace_on_ = false;
     std::atomic<int64_t> stats_t0_us_{0};                 ///< Push 首包时刻（steady epoch µs）
 };
 

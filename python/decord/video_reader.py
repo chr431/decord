@@ -402,6 +402,42 @@ class VideoReader(object):
         """
         return _CAPI_VideoReaderGetCodec(self._handle)
 
+    def hybrid_stats(self):
+        """Hybrid decoder telemetry snapshot (dict; None if not hybrid).
+
+        Fork-side counters atomically snapshotted ("k=v;..." wire protocol),
+        plus the engine-passthrough additions: ``hol_hist_c/g`` (log2-bucket
+        histograms of opposite-side backlog at head-of-line block entry) and
+        ``trace`` (per-dispatch ``[t_us, share_bp, rc, rg]`` tuples, only
+        when DECORD_HYBRID_TRACE=1 was set before reader construction).
+        Keys mirror the one-shot ``[hybrid-stats]`` stderr block; safe to
+        call any time (call before ``close()`` for near-final numbers).
+        """
+        s = _CAPI_VideoReaderHybridStats(self._handle)
+        if not s:
+            return None
+        head, _, trace_tail = s.partition("trace=")
+        out = {}
+        for kv in head.split(";"):
+            if "=" not in kv:
+                continue
+            k, v = kv.split("=", 1)
+            if k in ("hol_hist_c", "hol_hist_g"):
+                out[k] = [int(x) for x in v.split(",") if x != ""]
+                continue
+            try:
+                out[k] = float(v)
+            except ValueError:
+                out[k] = v
+        if trace_tail:
+            quads = []
+            for tup in trace_tail.split(";"):
+                f = tup.split(",")
+                if len(f) == 4:
+                    quads.append(tuple(float(x) for x in f))
+            out["trace"] = quads
+        return out
+
     def get_color_range(self):
         """Get the stream luma color range.
 

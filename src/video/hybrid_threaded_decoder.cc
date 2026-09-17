@@ -66,6 +66,7 @@
 #endif
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -95,6 +96,9 @@ HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
     if (const char *e = getenv("DECORD_HYBRID_KICK_BURST")) {
         kick_guard_ = atoi(e);
     }
+    // 遥测穿透轮：份额轨迹默认关（首 1024 个派工决策，ring 4KB——
+    // 诊断时开，A/B 热路径零成本）
+    trace_on_ = getenv("DECORD_HYBRID_TRACE") != nullptr;
     if (const char *e = getenv("DECORD_HYBRID_PKT_CACHE_MB")) {
         const long long v = atoll(e);
         if (v > 0) cache_budget_ = static_cast<size_t>(v) << 20;
@@ -704,6 +708,87 @@ void HybridThreadedDecoder::StopGpuWorker() {
 }
 #endif
 
+std::string HybridThreadedDecoder::HybridStatsProbe() {
+    // 与 Stop() 的 stderr 汇总同源，另补 HOL 直方图与份额轨迹（穿透轮新增）。
+    // 协议 "k=v;k=v"：值全为数字（mode 用 out_cuda 0/1）；列表键值为逗号
+    // 串（hol_hist_c/g 桶计数、trace 扁平四元组）。python 侧 hybrid_stats()
+    // 负责解析。字符串拼装只在快照时刻发生一次（µs 级），不在热路径。
+    char buf[64];
+    std::string out;
+    auto kv = [&](const char *k, long long v) {
+        snprintf(buf, sizeof(buf), "%s=%lld;", k, v);
+        out += buf;
+    };
+    auto kvf = [&](const char *k, double v) {
+        snprintf(buf, sizeof(buf), "%s=%.3f;", k, v);
+        out += buf;
+    };
+    kv("frames_c", frames_out_[0].load());
+    kv("frames_g", frames_out_[1].load());
+    kv("chunks_c", chunks_assigned_[0]);
+    kv("chunks_g", chunks_assigned_[1]);
+    kv("kicks_c", kicks_[0].load());
+    kv("kicks_g", kicks_[1].load());
+    kv("clones", fb_clones_.load());
+#ifdef DECORD_USE_CUDA
+    kv("out_cuda", out_cuda_ ? 1 : 0);
+#else
+    kv("out_cuda", 0);
+#endif
+    kvf("rc_now", cpu_.ProductionRate());
+    kvf("rg_now", gpu_rate_landed_.load(std::memory_order_relaxed));
+    kv("cache_peak_mb", (long long)(cache_peak_bytes_ >> 20));
+    kv("late", late_feeds_.load(std::memory_order_relaxed));
+    kv("strag", strag_total_.load(std::memory_order_relaxed));
+    kv("assigned_c", assigned_frames_[0]);
+    kv("assigned_g", assigned_frames_[1]);
+    kv("hol_us_c", hol_us_[0].load());
+    kv("hol_ev_c", hol_ev_[0].load());
+    kv("strandmax_c", hol_strand_max_[0].load());
+    kv("hol_us_g", hol_us_[1].load());
+    kv("hol_ev_g", hol_ev_[1].load());
+    kv("strandmax_g", hol_strand_max_[1].load());
+    // HOL 直方图（log2 桶：episode 入口对侧存货的分布形状）
+    for (int s = 0; s < 2; ++s) {
+        out += s == 0 ? "hol_hist_c=" : "hol_hist_g=";
+        for (int b = 0; b < 24; ++b) {
+            snprintf(buf, sizeof(buf), "%s%lld", b ? "," : "",
+                     hol_hist_[s][b].load(std::memory_order_relaxed));
+            out += buf;
+        }
+        out += ";";
+    }
+    kv("busy_cpu_us", cpu_.DecodeBusyUs());
+    kv("busy_cpu_pkts", cpu_.DecodeBusyPkts());
+    kv("busy_gpu_us", gpu_ ? gpu_->DecodeBusyUs() : 0);
+    kv("busy_gpu_pics", gpu_ ? gpu_->DecodeBusyPics() : 0);
+#ifdef DECORD_USE_CUDA
+    if (out_cuda_) {
+        const long long fn = up_flush_n_.load();
+        const long long fr = up_flush_f_.load();
+        kv("up_flushes", fn);
+        kv("up_frames", fr);
+        kvf("up_avg_batch", fn > 0 ? (double)fr / (double)fn : 0.0);
+        kv("up_nobuf", up_nobuf_.load());
+        kv("up_cempty", up_cempty_.load());
+    }
+#endif
+    // 份额轨迹（仅 DECORD_HYBRID_TRACE=1 且有样本时；扁平 csv 四元组）
+    const size_t tn = trace_n_.load(std::memory_order_relaxed);
+    if (trace_on_ && tn > 0) {
+        out += "trace=";
+        for (size_t i = 0; i < tn; ++i) {
+            snprintf(buf, sizeof(buf), "%s%.0f,%.0f,%.1f,%.1f", i ? ";" : "",
+                     trace_ring_[i * 4], trace_ring_[i * 4 + 1],
+                     trace_ring_[i * 4 + 2], trace_ring_[i * 4 + 3]);
+            out += buf;
+        }
+        // trace 用 ';' 分隔四元组、',' 分隔字段（与 kv 的 ';' 终结符冲突：
+        // 放最后并省略终结 ';'，python 侧按 'trace=' 前缀单独解析）
+    }
+    return out;
+}
+
 void HybridThreadedDecoder::Stop() {
     started_.store(false);
     if (getenv("DECORD_HYBRID_DEBUG")) {
@@ -902,6 +987,22 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
     }();
     double f = fs_env > 0 ? fs_env : rc / std::max(rc + rg, 1.0);
     f = std::min(std::max(f, 0.0), 1.0);
+    if (trace_on_) {
+        // 穿透轮：速率就绪后的每个派工决策记 [t_us, share_bp, rc, rg]
+        // ——泵的份额适应过程（启动学习→稳态）自此有轨迹。
+        const size_t ti = trace_n_.load(std::memory_order_relaxed);
+        if (ti < 1024) {
+            const int64_t t0 = stats_t0_us_.load(std::memory_order_relaxed);
+            const auto now_us = std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            trace_ring_[ti * 4] = t0 > 0 ? (double)(now_us - t0) : 0.0;
+            trace_ring_[ti * 4 + 1] = f * 10000.0;
+            trace_ring_[ti * 4 + 2] = rc;
+            trace_ring_[ti * 4 + 3] = rg;
+            trace_n_.store(ti + 1, std::memory_order_relaxed);
+        }
+    }
     return (static_cast<double>(assigned_frames_[SIDE_CPU]) * (1.0 - f)
             <= static_cast<double>(assigned_frames_[SIDE_GPU]) * f)
                ? SIDE_CPU : SIDE_GPU;
@@ -1670,6 +1771,11 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 if (other > 0) {
                     if (hol_prev_side_ < 0) {
                         hol_ev_[s].fetch_add(1, std::memory_order_relaxed);
+                        // 穿透轮：episode 入口的对侧存货分布（log2 桶×24）
+                        int hb = 0;
+                        for (int64_t v = other; v > 1; v >>= 1) ++hb;
+                        hol_hist_[s][hb < 23 ? hb : 23].fetch_add(
+                            1, std::memory_order_relaxed);
                         hol_prev_side_ = static_cast<int>(s);
                         hol_tp_ = std::chrono::steady_clock::now();
                     }

@@ -944,6 +944,11 @@ NDArray VideoReader::NextFrame() {
     return frame;
 }
 
+std::string VideoReader::HybridStats() {
+    // decoder_ 为 hybrid 时给全量快照；其余实现返回空串
+    return decoder_ ? decoder_->HybridStatsProbe() : std::string();
+}
+
 void VideoReader::SetRoi(int x1, int y1, int x2, int y2) {
     x1 = std::max(0, std::min(x1, width_));
     y1 = std::max(0, std::min(y1, height_));

@@ -76,6 +76,9 @@ class VideoReader : public VideoReaderInterface {
          * 之完全一致（python 层强制）；一致时 CropRoi 直通（无每帧拷贝）。
          */
         void SetRoi(int x1, int y1, int x2, int y2);
+        /*! hybrid 遥测直通：decoder_ 是 hybrid 时返回 "k=v;..."
+         *  快照（空串 = 非 hybrid）；python 侧 hybrid_stats() 解析。 */
+        std::string HybridStats();
         /*!
          * \brief Grab a batch of frames; an optional ROI rectangle crops
          *        every frame to [x1,x2) x [y1,y2) before writing into the
