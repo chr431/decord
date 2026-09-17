@@ -774,7 +774,13 @@ bool VideoReader::SeekAccurate(int64_t pos) {
     return true;
 }
 
+static const bool s_push_dbg = getenv("DECORD_SEEK_DEBUG") != nullptr;
 void VideoReader::PushNext() {
+    // 临时诊断（DECORD_SEEK_DEBUG=1）：谁的推包——调用栈无法直接打，
+    // 打 curr/diff 供与 seek-dbg 行对齐判别（top-up vs retry-loop）
+    if (s_push_dbg) fprintf(stderr, "[push] curr=%lld diff=%lld\n",
+                            (long long)curr_frame_,
+                            (long long)(pkts_pushed_ - frames_popped_));
     // AVPacket *packet = av_packet_alloc();
     AVPacketPtr packet = AVPacketPool::Get()->Acquire();
     int ret = -1;
@@ -942,6 +948,16 @@ NDArray VideoReader::NextFrame() {
         return CropRoi(frame, roi_x1_, roi_y1_, roi_x2_, roi_y2_);
     }
     return frame;
+}
+
+std::string VideoReader::DecodeStats() const {
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "pkts_pushed=%lld;frames_popped=%lld;eof=%d",
+             static_cast<long long>(pkts_pushed_),
+             static_cast<long long>(frames_popped_),
+             eof_ ? 1 : 0);
+    return std::string(buf);
 }
 
 std::string VideoReader::HybridStats() {

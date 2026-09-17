@@ -436,6 +436,21 @@ class VideoReader(object):
                 if len(f) == 4:
                     quads.append(tuple(float(x) for x in f))
             out["trace"] = quads
+    def decode_stats(self):
+        """Base-path decode accounting (all decoder types).
+
+        Returns ``{'pkts_pushed', 'frames_popped', 'eof'}`` -- demux
+        packets pushed vs frames delivered by NextFrameImpl. Their
+        difference is in-flight + overread (bounded by prefetch depth,
+        8 on the base path). seek/skip decode-discard is not counted
+        (upstream accounting convention); assess the left edge via
+        GOP bounds separately."""
+        s = _CAPI_VideoReaderDecodeStats(self._handle)
+        if not s:
+            return None
+        return {k: (int(v) if k != 'eof' else bool(int(v)))
+                for k, v in (kv.split('=', 1) for kv in s.split(';') if kv)}
+
         return out
 
     def get_color_range(self):

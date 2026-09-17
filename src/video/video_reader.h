@@ -79,6 +79,12 @@ class VideoReader : public VideoReaderInterface {
         /*! hybrid 遥测直通：decoder_ 是 hybrid 时返回 "k=v;..."
          *  快照（空串 = 非 hybrid）；python 侧 hybrid_stats() 解析。 */
         std::string HybridStats();
+        /*! 基础路径解码记账直通（2026-09-17 打桩对齐）：demux 已推
+     *  包数 / 已交付帧数（NextFrameImpl 计数）。pkts_pushed −
+     *  frames_popped = 在途+越窗读（上界 = prefetch 深度，base=8）。
+     *  注意：seek/skip 的解码-丢弃不计数（源码既有口径），左缘
+     *  seek-back 另按 GOP 上界单独评估。 */
+        std::string DecodeStats() const;
         /*!
          * \brief Grab a batch of frames; an optional ROI rectangle crops
          *        every frame to [x1,x2) x [y1,y2) before writing into the
