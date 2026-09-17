@@ -863,7 +863,8 @@ NDArray VideoReader::NextFrameImpl() {
         // 非 hybrid 解码器 NeedsPackets 恒真，行为不变。
         if (decoder_->NeedsPackets()) {
             PushNext();
-            ++pkts_pushed_;  // prefetch accounting: every pushed packet counts
+            // 与 top-up 同口径：EOF 后 PushNext 是空转，不计入
+            if (!eof_) ++pkts_pushed_;  // prefetch accounting
         } else if (!eof_) {
             // 门控未推包且 Pop 空手：让出式自旋等生产推进。不能睡 ——
             // 1ms 睡眠把帧交付量子化到 ≤500fps（CPU 实时段 1.4ms/帧，

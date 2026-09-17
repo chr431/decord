@@ -100,6 +100,22 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
          *  一个 chunk 帧数（~286）就会退化为实时跟随解码速率
          *  （hevc CPU 侧 ~700fps，实测整体被拖到 0.70x）。 */
         void SetQueueDepth(int n) { max_queue_frames_ = n; }
+        /*! 基础路径 demux 门控（2026-09-17 越窗修复）：在途（未解码包
+     *  + 已解码未滤镜）+ 可交付 < 上限时才需要更多包。此前接口默认
+     *  恒真 —— VideoReader 的 retry 循环按消费自旋速度无上界推包，
+     *  任意短窗都会把整个文件 demux 进来（+7420 包，全片双读），
+     *  越窗解码在解码线程池里并行烧核（引擎 decode 相位 cores_avg
+     *  16.42 的大头）。上界 256 ≈ 8 prefetch + 32 帧队列 + 滤镜链
+     *  深度 ×8 余量，0.075s 供给 @3400fps；DECORD_INFLIGHT_CAP 可调。
+     *  仅 VideoReader 消费线程调用（单线程 demux 不变量）。 */
+        bool NeedsPackets() const override {
+            static const size_t cap = [] {
+                const char *e = getenv("DECORD_INFLIGHT_CAP");
+                const long v = e ? atol(e) : 0;
+                return v > 0 ? static_cast<size_t>(v) : static_cast<size_t>(256);
+            }();
+            return PendingDepth() + QueueDepth() < cap;
+        }
         /*! \brief 解码线程背压的 raw 队列上限（帧数），0 = 旧行为。
          *  旧行为把 raw(全帧) 与 frame(滤镜后) 合并计入同一上限
          *  （max_queue + slack）：ROI 输出下 frame 项只有 KB 级，合并
