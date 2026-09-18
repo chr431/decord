@@ -424,7 +424,10 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
                         gpu_frame_shape_, kUInt8,
                         DLDevice{kDLCUDA, device_id_});
         // 事件驱动：子解码器产出 / 池回收 → 即时唤醒工作线程
-        gpu_->SetOnOutput([this] { lcv_.notify_all(); });
+        gpu_->SetOnOutput([this](bool marker) {
+            if (!marker) GpuFrameProduced();
+            lcv_.notify_all();
+        });
         cpu_.SetOnOutput([this] { lcv_.notify_all(); });
         gpu_pool_.SetOnRelease([this] { lcv_.notify_all(); });
         up_pool_.SetOnRelease([this] { lcv_.notify_all(); });
@@ -1215,6 +1218,7 @@ void HybridThreadedDecoder::PumpFeed() {
             //   再发。kick 抢先插入会打乱同侧流序（RPS 丢帧 → pending
             //   泄漏挂死，实测 "Could not find ref with POC"）。
             int64_t gi = -1;
+            bool held_unassigned = false;  // 熟前挂起break置位：flush须抑制
             bool earlier_pending[2] = {false, false};
             if (feed_gop_idx_ < static_cast<int64_t>(gops_.size())) {
                 const GopRec &gc = gops_[feed_gop_idx_];
@@ -1248,7 +1252,37 @@ void HybridThreadedDecoder::PumpFeed() {
                                    >= window_frames_) {
                         break;
                     }
-                    g.side = PickFeedSide();
+                    // 熟前挂起（2026-09-18 启动轮）：rc/rg 任一未出版时
+                    // 分配挂起、GOP 留在包缓存等速率成熟——此前 demux 远
+                    // 快于解码，w3000 hevc 的 13 个 GOP 有 10~13 个在速率
+                    // 成熟前被 50/50 交替盲派（CPU 臂超分 200+ 帧 = 慢臂
+                    // 尾部 0.24s+；_probe_hybrid_startup 实测）。挂起零
+                    // 成本：包缓存即为此设计。防饿死例外：某侧空转
+                    // （side_pending_==0）→ 盲派给空侧——纯库存读数，
+                    // 无速率假设；双空走 PickFeedSide（gop0 GPU 起步 /
+                    // gop1 CPU 采样语义不变，FORCE_SIDE 亦经它生效）。
+                    // EOF 后 Push 停驱，由 Pop 空取路径重驱泵（同线程
+                    // 不变量：Pop/Push/PumpFeed 全在消费线程）。
+                    if (cpu_.ProductionRate() <= 0.0
+                            || gpu_rate_landed_.load(
+                                   std::memory_order_relaxed) <= 0.0) {
+                        const bool cpu_idle =
+                            side_pending_[SIDE_CPU] == 0;
+                        const bool gpu_idle =
+                            side_pending_[SIDE_GPU] == 0;
+                        if (!cpu_idle && !gpu_idle) {
+                            held_unassigned = true;
+                            break;
+                        }
+                        if (ForcedSide() != Side(-1)
+                                || (cpu_idle && gpu_idle)) {
+                            g.side = PickFeedSide();
+                        } else {
+                            g.side = cpu_idle ? SIDE_CPU : SIDE_GPU;
+                        }
+                    } else {
+                        g.side = PickFeedSide();
+                    }
                     for (Chunk &c : emit_queue_) {
                         if (c.id == g.id) {
                             c.side = g.side;
@@ -1304,7 +1338,8 @@ void HybridThreadedDecoder::PumpFeed() {
                 // 窗界关断不必等游标到表尾（窗外 GOP 永不派，游标
                 // 停在窗缘）——NVDEC 的 DPB 扣留尾帧必须靠 flush 释放，
                 // 否则消费者等不到窗口末帧（首轮实测挂死即此）。
-                if ((eof_cache_ || window_closed) && !arm_flush_sent_) {
+                if ((eof_cache_ || window_closed)
+                        && !held_unassigned && !arm_flush_sent_) {
                     arm_flush_sent_ = true;
                     eof_pushed_ = true;   // Pop 的 EOF 语义在此就位
                     if (window_closed && !eof_cache_) {
@@ -1686,6 +1721,9 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         // 帧可取"，返回 false 等泵供上（force-close 安全网也依赖 side
         // 合法，先挡掉）。
         if (ch.side == Side(-1)) {
+            // 熟前挂起配套：EOF/窗界后 Push 停驱，未分配 GOP 由消费
+            // 线程在此重驱泵（分配可能此刻已可进行——速率成熟/防饿死）。
+            PumpFeed();
             return false;
         }
         // force-close 安全网：该侧已路由的包全部出清（pending==0）但
@@ -1831,6 +1869,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 }
             }
 #endif
+            PumpFeed();   // 同 A4：空取时保持泵推进（EOF 后唯一驱动）
             return false;
         }
         // PopSide 成功 = 有进展（marker/陈旧丢弃/越界暂存/发射同此之后）：
@@ -1945,6 +1984,55 @@ runtime::NDArray HybridThreadedDecoder::ToHost(const runtime::NDArray &g) {
 }
 
 #ifdef DECORD_USE_CUDA
+void HybridThreadedDecoder::GpuFrameProduced() {
+    // 生产侧 sustained 折（2026-09-18）：连续产出段（间隔 <50ms，
+    // 断流重置——CPU 值日期不计入，"没活干"≠"能力低"）满折（16 帧）
+    // 入 8 折环，出版 max(环内"连续4折最小值") + 0.997/折慢降锁
+    // （对齐 cpu_.prod_rate_ 唯一口径）。旧落地侧 EWMA 两病（排空
+    // 积压假折 689655fps / 冷启排空孤峰直接出版 13402fps → CPU 臂
+    // 超分）同源于"量到消费节奏"——生产侧不受积压/消费影响。
+    const auto now = std::chrono::steady_clock::now();
+    if (last_land_tp_.time_since_epoch().count() != 0) {
+        double dt = std::chrono::duration<double>(now - last_land_tp_).count();
+        if (dt > 1e-6 && dt < 0.05) {
+            land_seg_frames_++;
+            land_seg_secs_ += dt;
+            if (land_seg_frames_ >= 16) {
+                const double r = land_seg_frames_ / land_seg_secs_;
+                land_fold_ring_[land_fold_i_] = r;
+                land_fold_i_ = (land_fold_i_ + 1) % kLandFoldRing;
+                if (land_fold_n_ < kLandFoldRing) ++land_fold_n_;
+                if (land_fold_n_ >= 4) {
+                    double best = 0.0;
+                    const int oldest =
+                        (land_fold_i_ - land_fold_n_ + 2 * kLandFoldRing)
+                        % kLandFoldRing;
+                    for (int i = 0; i + 4 <= land_fold_n_; ++i) {
+                        double w = land_fold_ring_[
+                            (oldest + i) % kLandFoldRing];
+                        for (int j = 1; j < 4; ++j) {
+                            const double v = land_fold_ring_[
+                                (oldest + i + j) % kLandFoldRing];
+                            if (v < w) w = v;
+                        }
+                        if (w > best) best = w;
+                    }
+                    const double prev = gpu_rate_landed_.load(
+                        std::memory_order_relaxed);
+                    gpu_rate_landed_.store(
+                        prev > 0 ? std::max(best, prev * 0.997) : best,
+                        std::memory_order_relaxed);
+                }
+                land_seg_frames_ = 0;
+                land_seg_secs_ = 0.0;
+            }
+        } else {
+            land_seg_frames_ = 0;
+            land_seg_secs_ = 0.0;
+        }
+    }
+    last_land_tp_ = now;
+}
 bool HybridThreadedDecoder::LandStep() {
     if (!gpu_) return false;
     {
@@ -1963,46 +2051,10 @@ bool HybridThreadedDecoder::LandStep() {
     }
     runtime::NDArray f;
     if (!gpu_->Pop(&f) || !f.defined()) return false;
-    // 落地速率（供调度）：段式统计 —— 只累计连续落地段（间隔 <50ms），
-    // 段满 16 帧折算一次段速率并 EWMA。断流（chunk 间包断流/预算等待）
-    // 重置段且不计入，否则"没活干"会被误判为"能力低"，调度锁死。
-    // 必须在直通分支之前：GPU 驻留模式无 D2H，若统计挂在 ToHost 后
-    // 则 gpu_rate_landed_ 恒 0 → "gpu-rate unknown" → CPU 包办
-    // （实测 av1 f_c=0.8、混合退化）。
-    {
-        auto now = std::chrono::steady_clock::now();
-        if (last_land_tp_.time_since_epoch().count() != 0) {
-            double dt = std::chrono::duration<double>(now - last_land_tp_).count();
-            if (dt > 1e-6 && dt < 0.05) {
-                land_seg_frames_++;
-                land_seg_secs_ += dt;
-                if (land_seg_frames_ >= 16) {
-                    double r = land_seg_frames_ / land_seg_secs_;
-                    double prev = gpu_rate_landed_.load(std::memory_order_relaxed);
-                    // 容量跟踪（快升慢降，同 cpu_.prod_rate_ 注释）：CPU
-                    // 值日期间 ready 满载闸住落地、低速段把 EWMA 从 1519
-                    // 拖到 1132 → tg 虚高 → GPU 显差 → CPU 值日更长 ——
-                    // 空闲贬值与相位比例互为反馈（hevc 1577-1833 双峰的
-                    // 根因）。产能不因空闲贬值。
-                    double next;
-                    if (prev <= 0) {
-                        next = r;
-                    } else if (r > prev) {
-                        next = std::min(r, prev * 1.3);
-                    } else {
-                        next = 0.95 * prev + 0.05 * r;
-                    }
-                    gpu_rate_landed_.store(next, std::memory_order_relaxed);
-                    land_seg_frames_ = 0;
-                    land_seg_secs_ = 0.0;
-                }
-            } else {
-                land_seg_frames_ = 0;
-                land_seg_secs_ = 0.0;
-            }
-        }
-        last_land_tp_ = now;
-    }
+    // 产出速率统计已外迁 GpuFrameProduced（CU display 线程逐帧触
+    // 发，生产侧口径 2026-09-18）：落地线程排空 reorder 积压时会以
+    // D2H 提交速度连 pop（假折 689655fps），生产侧不受积压影响；
+    // GPU 驻留模式逐帧回调亦天然解除旧"统计挂 ToHost 后 rg 恒 0"坑。
     if (IsMarker(f)) {
         // drain marker（kCPU kInt64）：在途 D2H 帧必须先于 marker 入队
         // （发射顺序 = ready_ 顺序）。ready_ 满时容忍越界（软限，仅

@@ -412,6 +412,19 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! rief 当前连续落地段的帧数/秒数（仅工作线程访问） */
     int64_t land_seg_frames_ = 0;
     double land_seg_secs_ = 0.0;
+    /*! brief 产出侧 sustained 折累计（CU display 线程调 GpuFrameProduced；2026-09-18
+     *  折计时自落地线程外迁——落地侧在排空 reorder 积压时量到 D2H 提交速度
+     *  （假折 689655fps），生产侧=NVDEC 解码节奏与积压无关） */
+    void GpuFrameProduced();
+
+    /*! sustained 折环（对齐 cpu_.prod_rate_ 口径，2026-09-18）：段式
+     *  EWMA 在启动/排空段读出"预缓冲排空速度"孤峰（实测 rg=13402fps
+     *  → 份额被压到 6%、CPU 臂超分 1680/1440），与 CPU 侧容量跟踪
+     *  EWMA 同病同修：max(最近8折"连续4折最小值") + 0.997/折慢降锁。 */
+    static constexpr int kLandFoldRing = 8;
+    double land_fold_ring_[kLandFoldRing]{};
+    int land_fold_i_ = 0;
+    int land_fold_n_ = 0;
 #endif
     /*! \brief 已路由到 GPU、尚未发射/丢弃的帧数（包粒度精确计数；
      *  诊断用途） */
@@ -530,8 +543,9 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     };
     std::vector<PendingKick> pending_kicks_;
     /*! \brief 供料侧选择：供水式贪心（累计分账水位）+ 尾部最少积压。
-     *  f = rc/(rc+rg)（当前 EWMA，FORCE_SHARE 可覆盖）；rc 未学得时
-     *  用启动启发（gop0 GPU / gop1 CPU 采样）。非 IDR 编码恒 GPU。 */
+     *  f = rc/(rc+rg)（当前 sustained，FORCE_SHARE 可覆盖）；rc 未学得时
+     *  用启动启发（gop0 GPU / gop1 CPU 采样）。速率未熟期的分配挂起与
+     *  防饿死盲派见 PumpFeed（2026-09-18 启动轮）。 */
     Side PickFeedSide();
     /*! 打开/关闭当前 GOP（仅 Push 线程持 mtx_ 时调用；Close 从
      *  emit_queue_.back().end_pts 取终点，expected 写回 chunk）。 */

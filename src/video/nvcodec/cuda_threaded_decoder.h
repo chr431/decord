@@ -64,7 +64,9 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         /*! 产出回调（display 线程调用）：混合解码器用它即时唤醒
          *  落地/喂包线程（替代 1ms 轮询，hevc ~1800fps 下轮询延迟
          *  直接封顶吞吐）。 */
-        void SetOnOutput(std::function<void()> cb) { on_output_ = std::move(cb); }
+        void SetOnOutput(std::function<void(bool marker)> cb) {
+            on_output_ = std::move(cb);
+        }
         /*! \brief stall 取证：CU 三条队列深度（包 / 输出缓冲 / 待落地重排
          *  环）。混合解码器 Pop 空手时用来自证 8 帧卡在哪一层：pkt>0 =
          *  解析线程停摆；pkt=0 而 bufs/ord 非零 = 解码/转换在途；
@@ -177,7 +179,7 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         void RecordFrameEvent();
         cudaEvent_t PopFrameEvent();
         std::mutex pkt_room_mutex_;
-        std::function<void()> on_output_;
+        std::function<void(bool marker)> on_output_;
         std::condition_variable pkt_room_cv_;
 
     DISALLOW_COPY_AND_ASSIGN(CUThreadedDecoder);

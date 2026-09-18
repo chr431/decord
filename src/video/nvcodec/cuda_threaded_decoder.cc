@@ -393,7 +393,7 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
         // 仅保持与 reorder 出队序 1:1）
         RecordFrameEvent();
         reorder_queue_->Push(arr);
-        if (on_output_) on_output_();
+        if (on_output_) on_output_(false);
         return 1;
     }
 
@@ -440,7 +440,7 @@ int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
     deferred_valid_.store(true);
     RecordFrameEvent();
     reorder_queue_->Push(arr);
-    if (on_output_) on_output_();
+    if (on_output_) on_output_(false);
     return 1;
 }
 
@@ -596,7 +596,7 @@ void CUThreadedDecoder::LaunchThreadImpl() {
                 { std::lock_guard<std::mutex> lk(ev_mtx_); frame_events_.push_back(nullptr); }
                 reorder_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
             }
-            if (on_output_) on_output_();
+            if (on_output_) on_output_(true);
         }
     }
 }
