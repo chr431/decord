@@ -951,6 +951,10 @@ NDArray VideoReader::NextFrame() {
     return frame;
 }
 
+void VideoReader::SetDecodeWindow(int64_t max_frames) {
+    if (decoder_) decoder_->SetDecodeWindow(max_frames);
+}
+
 std::string VideoReader::DecodeStats() const {
     char buf[128];
     snprintf(buf, sizeof(buf),

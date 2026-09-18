@@ -436,6 +436,8 @@ class VideoReader(object):
                 if len(f) == 4:
                     quads.append(tuple(float(x) for x in f))
             out["trace"] = quads
+        return out
+
     def decode_stats(self):
         """Base-path decode accounting (all decoder types).
 
@@ -451,7 +453,15 @@ class VideoReader(object):
         return {k: (int(v) if k != 'eof' else bool(int(v)))
                 for k, v in (kv.split('=', 1) for kv in s.split(';') if kv)}
 
-        return out
+    def set_decode_window(self, n):
+        """Hard decode-window bound (hybrid decoders only).
+
+        Declares that the consumer will pull at most ``n`` frames. The
+        hybrid pump stops demuxing and GOP assignment at the window
+        edge -- not one packet beyond it is read (the boundary GOP is
+        still supplied whole, which decoding inside the window
+        requires). Must be called before the first ``get_batch``."""
+        _CAPI_VideoReaderSetDecodeWindow(self._handle, int(n))
 
     def get_color_range(self):
         """Get the stream luma color range.

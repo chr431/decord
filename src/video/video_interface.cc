@@ -159,6 +159,14 @@ DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderGetAverageFPS")
     *rv = fps;
   });
 
+DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderSetDecodeWindow")
+.set_body([] (DECORDArgs args, DECORDRetValue* rv) {
+    VideoReaderInterfaceHandle handle = args[0];
+    int64_t n = args[1];
+    static_cast<VideoReader*>(handle)->SetDecodeWindow(n);
+    *rv = nullptr;
+  });
+
 DECORD_REGISTER_GLOBAL("video_reader._CAPI_VideoReaderDecodeStats")
 .set_body([] (DECORDArgs args, DECORDRetValue* rv) {
     VideoReaderInterfaceHandle handle = args[0];

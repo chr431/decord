@@ -68,6 +68,12 @@ class ThreadedDecoderInterface {
          *  extract 拿全部 fork 侧数据，不再依赖 stderr 文本/环境变量
          *  （2026-09-17 引擎穿透轮）。原子计数器快照，任意时刻可调。 */
         virtual std::string HybridStatsProbe() { return ""; }
+        /*! 硬窗界：声明消费者最多取 n 帧。hybrid 实现据此硬性停止
+         *  demux 与 GOP 派工——窗口外一个包都不读（窗口内帧解码必需
+         *  的边界 GOP 整体供给属例外）。默认空操作（cpu/nvdec 基础
+         *  路径 prefetch 深度 8 包 + NeedsPackets 已如实化，无越窗
+         *  问题）。须在首个 get_batch 前调用。 */
+        virtual void SetDecodeWindow(int64_t max_frames) { (void)max_frames; }
         virtual ~ThreadedDecoderInterface() = default;
 };  // class ThreadedDecoderInterface
 

@@ -170,6 +170,13 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  与 Stop() 的 stderr 汇总同源（原子快照），供引擎层
      *  VideoReader.hybrid_stats() 在 close 前取走。 */
     std::string HybridStatsProbe() override;
+    /*! 硬窗界：assigned 帧量达窗后，demux（NeedsPackets）与 GOP 派工
+     *  双双硬停；部分供给中的已分配 GOP 不受影响（边界 GOP 整体供给
+     *  是窗口内帧解码的必需）。须在首个 get_batch 前调用。 */
+    void SetDecodeWindow(int64_t max_frames) override;
+    /*! 窗界例外判据：游标 GOP 已派侧且未供完（主区间或迟到包）。
+     *  仅消费线程调用（NeedsPackets/PumpFeed 同线程）。 */
+    bool HasPartialSupplyLocked() const;
     void Clear() override;
     void Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) override;
     bool Pop(runtime::NDArray *frame) override;
@@ -324,6 +331,14 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
         if (kick_side_ != Side(-1)
                 && side_pending_[kick_side_] - kick_cloned_ > 0) {
             return true;
+        }
+        // 硬窗界（2026-09-17）：assigned 帧量已达窗 → demux 硬停——
+        // 窗口外一个包都不读。例外：游标处 GOP 已派侧且未供完
+        // （边界 GOP 必须整体供给，否则窗口末帧饿死）。
+        if (window_frames_ > 0
+                && assigned_frames_[0] + assigned_frames_[1]
+                       >= window_frames_) {
+            return HasPartialSupplyLocked();
         }
         if (cache_bytes_ < cache_budget_) return true;
         const int64_t cpu_cap = static_cast<int64_t>(queue_frames_);
@@ -580,6 +595,9 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     double trace_ring_[1024 * 4]{};
     std::atomic<size_t> trace_n_{0};
     bool trace_on_ = false;
+    // 硬窗界（-1=无限）。SetDecodeWindow 于 Start 前由消费线程设置；
+    // NeedsPackets/PumpFeed 同在消费线程读取——单线程不变量无锁。
+    int64_t window_frames_ = -1;
     std::atomic<int64_t> stats_t0_us_{0};                 ///< Push 首包时刻（steady epoch µs）
 };
 

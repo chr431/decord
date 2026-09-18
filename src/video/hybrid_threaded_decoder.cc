@@ -708,6 +708,24 @@ void HybridThreadedDecoder::StopGpuWorker() {
 }
 #endif
 
+void HybridThreadedDecoder::SetDecodeWindow(int64_t max_frames) {
+    // Start 前由消费线程调用；与 NeedsPackets/PumpFeed 同线程，无竞态。
+    window_frames_ = max_frames > 0 ? max_frames : -1;
+}
+
+bool HybridThreadedDecoder::HasPartialSupplyLocked() const {
+    // 游标 GOP 已派侧且未供完（主区间未到已见末端，或还有迟到包）→
+    // 边界 GOP 仍需 demux 供包（硬窗的解码语义例外）。
+    if (feed_gop_idx_ >= static_cast<int64_t>(gops_.size())) return false;
+    const GopRec &g = gops_[feed_gop_idx_];
+    if (g.side == Side(-1)) return false;   // 未派侧 = 窗外，不供
+    const int64_t avail_end = g.closed ? g.pkt_end : cache_seq_;
+    return g.fed_upto < avail_end
+        || (g.closed
+            && g.straggler_idx
+                   < static_cast<int64_t>(g.stragglers.size()));
+}
+
 std::string HybridThreadedDecoder::HybridStatsProbe() {
     // 与 Stop() 的 stderr 汇总同源，另补 HOL 直方图与份额轨迹（穿透轮新增）。
     // 协议 "k=v;k=v"：值全为数字（mode 用 out_cuda 0/1）；列表键值为逗号
@@ -742,6 +760,8 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     kv("strag", strag_total_.load(std::memory_order_relaxed));
     kv("assigned_c", assigned_frames_[0]);
     kv("assigned_g", assigned_frames_[1]);
+    kv("window_frames", window_frames_);
+    kv("assigned_total", assigned_frames_[0] + assigned_frames_[1]);
     kv("hol_us_c", hol_us_[0].load());
     kv("hol_ev_c", hol_ev_[0].load());
     kv("strandmax_c", hol_strand_max_[0].load());
@@ -1220,6 +1240,14 @@ void HybridThreadedDecoder::PumpFeed() {
                 }
                 if (g.side == Side(-1)) {
                     if (!has_pkt) continue;   // 未开 GOP 无包不分配
+                    // 硬窗界：assigned 达窗后不再派新 GOP（扫描终止；
+                    // 已派 GOP 的供给与 kick 注入不受影响）。EOF 排空
+                    // 同走此门，路径一致。
+                    if (window_frames_ > 0
+                            && assigned_frames_[0] + assigned_frames_[1]
+                                   >= window_frames_) {
+                        break;
+                    }
                     g.side = PickFeedSide();
                     for (Chunk &c : emit_queue_) {
                         if (c.id == g.id) {
@@ -1264,11 +1292,26 @@ void HybridThreadedDecoder::PumpFeed() {
                 break;
             }
             if (gi < 0) {
-                // 3. 无可供工作：EOF 且全部供完 → 置排空标记（锁外发送）
-                if (eof_cache_ && !arm_flush_sent_
-                        && feed_gop_idx_ >= static_cast<int64_t>(gops_.size())) {
+                // 3. 无可供工作：EOF 或窗界关断、且全部已派工作供完
+                // （含 kick 注入完毕）→ 置排空标记（锁外发送）。
+                // 窗界即调度语义上的流结束：消费者声明只取 window 帧，
+                // 已派 GOP 供完 = 窗内工作全部完成，此后臂应收尾退出——
+                // 否则 worker 等不到排空标记，close 时 join 死锁
+                // （2026-09-17 硬窗界首轮实测挂死，即漏了此分支）。
+                const bool window_closed = window_frames_ > 0
+                    && assigned_frames_[0] + assigned_frames_[1]
+                           >= window_frames_;
+                // 窗界关断不必等游标到表尾（窗外 GOP 永不派，游标
+                // 停在窗缘）——NVDEC 的 DPB 扣留尾帧必须靠 flush 释放，
+                // 否则消费者等不到窗口末帧（首轮实测挂死即此）。
+                if ((eof_cache_ || window_closed) && !arm_flush_sent_) {
                     arm_flush_sent_ = true;
                     eof_pushed_ = true;   // Pop 的 EOF 语义在此就位
+                    if (window_closed && !eof_cache_) {
+                        // 窗界排空：窗外未派 GOP 的 kick 直接丢弃——
+                        // 兜底重锚会让离场侧解码窗外帧，违背窗界语义
+                        pending_kicks_.clear();
+                    }
                 }
                 break;
             }

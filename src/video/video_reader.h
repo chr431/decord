@@ -85,6 +85,8 @@ class VideoReader : public VideoReaderInterface {
      *  注意：seek/skip 的解码-丢弃不计数（源码既有口径），左缘
      *  seek-back 另按 GOP 上界单独评估。 */
         std::string DecodeStats() const;
+        /*! 硬窗界转发：decoder 是 hybrid 时生效（须在首个 get_batch 前）。 */
+        void SetDecodeWindow(int64_t max_frames);
         /*!
          * \brief Grab a batch of frames; an optional ROI rectangle crops
          *        every frame to [x1,x2) x [y1,y2) before writing into the
