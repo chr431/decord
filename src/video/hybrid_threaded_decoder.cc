@@ -975,6 +975,59 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
     if (chunks_assigned_[SIDE_CPU] == 0) {
         return chunks_assigned_[SIDE_GPU] >= 1 ? SIDE_CPU : SIDE_GPU;
     }
+    // 窗口尾收口（2026-09-18 启动轮续）：EOF 的「末段给最少积压侧」
+    // 规则原本只在 eof_cache_ 触发——窗口运行没有尾意识，末段 GOP 按
+    // 供水比例可能落到慢臂，窗口尾部被拖满额 GOP 时间（hevc w1500/
+    // w2000 交叉点卡噪声带的主嫌疑）。窗口剩余预算 ≤ ~4 GOP 时切最少
+    // 积压侧，两侧一同收尾。全片（window<0）零影响；gop0/gop1 起步
+    // 启发在前，采样语义不变。
+    {
+        int64_t gop_est = est_chunk_frames_;
+        if (gop_est <= 0 && kf_pts_.size() > 1 && frame_count_ > 0) {
+            gop_est = std::max<int64_t>(
+                frame_count_ / static_cast<int64_t>(kf_pts_.size() - 1), 1);
+        }
+        if (window_frames_ > 0 && gop_est > 0
+                && window_frames_
+                       - (assigned_frames_[0] + assigned_frames_[1])
+                       <= 4 * gop_est) {
+            // ETA 口径（首版 least-pending 实测大回归 1.6-1.7s：
+            // side_pending_ 含按序合并的等待发射帧——GPU 臂解码完成但
+            // 排在 CPU chunk 后等发射时 pending 虚高，尾被系统性派给
+            // 慢的 CPU 臂）。ETA=未解码余量/实测速率：pending 扣除
+            // 已解码存货（CPU=filter 队列深，GPU=ready_/cpu_ready_），
+            // 谁先腾手给谁；速率未熟退回供水比例（下方 water-fill）。
+            const double r_c = cpu_.ProductionRate();
+            const double r_g = gpu_rate_landed_.load(
+                std::memory_order_relaxed);
+            if (r_c > 0.0 && r_g > 0.0) {
+                std::size_t gpu_inv = 0;
+                {
+                    std::lock_guard<std::mutex> lk(rmtx_);
+                    gpu_inv = ready_.size()
+                        + (out_cuda_ ? cpu_ready_.size() : 0);
+                }
+                // 已解码存货另含 cuvid reorder 输出队列（LandStep 尚未
+                // 收割；co≤0 时诊断口径未启用，跳过）。宿主包队列与
+                // cuvid parser/解码在途属未解码工作，不扣——首版把
+                // 它们误计入存货（低估 GPU 余量），已更正。
+                if (gpu_) {
+                    int64_t cp = 0, cb = 0, co = 0;
+                    gpu_->DiagDepths(&cp, &cb, &co);
+                    (void)cp; (void)cb;
+                    if (co > 0) gpu_inv += static_cast<std::size_t>(co);
+                }
+                const int64_t cpu_und = std::max<int64_t>(
+                    side_pending_[SIDE_CPU] - cpu_.QueueDepth(), 0);
+                const int64_t gpu_und = std::max<int64_t>(
+                    side_pending_[SIDE_GPU]
+                        - static_cast<int64_t>(gpu_inv), 0);
+                return (static_cast<double>(cpu_und) / r_c
+                        <= static_cast<double>(gpu_und) / r_g)
+                           ? SIDE_CPU : SIDE_GPU;
+            }
+        }
+    }
     const double rc = cpu_.ProductionRate();
     const double rg = gpu_rate_landed_.load(std::memory_order_relaxed);
     if (rc <= 0.0 || rg <= 0.0) {
