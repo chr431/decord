@@ -987,7 +987,11 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
             gop_est = std::max<int64_t>(
                 frame_count_ / static_cast<int64_t>(kf_pts_.size() - 1), 1);
         }
-        if (window_frames_ > 0 && gop_est > 0
+        static const bool tail_off = [] {
+            const char *e = getenv("DECORD_HYBRID_TAIL_OFF");
+            return e != nullptr && atoi(e) > 0;
+        }();
+        if (!tail_off && window_frames_ > 0 && gop_est > 0
                 && window_frames_
                        - (assigned_frames_[0] + assigned_frames_[1])
                        <= 4 * gop_est) {
@@ -1034,7 +1038,11 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
         return chunks_assigned_[SIDE_CPU] <= chunks_assigned_[SIDE_GPU]
                    ? SIDE_CPU : SIDE_GPU;
     }
-    if (!sched_initialized_) {
+    static const bool resplit_off = [] {
+        const char *e = getenv("DECORD_HYBRID_RESPLIT_OFF");
+        return e != nullptr && atoi(e) > 0;
+    }();
+    if (!sched_initialized_ && !resplit_off) {
         // 首次双侧速率就绪：cpu-out 的库存帽按产率比分账（旧 inv-split
         // 语义不变；gpu-out 的 ready 由显存池决定不可动）
         sched_initialized_ = true;
@@ -1224,7 +1232,7 @@ ffmpeg::AVPacketPtr HybridThreadedDecoder::CloneCachePacket(int64_t seq) {
     return ffmpeg::AVPacketPtr(c, [](AVPacket *p) { av_packet_free(&p); });
 }
 
-void HybridThreadedDecoder::PumpFeed() {
+void HybridThreadedDecoder::PumpFeed(bool force_head) {
     // 供料泵（层0/1 重设计核心）：Push 只入缓存，这里在**分配时点**把
     // 包喂给臂。仅 Push 调用线程（VideoReader 单线程 demux）执行，
     // 沿用"路由状态单线程"不变量；每包一次 mtx_。
@@ -1238,6 +1246,12 @@ void HybridThreadedDecoder::PumpFeed() {
     //
     // EOF（eof_cache_）：无视饥饿门排空全部剩余包——否则 demux 停读后
     // 无人再驱动泵，尾死锁。
+    // flush 已实际发出（eof_flush_out_）：两臂已进 drain——此后任何喂包
+    // 都是 send-after-flush 错误（2026-09-19 test6_h264 w12000 实测
+    // ffmpeg CHECK）。Pop 的 force 重驱也必须止步于此。
+    if (eof_flush_out_) {
+        return;
+    }
     for (int guard = 0; guard < 1000000; ++guard) {
         Side s = Side(-1);
         ffmpeg::AVPacketPtr pkt;
@@ -1305,20 +1319,33 @@ void HybridThreadedDecoder::PumpFeed() {
                                    >= window_frames_) {
                         break;
                     }
+                    static const bool hold_off = [] {
+                        const char *e = getenv("DECORD_HYBRID_HOLD_OFF");
+                        return e != nullptr && atoi(e) > 0;
+                    }();
                     // 熟前挂起（2026-09-18 启动轮）：rc/rg 任一未出版时
                     // 分配挂起、GOP 留在包缓存等速率成熟——此前 demux 远
                     // 快于解码，w3000 hevc 的 13 个 GOP 有 10~13 个在速率
                     // 成熟前被 50/50 交替盲派（CPU 臂超分 200+ 帧 = 慢臂
                     // 尾部 0.24s+；_probe_hybrid_startup 实测）。挂起零
-                    // 成本：包缓存即为此设计。防饿死例外：某侧空转
+                    // 成本：包缓存即为此设计。防饿死例外：①某侧空转
                     // （side_pending_==0）→ 盲派给空侧——纯库存读数，
-                    // 无速率假设；双空走 PickFeedSide（gop0 GPU 起步 /
-                    // gop1 CPU 采样语义不变，FORCE_SIDE 亦经它生效）。
-                    // EOF 后 Push 停驱，由 Pop 空取路径重驱泵（同线程
-                    // 不变量：Pop/Push/PumpFeed 全在消费线程）。
-                    if (cpu_.ProductionRate() <= 0.0
-                            || gpu_rate_landed_.load(
-                                   std::memory_order_relaxed) <= 0.0) {
+                    // 无速率假设；②头部强制派工（force_head，Pop 饿死
+                    // 解锁）：库存残帧互锁时由消费线程经 Pop 重驱泵并
+                    // 强制分配头部 GOP。双空走 PickFeedSide（gop0 GPU
+                    // 起步 / gop1 CPU 采样语义不变，FORCE_SIDE 亦经它
+                    // 生效）。HOLD_OFF=1 回退旧路径（消融/诊断用）。
+                    const bool force_this =
+                        force_head && k == feed_gop_idx_;
+                    if (force_this) {
+                        const bool ci = side_pending_[SIDE_CPU] == 0;
+                        const bool gi = side_pending_[SIDE_GPU] == 0;
+                        g.side = (ci && gi) ? PickFeedSide()
+                                               : (ci ? SIDE_CPU : SIDE_GPU);
+                    } else if (!hold_off
+                            && (cpu_.ProductionRate() <= 0.0
+                                || gpu_rate_landed_.load(
+                                       std::memory_order_relaxed) <= 0.0)) {
                         const bool cpu_idle =
                             side_pending_[SIDE_CPU] == 0;
                         const bool gpu_idle =
@@ -1388,17 +1415,54 @@ void HybridThreadedDecoder::PumpFeed() {
                 const bool window_closed = window_frames_ > 0
                     && assigned_frames_[0] + assigned_frames_[1]
                            >= window_frames_;
+                // 排空前确认：所有已派 GOP 已喂完（主区间+迟到包）。
+                // 被侧容量门挡住的 GOP 让 gi<0 但喂包未完——此刻发
+                // flush = 已派未喂帧丢失（2026-09-19 test6_h264 CPU-out
+                // 窗口实测：消费者等不到窗内帧 → EOF 兜底长自旋）。
+                // 容量门由消费推进自然解除（头部 chunk 即被消费），
+                // 下一轮泵送继续喂完后再排空。
+                bool all_assigned_fed = true;
+                for (const GopRec &g3 : gops_) {
+                    if (g3.side == Side(-1)) continue;
+                    const int64_t ae3 = g3.closed ? g3.pkt_end : cache_seq_;
+                    if (g3.fed_upto < ae3
+                            || (g3.closed && g3.straggler_idx
+                                           < static_cast<int64_t>(
+                                               g3.stragglers.size()))) {
+                        all_assigned_fed = false;
+                        break;
+                    }
+                }
                 // 窗界关断不必等游标到表尾（窗外 GOP 永不派，游标
                 // 停在窗缘）——NVDEC 的 DPB 扣留尾帧必须靠 flush 释放，
                 // 否则消费者等不到窗口末帧（首轮实测挂死即此）。
-                if ((eof_cache_ || window_closed)
+                if ((eof_cache_ || window_closed) && all_assigned_fed
                         && !held_unassigned && !arm_flush_sent_) {
                     arm_flush_sent_ = true;
                     eof_pushed_ = true;   // Pop 的 EOF 语义在此就位
                     if (window_closed && !eof_cache_) {
-                        // 窗界排空：窗外未派 GOP 的 kick 直接丢弃——
-                        // 兜底重锚会让离场侧解码窗外帧，违背窗界语义
-                        pending_kicks_.clear();
+                        // 窗界排空：仅丢弃触发点已越过窗缘的 kick（其
+                        // 目标 GOP 未派=窗外，注入=解码窗外帧）。目标
+                        // GOP 已派（窗内）的 kick 必须保留并注入——否则
+                        // 该侧 chunk 缺 IDR 重锚、expected 补不满 →
+                        // 少交付（2026-09-19 test6_h264 w12000 实测
+                        // EOF-retry 上限报错的根因）。
+                        int64_t last_assigned_gop = -1;
+                        for (auto rit = gops_.rbegin();
+                             rit != gops_.rend(); ++rit) {
+                            if (rit->side != Side(-1)) {
+                                last_assigned_gop = rit->id;
+                                break;
+                            }
+                        }
+                        for (auto it = pending_kicks_.begin();
+                             it != pending_kicks_.end();) {
+                            if (it->after_gop >= last_assigned_gop) {
+                                it = pending_kicks_.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
                     }
                 }
                 break;
@@ -1774,9 +1838,50 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         // 帧可取"，返回 false 等泵供上（force-close 安全网也依赖 side
         // 合法，先挡掉）。
         if (ch.side == Side(-1)) {
+            static const bool t2 = [] {
+                const char *e = getenv("DECORD_HYBRID_TRACE2");
+                return e != nullptr && atoi(e) > 0;
+            }();
+            if (t2) {
+                fprintf(stderr,
+                        "[pop-held] head=(id=%lld side=%d exp=%lld em=%lld) "
+                        "pend=%d/%d cq=%lld cp=%lld fed_gop=%lld "
+                        "gop_n=%zu cache=%lld np=%d sched=%d eof=%d\n",
+                        (long long)ch.id, (int)ch.side,
+                        (long long)ch.expected, (long long)ch.emitted,
+                        (int)side_pending_[0], (int)side_pending_[1],
+                        (long long)cpu_.QueueDepth(),
+                        (long long)cpu_.PendingDepth(),
+                        (long long)feed_gop_idx_, gops_.size(),
+                        (long long)cache_bytes_, (int)NeedsPackets(),
+                        (int)sched_initialized_, (int)eof_cache_);
+            }
+            if (eof_pushed_) {
+                // 排空已启动后仍未派工的 chunk = 窗外 GOP（无帧可失）
+                // ——移除以让排空 marker 可达，否则 marker 被
+                // return false 挡住 → 消费者静默自旋（pop-stall 取证
+                // 只覆盖已派 chunk，覆盖不到这里）。
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (!emit_queue_.empty()
+                        && emit_queue_.front().start_pts == ch.start_pts
+                        && emit_queue_.front().side == Side(-1)) {
+                    emit_queue_.pop_front();
+                    continue;
+                }
+            }
             // 熟前挂起配套：EOF/窗界后 Push 停驱，未分配 GOP 由消费
             // 线程在此重驱泵（分配可能此刻已可进行——速率成熟/防饿死）。
-            PumpFeed();
+            // force=true：头部已饿死仍不能分配 = 库存残帧互锁（两侧
+            // pending 均非零但都不属于头部可发射序）——强制派工头部
+            // GOP 解锁。仅此处使用；正常推进走 Push 路径的无参泵。
+            // FORCEREDRIVE_OFF=1：消融——不做重驱（诊断 CPU-out 挂死）。
+            static const bool frd_off = [] {
+                const char *e = getenv("DECORD_HYBRID_FORCEREDRIVE_OFF");
+                return e != nullptr && atoi(e) > 0;
+            }();
+            if (!frd_off) {
+                PumpFeed(true);
+            }
             return false;
         }
         // force-close 安全网：该侧已路由的包全部出清（pending==0）但
@@ -1922,7 +2027,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 }
             }
 #endif
-            PumpFeed();   // 同 A4：空取时保持泵推进（EOF 后唯一驱动）
+            PumpFeed(true);   // 同 A4：空取=头部饥饿，强制泵推进
             return false;
         }
         // PopSide 成功 = 有进展（marker/陈旧丢弃/越界暂存/发射同此之后）：
@@ -2440,11 +2545,22 @@ bool HybridThreadedDecoder::UploadStep() {
     return true;
 }
 
+static void HybridTrap(const char *who, const std::exception &e) {
+    fprintf(stderr, "[hybrid-EXC] %s: %s\n", who, e.what());
+    fflush(stderr);
+}
+
 void HybridThreadedDecoder::GpuWorkerLoop() {
     static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
     while (lander_run_.load()) {
-        bool did = LandStep();
-        did = FeedStep() || did;
+        bool did = false;
+        try {
+            did = LandStep();
+            did = FeedStep() || did;
+        } catch (const std::exception &e) {
+            HybridTrap("gpu-worker", e);
+            throw;
+        }
         if (dbg && did) fprintf(stderr, "[hybrid-w] did=%d ready=%zu cpuready=%zu pktq=%zu\n", (int)did, ready_.size(), cpu_ready_.size(), gpu_pkt_q_.size());
         if (!did) {
             if (dbg) fprintf(stderr, "[hybrid-w] idle rdy=%zu crdy=%zu q=%zu",

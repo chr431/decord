@@ -516,7 +516,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     Side last_fed_side_ = Side(-1); ///< 供料侧（kick 判定用；Side(-1)=尚无）
     bool eof_cache_ = false;       ///< demux EOF 已入缓
     bool arm_flush_sent_ = false;  ///< EOF 后排空标记已发（幂等）
-    void PumpFeed();               ///< 供料泵（仅 Push 调用线程=demux 执行）
+    void PumpFeed(bool force_head = false);               ///< 供料泵（仅 Push 调用线程=demux 执行）
     // ── 层2/3 亲和分区（env 门控，默认关）────────────────────────────
     // 两组掩码：decode（ffmpeg 帧线程，物理核×N 的 SMT 对）与 service
     //（喂料/落地/上载/消费/OCR 宿主线程）。动机：混跑干扰税实测 CPU 臂
