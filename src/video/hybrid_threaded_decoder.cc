@@ -66,6 +66,9 @@
 #endif
 #include <algorithm>
 #include <cmath>
+#include <exception>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -73,6 +76,28 @@
 namespace decord {
 
 namespace {
+/*! hybrid 工作线程异常槽（2026-09-19 崩溃类修复）：工作线程 catch 到
+ *  异常后记录于此并退出线程，消费者 Pop 处转 DECORDError——异常零
+ *  逃逸（此前无 catch 线程的异常 → std::terminate → abort，dmlc
+ *  throw 分支的消息在异常体里、MSVC terminate 不打印=静默死）。 */
+static std::mutex g_hybrid_err_mtx;
+static char g_hybrid_err_msg[512] = {0};
+static std::atomic<bool> g_hybrid_err_seen{false};
+
+/*! 工作线程异常统一收口：记录原消息（Pop 处转 DECORDError）+
+    打 stderr 一份（即使 Pop 未被再调用也能留诊断）。 */
+static void HybridTrap(const char *who, const std::exception &e) {
+    {
+        std::lock_guard<std::mutex> lk(g_hybrid_err_mtx);
+        if (!g_hybrid_err_seen.load()) {
+            snprintf(g_hybrid_err_msg, sizeof(g_hybrid_err_msg),
+                     "hybrid %s: %s", who, e.what());
+            g_hybrid_err_seen.store(true);
+        }
+    }
+    fprintf(stderr, "[hybrid-EXC] %s: %s\n", who, e.what());
+    fflush(stderr);
+}
 /*! 调度粘性：同侧最少连续分配的 chunk 数（块状分配，防流水线冷启动） */
 constexpr int kStickyMinChunks = 4;
 #if defined(_WIN32)
@@ -615,6 +640,27 @@ void HybridThreadedDecoder::Start() {
         gpu_pool_.Start();
         up_pool_.Start();  // 与 gpu_pool_ 对称：Clear/Stop 后恢复
         lander_run_.store(true);
+        static std::once_flag term_flag;
+        std::call_once(term_flag, [] {
+            std::set_terminate([] {
+                if (auto ep = std::current_exception()) {
+                    try {
+                        std::rethrow_exception(ep);
+                    } catch (const std::exception &e) {
+                        fprintf(stderr,
+                                "[decord] TERMINATE: uncaught exception: %s\n",
+                                e.what());
+                    } catch (...) {
+                        fprintf(stderr,
+                                "[decord] TERMINATE: unknown exception\n");
+                    }
+                } else {
+                    fprintf(stderr, "[decord] TERMINATE called\n");
+                }
+                fflush(stderr);
+                std::abort();
+            });
+        });
         std::thread t(&HybridThreadedDecoder::GpuWorkerLoop, this);
         lander_ = std::move(t);
         if (out_cuda_) {
@@ -1825,6 +1871,11 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         }
         hol_tp_ = now_tp;
     }
+        if (g_hybrid_err_seen.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lk(g_hybrid_err_mtx);
+            throw dmlc::Error(std::string("hybrid worker failed: ")
+                              + g_hybrid_err_msg);
+        }
     while (true) {
         Chunk ch;
         {
@@ -2545,10 +2596,7 @@ bool HybridThreadedDecoder::UploadStep() {
     return true;
 }
 
-static void HybridTrap(const char *who, const std::exception &e) {
-    fprintf(stderr, "[hybrid-EXC] %s: %s\n", who, e.what());
-    fflush(stderr);
-}
+
 
 void HybridThreadedDecoder::GpuWorkerLoop() {
     static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
@@ -2559,7 +2607,8 @@ void HybridThreadedDecoder::GpuWorkerLoop() {
             did = FeedStep() || did;
         } catch (const std::exception &e) {
             HybridTrap("gpu-worker", e);
-            throw;
+            lcv_.notify_all();   // 唤醒消费者：Pop 处转 DECORDError
+            break;               // 退出线程（不再 rethrow=不再 terminate）
         }
         if (dbg && did) fprintf(stderr, "[hybrid-w] did=%d ready=%zu cpuready=%zu pktq=%zu\n", (int)did, ready_.size(), cpu_ready_.size(), gpu_pkt_q_.size());
         if (!did) {
@@ -2573,7 +2622,15 @@ void HybridThreadedDecoder::GpuWorkerLoop() {
 
 void HybridThreadedDecoder::UploaderLoop() {
     while (lander_run_.load()) {
-        if (!UploadStep()) {
+        bool did = false;
+        try {
+            did = UploadStep();
+        } catch (const std::exception &e) {
+            HybridTrap("uploader", e);
+            lcv_.notify_all();
+            break;
+        }
+        if (!did) {
             std::unique_lock<std::mutex> lk(lcv_mtx_);
             lcv_.wait_for(lk, std::chrono::milliseconds(1));
         }
