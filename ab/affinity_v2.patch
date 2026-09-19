@@ -1,0 +1,152 @@
+diff --git a/src/video/hybrid_threaded_decoder.cc b/src/video/hybrid_threaded_decoder.cc
+index 5b6c99c..07e9324 100644
+--- a/src/video/hybrid_threaded_decoder.cc
++++ b/src/video/hybrid_threaded_decoder.cc
+@@ -77,6 +77,7 @@ constexpr int kStickyMinChunks = 4;
+ #if defined(_WIN32)
+ std::vector<unsigned long> SnapshotThreads();   // 定义见亲和分区节
+ bool SetThreadAffinity(unsigned long tid, uintptr_t mask);
++bool ThreadNameIsAv(unsigned long tid);
+ #endif
+ }  // namespace
+ 
+@@ -627,9 +628,16 @@ void HybridThreadedDecoder::Start() {
+ #endif
+ #if defined(_WIN32)
+     if (affinity_on_) {
+-        // 差分本轮新增线程：lander/uploader → service；其余新增（cpu_
+-        // 解码 worker / filter worker）→ decode。此前直接把存量+新增
+-        // 全归 service，把 cpu_ worker 也钉去服务核 → CPU 臂饿死。
++        // ── 亲和分区 v2（2026-09-15）：按 FFmpeg 帧线程名识别 ──
++        // v1 把差分窗口内全部新线程钉进解码组——CUDA 初始化线程
++        //（parser/回调，~23/55）被错钉后与解码线程互卡 → hevc 10fps
++        // 灾难（层2 已知故障）。FFmpeg 9 帧线程入口自带命名
++        //（"av:<codec>:df<idx>"）→ 按名识别；CUDA/无名新线程保持
++        // 默认全核不钉（根治错钉），存量进程线程仍归 service。
++        Sleep(100);   // 等 avcodec 帧线程入口的 setname 落定（一次性）
++        if (getenv("DECORD_AFF_X1") || getenv("DECORD_AFF_X0")) {
++            return;   // X0：亲和块整体空转（二分锚点）
++        }
+         const unsigned long lander_tid = lander_.joinable()
+             ? GetThreadId(lander_.native_handle()) : 0;
+         const unsigned long uploader_tid = uploader_.joinable()
+@@ -641,16 +649,19 @@ void HybridThreadedDecoder::Start() {
+         std::set_difference(after.begin(), after.end(),
+                             pre_tids.begin(), pre_tids.end(),
+                             std::back_inserter(added));
++        std::vector<unsigned long> unpinned;
+         for (DWORD tid : added) {
+             if (tid == lander_tid || tid == uploader_tid) {
+                 SetThreadAffinity(tid, service_mask_);
+-            } else {
++            } else if (ThreadNameIsAv(tid)) {
+                 if (SetThreadAffinity(tid, decode_mask_)) {
+                     decode_tids_.push_back(tid);
+                 }
++            } else {
++                unpinned.push_back(tid);   // CUDA/无名：不钉（根治错钉）
+             }
+         }
+-        PinRemainingToService();   // 存量（python/TRT/引擎）
++        PinRemainingToService(&unpinned);   // 存量（python/TRT/引擎）
+     }
+ #endif
+ }
+@@ -926,6 +937,30 @@ std::vector<unsigned long> SnapshotThreads() {
+     CloseHandle(snap);
+     return out;
+ }
++bool ThreadNameIsAv(DWORD tid) {
++    if (getenv("DECORD_AFF_V2_BYPASS")) return false;   // 二分：绕过按名识别
++    // FFmpeg 9 帧线程入口即 SetThreadDescription("av:<codec>:df<idx>"，
++    // pthread_frame.c thread_set_name)——按名识别，避免 v1 差分把 CUDA
++    // 初始化线程错钉进解码组（hevc 10fps 灾难根因）。
++    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
++    if (!h) return false;
++    using Fn = HRESULT(WINAPI *)(HANDLE, PWSTR *);
++    static Fn get_desc = []() -> Fn {
++        HMODULE k = GetModuleHandleW(L"kernel32.dll");
++        return k ? reinterpret_cast<Fn>(GetProcAddress(k, "GetThreadDescription"))
++                 : nullptr;
++    }();
++    bool ok = false;
++    if (get_desc) {
++        PWSTR name = nullptr;
++        if (SUCCEEDED(get_desc(h, &name)) && name) {
++            ok = name[0] == L'a' && name[1] == L'v' && name[2] == L':';
++            LocalFree(name);
++        }
++    }
++    CloseHandle(h);
++    return ok;
++}
+ bool SetThreadAffinity(DWORD tid, uintptr_t mask) {
+     HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
+                           FALSE, tid);
+@@ -939,6 +974,8 @@ bool SetThreadAffinity(DWORD tid, uintptr_t mask) {
+ 
+ void HybridThreadedDecoder::InitAffinityMasks() {
+ #if defined(_WIN32)
++    if (getenv("DECORD_HYBRID_DEBUG"))
++        fprintf(stderr, "[hybrid-affinity] InitAffinityMasks enter\n");
+     // env：DECORD_HYBRID_DECODE_CORES=物理核数（0/未设=关；-1=默认
+     // total-3）。仅在单 processor group（逻辑核 ≤64）平台生效。
+     int want = 0;
+@@ -1005,27 +1042,37 @@ void HybridThreadedDecoder::PinFfmpegThreads() {
+                         std::back_inserter(added));
+     int pinned = 0;
+     for (DWORD tid : added) {
+-        if (SetThreadAffinity(tid, decode_mask_)) {
+-            decode_tids_.push_back(tid);
+-            ++pinned;
++        if (ThreadNameIsAv(tid)) {   // v2: 按名识别（CUDA/无名线程不钉）
++            if (SetThreadAffinity(tid, decode_mask_)) {
++                decode_tids_.push_back(tid);
++                ++pinned;
++            }
+         }
+     }
+     if (getenv("DECORD_HYBRID_DEBUG")) {
+-        fprintf(stderr, "[hybrid-affinity] pinned %d ffmpeg threads to decode set\n",
+-                pinned);
++        fprintf(stderr, "[hybrid-affinity] pinned %d/%d av-named to decode\n",
++                pinned, (int)added.size());
+     }
+ #endif
+ }
+ 
+-void HybridThreadedDecoder::PinRemainingToService() {
++void HybridThreadedDecoder::PinRemainingToService(
++    std::vector<unsigned long> *added_unpinned) {
+ #if defined(_WIN32)
+     if (!affinity_on_) return;
++    if (getenv("DECORD_AFF_V2_PINOFF")) return;   // 实验：不钉存量
+     std::sort(decode_tids_.begin(), decode_tids_.end());
+     auto all = SnapshotThreads();
+     std::sort(all.begin(), all.end());
++    std::sort(all.begin(), all.end());
++    std::vector<unsigned long> known = decode_tids_;
++    if (added_unpinned) {
++        for (unsigned long tid : *added_unpinned) known.push_back(tid);
++        std::sort(known.begin(), known.end());
++    }
+     std::vector<unsigned long> others;
+     std::set_difference(all.begin(), all.end(),
+-                        decode_tids_.begin(), decode_tids_.end(),
++                        known.begin(), known.end(),
+                         std::back_inserter(others));
+     int pinned = 0;
+     for (DWORD tid : others) {
+diff --git a/src/video/hybrid_threaded_decoder.h b/src/video/hybrid_threaded_decoder.h
+index 5795bf2..bc5d9bd 100644
+--- a/src/video/hybrid_threaded_decoder.h
++++ b/src/video/hybrid_threaded_decoder.h
+@@ -493,7 +493,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
+     // 0=关）；存量线程在 Start() 时归 service（除已被钉为 decode 的）。
+     void InitAffinityMasks();      ///< 拓扑感知计算 decode/service 掩码
+     void PinFfmpegThreads();       ///< avcodec_open2 前后快照差分
+-    void PinRemainingToService();  ///< Start() 时存量 + 本类服务线程
++    void PinRemainingToService(std::vector<unsigned long> *added_unpinned = nullptr);  ///< Start() 时存量 + 本类服务线程（v2 排除未识别新线程）
+     uintptr_t decode_mask_ = 0;
+     uintptr_t service_mask_ = 0;
+     bool affinity_on_ = false;

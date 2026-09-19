@@ -1,3 +1,6 @@
+# DEPRECATED (2026-09-19) - NOT CALLED. 本文件是 0.8.1 去 Toolkit 化之前的遗留：它寻找 cudart/nvrtc/cudnn/cublas/nvml/nvcuvid
+# 六个库，与现役构建模型（零 Toolkit 依赖 + 运行时动态加载，见 cmake/modules/CUDA.cmake）
+# 完全相反；CMakeLists.txt 从未调用 find_cuda()。保留仅为历史对照。
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information

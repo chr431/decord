@@ -147,9 +147,11 @@ class CUDADeviceAPI final : public DeviceAPI {
       if (ctx_from.device_id == ctx_to.device_id) {
         GPUCopy(from, to, size, cudaMemcpyDeviceToDevice, cu_stream);
       } else {
-        cudaMemcpyPeerAsync(to, ctx_to.device_id,
-                            from, ctx_from.device_id,
-                            size, cu_stream);
+        // 返回值必须检查（2026-09-19）：此前裸调用丢弃返回值，符号解析
+        // 失败时静默产出未初始化目标缓冲（多卡跨设备拷贝的静默数据损坏）。
+        CUDA_CALL(cudaMemcpyPeerAsync(to, ctx_to.device_id,
+                                      from, ctx_from.device_id,
+                                      size, cu_stream));
       }
     } else if (ctx_from.device_type == kDLCUDA && ctx_to.device_type == kDLCPU) {
       CUDA_CALL(cudaSetDevice(ctx_from.device_id));

@@ -45,4 +45,6 @@ RUN apt-get clean && rm -rf /tmp/* /var/tmp/* /var/lib/apt/lists/* && apt-get -y
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 RUN ln -s /usr/lib/x86_64-linux-gnu/libnvcuvid.so.1 /usr/local/cuda/lib64/libnvcuvid.so
 RUN git clone --recursive https://github.com/dmlc/decord
-RUN cd decord && mkdir build && cd build && cmake .. -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release && make -j2 && cd ../python && python3 setup.py install
+# 2026-09-19: python/setup.py 已删（本 fork 改 pyproject.toml 构建），
+# 原 `python3 setup.py install` 必然失败 → 改 pip 从仓库根安装。
+RUN cd decord && mkdir build && cd build && cmake .. -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release && make -j2 && cd .. && pip3 install .

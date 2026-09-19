@@ -79,7 +79,7 @@ using nv_lib_t = void*;
   X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyDtoDAsync_v2,                          \
     (CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream),     \
     (dst, src, ByteCount, hStream))                                             \
-  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyPeerAsync_v2,                          \
+  X(CUresult, CUDA_ERROR_NOT_FOUND, cuMemcpyPeerAsync,                             \
     (CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,        \
      CUcontext srcContext, size_t ByteCount, CUstream hStream),                 \
     (dstDevice, dstContext, srcDevice, srcContext, ByteCount, hStream))         \

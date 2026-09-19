@@ -23,7 +23,8 @@
 # - cudart 调用走自研垫片（src/runtime/cuda/cudart_shim.*，转驱动 API）
 # - improc kernel 以预编译 PTX 内嵌（src/improc/improc_ptx.inc，经
 #   cuModuleLoadData 加载；再生成命令见 improc_dyn.cc 头注释）
-# - nvcuvid.h / cuda.h / nvml.h 头文件由仓库自带（cuda_include/、nvcuvid/）
+# - nvcuvid.h / cuda.h 由仓库自带（cuda_include/、nvcuvid/）；
+#   NVML 用 4 符号垫片 nvml_min.h（2026-09-19：14.5k 行官方头副本已删，省 795KB）
 
 if(USE_CUDA)
   add_definitions(-DDECORD_USE_CUDA)

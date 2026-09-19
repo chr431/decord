@@ -16,7 +16,7 @@
 #pragma once
 
 #include <cuda.h>
-#include <nvml.h>
+#include "nvml_min.h"   // 2026-09-19：14.5k 行官方头 → 4 符号垫片（见该头注释）
 #include <nvcuvid.h>
 
 /* cuda.h(13.x) 把内存/拷贝类 API 宏重定向到 *_v2 旧符号，而新驱动已
@@ -105,7 +105,12 @@ CUresult CUDAAPI cuMemcpyDtoHAsync_v2(void* dst, CUdeviceptr src,
                                    size_t ByteCount, CUstream hStream);
 CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dst, CUdeviceptr src,
                                    size_t ByteCount, CUstream hStream);
-CUresult CUDAAPI cuMemcpyPeerAsync_v2(CUdeviceptr dstDevice, CUcontext dstContext,
+/* 无后缀（2026-09-19 冻结前修正）：实测本机 nvcuda.dll 只导出
+ * cuMemcpyPeerAsync；同类 _v2 符号（DtoH/HtoD/DtoD/2D…）驱动都有导出，
+ * 唯独 cuMemcpyPeerAsync_v2 MISSING —— 且 cuda.h 里也没有这个名字
+ * （它是 0.8.1 去 Toolkit 化时手写声明写错的）。错误符号导致加载恒
+ * nullptr → cudaMemcpyPeerAsync 静默失败（多卡跨设备拷贝产出垃圾帧）。 */
+CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
                                    CUdeviceptr srcDevice, CUcontext srcContext,
                                    size_t ByteCount, CUstream hStream);
 CUresult CUDAAPI cuMemcpy2D_v2(const CUDA_MEMCPY2D* pCopy);

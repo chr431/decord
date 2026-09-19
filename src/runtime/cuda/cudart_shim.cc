@@ -244,7 +244,10 @@ cudaError_t cudaMemcpyPeerAsync(void *dst, int dstDevice, const void *src,
   CUcontext dctx = CtxFor(dstDevice);
   CUcontext sctx = CtxFor(srcDevice);
   if (!dctx || !sctx) return cudaErrorInitializationError;
-  return Err(nv::cuMemcpyPeerAsync_v2(
+  // 无后缀（2026-09-19 冻结前修正）：驱动不导出 _v2 版，此前符号解析恒
+  // 失败 → 本函数静默返回错误码、调用方（cuda_device_api）未检查 → 多卡
+  // 跨设备拷贝产出未初始化缓冲。
+  return Err(nv::cuMemcpyPeerAsync(
       reinterpret_cast<CUdeviceptr>(dst), dctx,
       reinterpret_cast<CUdeviceptr>(const_cast<void *>(src)), sctx, count,
       reinterpret_cast<CUstream>(stream)));

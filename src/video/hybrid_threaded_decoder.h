@@ -116,9 +116,7 @@ class HybridGpuBufferPool {
      *  后由调用方 cudaStreamWaitEvent —— 上载 H2D 无需 blocking 流全局
      *  互斥即可与消费侧在途拷贝保序（否则二者互相排队，上载被消费
      *  拷贝序列化，实测 hevc 上载链掉到 ~700fps）。 */
-    void EnableReleaseSync();
     /*! \brief Acquire 拿到缓冲后调用：等待其上次消费拷贝完成 */
-    void WaitRelease(void *stream);
     static void Deleter(runtime::NDArray::Container *ptr);
 
   private:
@@ -133,8 +131,6 @@ class HybridGpuBufferPool {
     DLDataType dtype_ = kUInt8;
     DLDevice dev_{kDLCUDA, 0};
     std::function<void()> on_release_;
-    void *release_ev_ = nullptr;    // cudaEvent_t（回池点标记）
-    void *sync_stream_ = nullptr;   // 等待事件的上载流
 };
 #endif  // DECORD_USE_CUDA
 
@@ -191,9 +187,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
                           std::vector<int64_t> rank_list,
                           int64_t frame_count);
 
-    /*! \brief 混合统计（诊断用）：两路各自输出的帧数 */
-    int64_t FramesDecoded(bool gpu_side) const { return frames_out_[gpu_side ? 1 : 0].load(); }
-
   private:
     enum Side : int { SIDE_CPU = 0, SIDE_GPU = 1 };
 
@@ -218,7 +211,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  side_pending_[GPU]≠0 而正确地不敢关它）。 */
     Side ForcedSide() const;
     /*! rief pts 	o 呈现序帧号（kf 表近似，调度用） */
-    int64_t RankOfPts(int64_t pts) const;
     /*! \brief chunk [start,end) 的期望帧数（查 kf 索引；0=未知） */
     int64_t ExpectedFrames(int64_t start_pts, int64_t end_pts) const;
     /*! \brief 该 codec 的关键帧是否 IDR 型（决定可否用 kick 冲刷/混合路由） */
@@ -230,11 +222,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
 #ifdef DECORD_USE_CUDA
     /*! \brief 落地线程主循环：只做 LandStep（NVDEC 收帧 → D2H → ready_） */
     void GpuWorkerLoop();
-    /*! \brief 喂包线程主循环：只做 FeedStep。与落地分离 —— FeedStep 极
-     *  廉价但旧实现与 LandStep（含 3.1MB/帧 D2H 收割 memcpy）串行，落地
-     *  1500fps 时单线程循环率 ~2200/s 已在 NVDEC 供包临界（1868/s），
-     *  落地越忙喂包越饿，rg 被压到 ~1400（独跑 1868）。 */
-    void FeederLoop();
     /*! \brief 落地一步：ready_ 有余量才 gpu_->Pop → D2H → ready_。
      *  持续排空 NVDEC 输出队列是显存有界的关键（reorder 无界堆积即
      *  7.7GB 峰值/OOM 的根因）。返回是否做了实际工作。 */
@@ -428,7 +415,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
 #endif
     /*! \brief 已路由到 GPU、尚未发射/丢弃的帧数（包粒度精确计数；
      *  诊断用途） */
-    int64_t gpu_pending_ = 0;
 
     ffmpeg::FFMPEGThreadedDecoder cpu_;
     int device_id_;
@@ -510,7 +496,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     size_t cache_peak_bytes_ = 0;  ///< 峰值（stats）
     size_t cache_budget_ = 512u << 20;  ///< 默认 512MB（构造期读 env）
     int64_t gop_seq_ = 0;          ///< 下一 GOP 的绝对 id
-    int64_t cur_gop_pkt_begin_ = 0;   ///< 当前打开 GOP 的 cache 起始序列
     std::vector<GopRec> gops_;     ///< 全部 GOP 的缓存记账（Clear 才清）
     int64_t feed_gop_idx_ = 0;     ///< 下一个未供 GOP 的 gops_ 下标
     Side last_fed_side_ = Side(-1); ///< 供料侧（kick 判定用；Side(-1)=尚无）
@@ -567,7 +552,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int prefetch_frames_ = 384;    ///< demux 领先深度建议（包）
 
     std::atomic<int64_t> frames_out_[2]{};
-    std::atomic<bool> started_{false};
     // ── 非打印测量（2026-09-12，§7.2 先量后做）──────────────────────
     // 热路径只做 relaxed 整数累加，**不打 stderr**；唯一输出点是 Stop()
     // 里 `DECORD_HYBRID_STATS` 门控的一次性汇总块（析构时触发，不在被测
