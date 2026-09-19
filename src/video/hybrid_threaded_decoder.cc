@@ -76,34 +76,30 @@
 namespace decord {
 
 namespace {
-/*! hybrid 工作线程异常槽（2026-09-19 崩溃类修复）：工作线程 catch 到
- *  异常后记录于此并退出线程，消费者 Pop 处转 DECORDError——异常零
- *  逃逸（此前无 catch 线程的异常 → std::terminate → abort，dmlc
- *  throw 分支的消息在异常体里、MSVC terminate 不打印=静默死）。 */
-static std::mutex g_hybrid_err_mtx;
-static char g_hybrid_err_msg[512] = {0};
-static std::atomic<bool> g_hybrid_err_seen{false};
-
-/*! 工作线程异常统一收口：记录原消息（Pop 处转 DECORDError）+
-    打 stderr 一份（即使 Pop 未被再调用也能留诊断）。 */
-static void HybridTrap(const char *who, const std::exception &e) {
-    {
-        std::lock_guard<std::mutex> lk(g_hybrid_err_mtx);
-        if (!g_hybrid_err_seen.load()) {
-            snprintf(g_hybrid_err_msg, sizeof(g_hybrid_err_msg),
-                     "hybrid %s: %s", who, e.what());
-            g_hybrid_err_seen.store(true);
-        }
-    }
-    fprintf(stderr, "[hybrid-EXC] %s: %s\n", who, e.what());
-    fflush(stderr);
-}
 /*! 调度粘性：同侧最少连续分配的 chunk 数（块状分配，防流水线冷启动） */
 #if defined(_WIN32)
 std::vector<unsigned long> SnapshotThreads();   // 定义见亲和分区节
 bool SetThreadAffinity(unsigned long tid, uintptr_t mask);
 #endif
 }  // namespace
+
+/*! 工作线程异常统一收口（2026-09-19 崩溃类修复；2026-09-20 改 per-instance
+ *  成员——原进程级全局槽在多 reader 并存时任一 reader 的 worker 异常会
+ *  污染所有 hybrid reader 的 Pop，引擎池 _POOL_MAX_TOTAL=16 下不可接受）：
+ *  记录原消息（Pop 处转 DECORDError）+ 打 stderr 一份（即使 Pop 未被
+ *  再调用也能留诊断）。 */
+void HybridThreadedDecoder::TrapWorkerError(const char *who,
+                                            const std::exception &e) {
+    {
+        std::lock_guard<std::mutex> lk(err_mtx_);
+        if (!err_seen_.load()) {
+            err_msg_ = std::string("hybrid ") + who + ": " + e.what();
+            err_seen_.store(true);
+        }
+    }
+    fprintf(stderr, "[hybrid-EXC] %s: %s\n", who, e.what());
+    fflush(stderr);
+}
 
 HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
                                              AVCodecParameters *codecpar,
@@ -1359,7 +1355,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                     // 解锁）：库存残帧互锁时由消费线程经 Pop 重驱泵并
                     // 强制分配头部 GOP。双空走 PickFeedSide（gop0 GPU
                     // 起步 / gop1 CPU 采样语义不变，FORCE_SIDE 亦经它
-                    // 生效）。HOLD_OFF=1 回退旧路径（消融/诊断用）。
+                    // 生效）。
                     const bool force_this =
                         force_head && k == feed_gop_idx_;
                     if (force_this) {
@@ -1831,10 +1827,9 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         }
         hol_tp_ = now_tp;
     }
-        if (g_hybrid_err_seen.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> lk(g_hybrid_err_mtx);
-            throw dmlc::Error(std::string("hybrid worker failed: ")
-                              + g_hybrid_err_msg);
+        if (err_seen_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lk(err_mtx_);
+            throw dmlc::Error("hybrid worker failed: " + err_msg_);
         }
     while (true) {
         Chunk ch;
@@ -1867,7 +1862,6 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             // force=true：头部已饿死仍不能分配 = 库存残帧互锁（两侧
             // pending 均非零但都不属于头部可发射序）——强制派工头部
             // GOP 解锁。仅此处使用；正常推进走 Push 路径的无参泵。
-            // FORCEREDRIVE_OFF=1：消融——不做重驱（诊断 CPU-out 挂死）。
             PumpFeed(true);
             return false;
         }
@@ -2441,6 +2435,15 @@ bool HybridThreadedDecoder::UploadStep() {
     // 提交顺序；marker/池尽/CPU 断流等所有提前退出路径先冲刷批再处理
     //（此前事件环方案的 marker/EOF 语义腐坏在这里不存在 —— 冲刷在
     // UploadStep 栈内同步完成，无跨调用在途状态）。
+    // ── 积攒窗（2026-09-20 H2D 聚合轮）──
+    // 批次化上线后实测批均仍只有 ~2.4 帧：CPU 臂断流（cpu-empty）即
+    // 冲刷，UPLOAD_BATCH 8→64 消融无差的根因就是实际批从未变大——
+    // 7761 帧仍是 7761 次小 H2D 提交，与 TRT 提交同上下文错叠，infer
+    // p50 8.6→14.1ms（回到 trt_call 串行价，引擎侧启动轮 §10）。积攒
+    // 窗：断流时不立即冲刷，窗内等续流攒大批（批均≈rc×W），一次 sync
+    // 收割。只改发射时机，不改任何路径语义：marker/EOF/池尽仍立即
+    // 冲刷；等待期释放池槽不占显存存货；稳态吞吐不变（恒定 W 只是
+    // 一次性延迟，合并以 chunk/GOP 粒度保序，8 帧级突发无感）。
     static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
     // 批大小消融旋钮（一次性读 env；仅上载线程读写 up_batch_，无锁）。
     static const int batch_env = [] {
@@ -2450,9 +2453,20 @@ bool HybridThreadedDecoder::UploadStep() {
     if (batch_env > 0) {
         up_batch_ = batch_env < kUploadBatch ? batch_env : kUploadBatch;
     }
+    // 积攒窗宽度 µs（一次性读 env；默认 0 = 关）。2026-09-20 A/B
+    // （h264/hevc hybrid 全片，臂序轮转）：机制生效（q_put_block −23%、
+    // consume_feed −6% 双显著）但 wall 无净收益——h264 侧 decode.batch
+    // +3.7%（HOL 延迟对冲），且当日 infer 暴露未复现（Σinfer 1.31s 已
+    // = cpu 路径水平），无收益可兑现。默认关；机制保留供「暴露复现的
+    // 机器状态」下复评（引擎侧启动轮 §10 的归因未获干预实验支持）。
+    static const int wait_us = [] {
+        const char *e = getenv("DECORD_HYBRID_UPLOAD_WAIT_US");
+        return e ? atoi(e) : 0;
+    }();
     runtime::NDArray bufs[kUploadBatch];
     int nf = 0;
     bool did = false;
+    const auto batch_t0 = std::chrono::steady_clock::now();
     auto flush = [&]() {
         if (nf == 0) return;
         up_flush_n_.fetch_add(1, std::memory_order_relaxed);
@@ -2478,6 +2492,21 @@ bool HybridThreadedDecoder::UploadStep() {
         }
         runtime::NDArray f;
         if (!cpu_.Pop(&f) || !f.defined()) {
+            // 积攒窗：批内已有帧且窗未到期 → 释放池槽、小睡重试（EOF
+            // marker 在队列尾，最长 250µs 后即被此重试取到并立即冲刷，
+            // 尾部无额外等待）。
+            if (nf > 0 && wait_us > 0) {
+                const auto waited =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - batch_t0)
+                                .count();
+                if (waited < wait_us) {
+                    buf = runtime::NDArray();   // 等待期不占池槽
+                    std::this_thread::sleep_for(
+                            std::chrono::microseconds(250));
+                    continue;
+                }
+            }
             up_cempty_.fetch_add(1, std::memory_order_relaxed);
             if (dbg) fprintf(stderr, "[hybrid-u] cpu-empty");
             flush();  // buf 随析构归还池
@@ -2539,7 +2568,7 @@ void HybridThreadedDecoder::GpuWorkerLoop() {
             did = LandStep();
             did = FeedStep() || did;
         } catch (const std::exception &e) {
-            HybridTrap("gpu-worker", e);
+            TrapWorkerError("gpu-worker", e);
             lcv_.notify_all();   // 唤醒消费者：Pop 处转 DECORDError
             break;               // 退出线程（不再 rethrow=不再 terminate）
         }
@@ -2559,7 +2588,7 @@ void HybridThreadedDecoder::UploaderLoop() {
         try {
             did = UploadStep();
         } catch (const std::exception &e) {
-            HybridTrap("uploader", e);
+            TrapWorkerError("uploader", e);
             lcv_.notify_all();
             break;
         }

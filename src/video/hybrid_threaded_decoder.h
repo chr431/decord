@@ -245,12 +245,22 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  H2D 在批内重叠）。运行期默认 8，`DECORD_HYBRID_UPLOAD_BATCH`
      *  可消融覆盖（1 = 逐帧同步旧行为）。
      *
-     *  **批大小不是杠杆（2026-09-12 消融定论）**：有效批均 1.1-3 的约束
-     *  是 cpu-empty（上传者消费快于 CPU 解码者补充，队列近恒空），不是
-     *  上限——上限提到 32/64 批均纹丝不动；反向压到 1（逐帧同步旧行为）
-     *  引擎全片 e2e 也无差（hevc 配对 3 遍中位 9.54 vs 9.66s，符号混乱
-     *  = 漂移内；av1/h264 同）。上传同步成本不在关键路径，cpu-empty 提前
-     *  冲刷（低发射延迟）是正确默认，勿再做上传链重构。 */
+     *  **批大小上限不是杠杆（2026-09-12 消融定论）**：有效批均 1.1-3 的
+     *  约束是 cpu-empty（上传者消费快于 CPU 解码者补充，队列近恒空），
+     *  不是上限——上限提到 32/64 批均纹丝不动；反向压到 1（逐帧同步旧
+     *  行为）引擎全片 e2e 也无差（hevc 配对 3 遍中位 9.54 vs 9.66s，
+     *  符号混乱 = 漂移内；av1/h264 同）。
+     *
+     *  **积攒窗（2026-09-20，H2D 聚合轮）**：启动轮 §10 的排除法把
+     *  h264 hybrid 的 infer p50 8.6→14.1ms 归因到「上载执行者与粒度」
+     *  （7761 次小 H2D 与 TRT 提交同上下文错叠，defer 重叠被打断）——
+     *  09-12 消融测的是「上限」这个错误杠杆，真正的杠杆是 cpu-empty
+     *  即冲刷导致的实际批均 2.4。窗内断流不冲刷、等续流攒大批
+     *  （`DECORD_HYBRID_UPLOAD_WAIT_US`，默认 0=关）；marker/EOF/池尽
+     *  仍立即冲刷。**A/B 裁决（同日）**：机制生效（put_block/consume_feed
+     *  双显著下降）但 wall 无净收益——h264 decode.batch +3.7% HOL 对冲、
+     *  当日 infer 暴露未复现（Σinfer 已 = cpu 路径）→ 默认关，暴露复现
+     *  的机器状态下复评。 */
     static constexpr int kUploadBatch = 64;  ///< 数组容量上限（非行为默认）
     int up_batch_ = 8;                       ///< 运行期批大小（仅上载线程读写）
     /*! \brief pinned 暂存槽（每批帧各一槽，仅上载线程访问）：pageable
@@ -597,6 +607,16 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     // NeedsPackets/PumpFeed 同在消费线程读取——单线程不变量无锁。
     int64_t window_frames_ = -1;
     std::atomic<int64_t> stats_t0_us_{0};                 ///< Push 首包时刻（steady epoch µs）
+    // 工作线程异常槽（per-instance，2026-09-20）：原为进程级全局槽
+    // （g_hybrid_err_*），多 reader 并存时任一 reader 的 worker 异常会
+    // 污染所有 hybrid reader 的 Pop——引擎池 16 reader 并存下不可接受。
+    std::mutex err_mtx_;
+    std::string err_msg_;
+    std::atomic<bool> err_seen_{false};
+
+    /*! 工作线程异常统一收口：记录本实例消息（Pop 处转 DECORDError）
+     *  + 打 stderr 一份（即使 Pop 未被再调用也能留诊断）。 */
+    void TrapWorkerError(const char *who, const std::exception &e);
 };
 
 }  // namespace decord
