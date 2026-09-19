@@ -286,27 +286,35 @@ CPU, slower than pure NVDEC. Measure on your own hardware (see
 
 ## Performance reference
 
+**Caliber note (important)**: the table below is **decode-only** — it measures
+decord decoding alone, with no engine-side coupling (no inference, no
+segmentation, no consumer thread). End-to-end numbers (with OCR etc.) live in
+the [chr431/video_ocr_engine](https://github.com/chr431/video_ocr_engine)
+repo and **must not be mixed with these**. Reproduce with
+`tests/bench_decode_only.py` from this repo.
+
 Measured on one machine (AMD Ryzen 9 7945HX + RTX 4060 Laptop, Windows, FFmpeg
-9.0 shared, 1080p, `output_format='yuv420'`, sequential `get_batch` of 250
-frames, median of 5-10 runs, fps). Results vary greatly across machines/
-streams/resolutions/**power plans** — measure your own workload; hybrid is
-experimental, numbers are order-of-magnitude guidance.
+9.0 shared, 1080p, `output_format='yuv420'`, **full frames**, sequential
+`get_batch` of 250 frames, full 23970-frame file × 5 runs, median, fps;
+2026-09-19 `v0.8.4` caliber). Results vary greatly across machines/streams/
+resolutions/**power plans** — measure your own workload; hybrid is experimental.
 
 | Decoder | H.264 | HEVC | AV1 |
 |---|---|---|---|
-| `cpu` (16 decode threads) | 1233 | 961 | 709 |
-| `gpu` (NVDEC) | 958 | 1868 | 1285 |
-| `hybrid` (experimental, → host memory) | **1761** | **2216** | **1852** |
-| `hybrid_gpu` (experimental, → VRAM) | **1650** | 2075 | 1785 |
+| `cpu` (decode threads: h264/hevc 32, av1 24) | 1386 | 841 | 996 |
+| `gpu` (NVDEC, full frames) | 864 | 1782 | 1511 |
+| `hybrid_gpu` (experimental, → VRAM) | **1484** | **1978** | **2074** |
 
 Notes:
 
-- All six configurations (3 codecs × both modes) beat pure CPU AND pure NVDEC
-  simultaneously: 1.42-2.31x over pure CPU, 1.01-1.86x over pure NVDEC
-  (hevc hybrid 2216 fps).
-- **The Windows power plan strongly affects hybrid stability**: under mixed
-  CPU+GPU load, boost-governor behaviour can produce ±15-25% run-to-run
-  variance ("bimodal" throughput) on the same binary. For reproducible
+- **Hybrid beats both single decoders on all three codecs**: +7% (h264, vs cpu),
+  +11% (hevc, vs NVDEC), +37% (av1, vs NVDEC) over the best single arm. The
+  H.264 margin is smallest because its CPU software decode is already fast
+  (1386 fps) — hybrid needs both arms to gain.
+- **Decode rate is stream-dependent; do not infer it from the codec name**:
+  for the same H.264, an x264-medium (weighted prediction) stream decodes
+  ~1.6x slower on CPU than a hardware-encoder-style stream. The h264 column
+  above comes from an x264-medium stream. Choose by measured rate, not codec.
   benchmarks, pin the power plan (high performance / ultimate performance)
   before measuring.
 - `get_batch` throughput includes every pipeline (consumer batch assembly:
