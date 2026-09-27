@@ -9,13 +9,17 @@ rem    dll after editing C++ (silent wrong-result). Now build+deploy is one
 rem    command and tools/env_doctor.py verifies md5 afterwards.
 rem  - CMAKE_BUILD_TYPE used to silently drift (Debug vs Release). It is now
 rem    explicit and overridable, and defaults to Release.
+rem 2026-09-28 R3-4: switch to CMakePresets ("dev" = Ninja + Release +
+rem  USE_CUDA=ON into build-081fix). FFMPEG_DIR goes through the env
+rem (FindFFmpeg reads $ENV{FFMPEG_DIR}); CMAKE_BUILD_TYPE override now maps
+rem to a plain -D on top of the preset (preset keeps Release as default).
 call "C:\Program Files\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
 cd /d %~dp0
 if "%FFMPEG_DIR%"=="" set FFMPEG_DIR=D:/Software/ffmpeg-n9.0-latest-win64-gpl-shared-9.0
 if "%CMAKE_BUILD_TYPE%"=="" set CMAKE_BUILD_TYPE=Release
-cmake -B build-081fix -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% -DFFMPEG_DIR=%FFMPEG_DIR% .
+cmake --preset dev -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% -DUSE_CUDA=ON
 if errorlevel 1 exit /b 1
-cmake --build build-081fix --parallel %*
+cmake --build --preset dev --parallel %*
 if errorlevel 1 exit /b 1
 
 rem --- deploy into site-packages (kill stale python first) ---

@@ -1,0 +1,45 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "vendor": {
+    "note": "R3-4（2026-09-28）：收敛 9 个历史 build-* 目录为三 preset。FFMPEG_DIR 不进 preset（空环境变量会破坏 FindFFmpeg），由 rebuild_dev.bat / 环境注入。GPU-only 化后 USE_CUDA 恒 ON（OFF 即 FATAL_ERROR），显式写出仅为自证。"
+  },
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "dev（日常开发，Ninja+Release）",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-081fix",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "USE_CUDA": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "asan（MSVC 地址消毒，RelWithDebInfo）",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "USE_CUDA": "ON",
+        "CMAKE_CXX_FLAGS": "/fsanitize=address"
+      }
+    },
+    {
+      "name": "release-check",
+      "displayName": "release-check（发版前干净树核对）",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-rel-check",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "USE_CUDA": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "release-check", "configurePreset": "release-check" }
+  ]
+}
