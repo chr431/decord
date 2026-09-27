@@ -105,7 +105,9 @@ assign_source_group("Source" ${GROUP_SOURCE})
 assign_source_group("Include" ${GROUP_INCLUDE})
 
 # Source file lists
-file(GLOB DECORD_CORE_SRCS src/*.cc src/runtime/*.cc src/video/*.cc src/sampler/*.cc src/audio/*.cc src/av_wrapper/*.cc)
+# R3-3（2026-09-28）：hybrid 解码器拆为 src/video/hybrid/ 四 TU
+# （supervisor/budget/pump/pools），glob 面扩到该子目录
+file(GLOB DECORD_CORE_SRCS src/*.cc src/runtime/*.cc src/video/*.cc src/video/hybrid/*.cc src/sampler/*.cc src/audio/*.cc src/av_wrapper/*.cc)
 
 # Module rules
 include(cmake/modules/FFmpeg.cmake)
