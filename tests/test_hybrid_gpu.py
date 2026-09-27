@@ -9,7 +9,7 @@ import os
 import sys
 
 os.environ.setdefault('DECORD_LIBRARY_PATH',
-                      'D:/Repo/decord/build-cuda13/Release')
+                      'D:/Repo/decord/build-081fix')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 from decord import VideoReader, gpu, hybrid_gpu  # noqa: E402

@@ -15,7 +15,7 @@ import time
 
 os.environ.setdefault('DECORD_LIBRARY_PATH',
                       os.environ.get('DECORD_LIBRARY_PATH',
-                                     r'D:/Repo/decord/build-cuda13/Release'))
+                                     r'D:/Repo/decord/build-081fix'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 from decord import VideoReader, cpu, gpu, hybrid  # noqa: E402
@@ -121,3 +121,4 @@ if __name__ == '__main__':
                   r'D:\Videos\racelog_test\test6.mp4'):
             ok &= verify(v, a.n)
         print('ALL PASS' if ok else 'FAIL')
+        sys.exit(0 if ok else 1)
