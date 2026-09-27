@@ -591,6 +591,13 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::atomic<int64_t> fb_clones_{};
     std::atomic<int64_t> late_feeds_{0};  ///< 迟到包直供次数（GOP 已供完后到达）
     std::atomic<int64_t> strag_total_{0};  ///< 迟到包挂 straggler 列表总次数                    ///< 反馈式清偿累计克隆包数
+    // ── EOF 尾恢复网（2026-09-27 停滞修复；仅消费者线程读写时基）──────
+    // marker 顺序竞态（CPU 排空 marker 在 eof_pushed_ 置位前被「吞掉」
+    // 分支误食）→ chunk 会计与实际产出永久失配 → 队头侧零产出。1s 空窗
+    // （时间基准，防大 GOP 突发误伤）后按 force-close 语义关队头 chunk。
+    std::chrono::steady_clock::time_point eof_starve_tp_{};
+    bool eof_starve_on_ = false;
+    std::atomic<int64_t> force_eof_close_{0};  ///< 恢复网触发次数（stats 透出）
     // ── 遥测直通（2026-09-17 引擎穿透轮）──────────────────────────
     // HOL episode 入口的对侧存货分布（log2 桶 ×24，per-episode 一次
     // 数组写，默认累计——成本≈零）：sum/max 之外补形状，"连续中等

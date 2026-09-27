@@ -789,6 +789,7 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     kv("cache_peak_mb", (long long)(cache_peak_bytes_ >> 20));
     kv("late", late_feeds_.load(std::memory_order_relaxed));
     kv("strag", strag_total_.load(std::memory_order_relaxed));
+    kv("force_eof", force_eof_close_.load(std::memory_order_relaxed));
     kv("assigned_c", assigned_frames_[0]);
     kv("assigned_g", assigned_frames_[1]);
     kv("window_frames", window_frames_);
@@ -1797,6 +1798,15 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
             return f->defined();
         }
 #endif
+        // 非阻塞门（2026-09-27 停滞修复）：cpu_.Pop 是阻塞队列操作——
+        // EOF 尾会计失配（marker 被「CPU 侧未推流」分支误食后 chunk 仍
+        // 期望帧）时会**永眠**并绕过 stall 看门狗与 VideoReader 的 EOF
+        // 重试两层防线（av1 无 kick 路径实测卡死）。本类是 cpu_ 的唯一
+        // 消费者：QueueDepth()>0 ⇒ Pop 必然立即返回（生产者只入队，
+        // 无 TOCTOU）；深度 0 ⇒ 返回 false 交上层重试/安全网处置——
+        // 这也是头文件「消费者线程的 Pop 永不阻塞」设计承诺的落位
+        //（CPU 侧此前是唯一违例）。
+        if (cpu_.QueueDepth() == 0) return false;
         return cpu_.Pop(f);
     }
 #ifdef DECORD_USE_CUDA
@@ -2008,10 +2018,55 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 }
             }
 #endif
+            // ── EOF 尾恢复网（2026-09-27 停滞修复）────────────────────
+            // 触发面：eof_pushed_ 已置 + **CPU 侧**队头持续 ≥1s 零产出。
+            // 根因是 marker 顺序竞态：CPU 侧排空 marker 在 eof_pushed_
+            // 置位前到达时走「吞掉」分支被误食，真到 EOF 时无 marker 可
+            // 收口，chunk 会计（expected/pending）与解码器实际产出永久
+            // 失配。时间基准（非计数）：CPU 侧大 GOP 解码突发 >100ms 属
+            // 正常，计数判别会误伤；1s 空产出在 EOF 后只可能是失配。
+            // 限定 CPU 侧：GPU 侧 EOF 走独立 flush 记账（gpu_flush_left_
+            // /ready_ marker），语义不同不套用。命中 → 按既有
+            // force-close 同款语义关队头 chunk（身份复查防并发漂移），
+            // 计数器入 stats。marker 正常到达的路径不受影响（任何产出
+            // 都会走下面的重置）。
+            if (eof_pushed_ && s == SIDE_CPU && !emit_queue_.empty()) {
+                const auto now_tp = std::chrono::steady_clock::now();
+                if (!eof_starve_on_) {
+                    eof_starve_on_ = true;
+                    eof_starve_tp_ = now_tp;
+                } else if (std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                        now_tp - eof_starve_tp_).count() >= 1000) {
+                    bool closed = false;
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        if (!emit_queue_.empty()
+                                && emit_queue_.front().id == ch.id) {
+                            emit_queue_.pop_front();
+                            closed = true;
+                        }
+                    }
+                    if (closed) {
+                        force_eof_close_.fetch_add(1,
+                            std::memory_order_relaxed);
+                        fprintf(stderr,
+                                "[hybrid] eof-starve force-close chunk id=%lld"
+                                " side=%d emitted=%lld/%lld\n",
+                                (long long)ch.id, (int)ch.side,
+                                (long long)ch.emitted,
+                                (long long)ch.expected);
+                        fflush(stderr);
+                        eof_starve_on_ = false;
+                        continue;
+                    }
+                }
+            }
             PumpFeed(true);   // 同 A4：空取=头部饥饿，强制泵推进
             return false;
         }
         // PopSide 成功 = 有进展（marker/陈旧丢弃/越界暂存/发射同此之后）：
+        eof_starve_on_ = false;   // EOF 尾恢复网的空窗计时清零
         // stall 报警状态在此清零（见上方 stall 取证注释）。
         stall_last_tp_ = std::chrono::steady_clock::now();
         stall_delay_ms_ = 0;
