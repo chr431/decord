@@ -5,6 +5,10 @@ from ._ffi.runtime_ctypes import TypeCode
 from ._ffi.function import register_func, get_global_func, list_global_func_names, extract_ext_funcs
 from ._ffi.base import DECORDError, DECORDLimitReachedError, __version__
 
+# 解码器契约面（R4 跨仓契约机器化，2026-09-28）：下游按
+# decord.features()/CONTRACT_VERSION 协商能力，取代版本号门控。
+from ._contract import CONTRACT_VERSION, features  # noqa: F401
+
 from .base import ALL
 
 from . import ndarray as nd

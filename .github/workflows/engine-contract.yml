@@ -1,0 +1,60 @@
+name: engine contract linkage
+
+# R4 跨仓契约联动（2026-09-28）：fork 变更 → 构建 → 主仓契约冒烟。
+#
+# ⚠️ 形态与限制（诚实说明，勿默默放宽）：
+# - workflow_dispatch 手动触发：主仓金标逐位验证（tests/golden/
+#   record.py --verify）依赖本机视频语料（D:\Videos\racelog_test）+ GPU +
+#   TRT 引擎文件，GitHub 托管 runner 三者皆无——本工作流只覆盖
+#   **无视频可跑**的跨仓机器检查（契约对账 + 假 decord 协商测试）。
+#   金标全量验证仍在本地门禁（rebuild → run_fast → golden 28/28）。
+# - 跨仓 checkout（chr431/video_ocr_engine）：仓库私有时需配
+#   PAT（secrets.ENGINE_REPO_TOKEN）；公开则免 token。当前未配 secret，
+#   私有场景下本 job 会在 checkout 步失败——这是已知且有意的暴露点。
+# - USE_CUDA 默认 ON（R3 GPU-only 化后 OFF 即 FATAL_ERROR），构建无需
+#   CUDA Toolkit（0.8.1 去 Toolkit 化：驱动 API 动态加载 + 内嵌 PTX）。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+jobs:
+  fork-build-and-engine-contract:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: install build deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential python3-dev python3-setuptools make cmake ninja-build xz-utils
+        python -m pip install --upgrade pip
+    - name: set up python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Download FFmpeg 9.0 (shared, BtbN linux64)
+      run: |
+        curl -L -o ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-shared-9.0.tar.xz
+        mkdir ffmpeg && tar -xJf ffmpeg.tar.xz -C ffmpeg --strip-components=1
+        echo "FFMPEG_DIR=$PWD/ffmpeg" >> $GITHUB_ENV
+        echo "LD_LIBRARY_PATH=$PWD/ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
+    - name: build fork wheel (GPU, no toolkit)
+      run: pip install .
+    - name: checkout engine repo
+      uses: actions/checkout@v4
+      with:
+        repository: chr431/video_ocr_engine
+        path: engine
+    - name: engine contract smoke (no videos needed)
+      run: |
+        pip install numpy pyyaml pytest
+        cd engine
+        # tests/decode/test_contract.py：8 个假 decord 协商测试（无 decord
+        # 依赖）+ 1 个对账测试（真 fork features() ↔ decoder_contract.yaml
+        # 一一对应）——本工作流存在的意义就是让后者在 CI 里跑起来。
+        PYTHONPATH="$GITHUB_WORKSPACE/engine" python -m pytest tests/decode/test_contract.py -v
+    - name: fork unit tests
+      run: python -m pytest tests/python/unittests/ -q
