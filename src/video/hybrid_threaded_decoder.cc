@@ -1867,6 +1867,34 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     continue;
                 }
             }
+            // 取证硬化（2026-09-28 夜间轮）：av1 hybrid 流中段互锁卡死
+            // 的三条静默路径之一——此分支无任何诊断，FATAL 后零现场。
+            // 与 PopSide 失败分支同款时间门控（3s 首报/指数退避），仅
+            // 失败路径触达，健康路径零成本。
+            {
+                const auto now_ = std::chrono::steady_clock::now();
+                bool due = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                        now_ - stall_last_tp_).count() >= 3000;
+                if (due && stall_delay_ms_ == 0) {
+                    stall_print_tp_ = now_;
+                    stall_delay_ms_ = 1000;
+                    std::size_t eqn = 0, gsz = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        eqn = emit_queue_.size();
+                        gsz = gops_.size();
+                    }
+                    fprintf(stderr,
+                            "\n[pop-stall3] unassigned-head eq=%zu gops=%zu "
+                            "pend=%d/%d infl=%lld fp=%d\n",
+                            eqn, gsz, (int)side_pending_[0],
+                            (int)side_pending_[1],
+                            (long long)(side_pending_[0] + side_pending_[1]),
+                            (int)eof_pushed_);
+                    fflush(stderr);
+                }
+            }
             // 熟前挂起配套：EOF/窗界后 Push 停驱，未分配 GOP 由消费
             // 线程在此重驱泵（分配可能此刻已可进行——速率成熟/防饿死）。
             // force=true：头部已饿死仍不能分配 = 库存残帧互锁（两侧
@@ -2030,6 +2058,15 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             // force-close 同款语义关队头 chunk（身份复查防并发漂移），
             // 计数器入 stats。marker 正常到达的路径不受影响（任何产出
             // 都会走下面的重置）。
+            //
+            // ⚠️ 2026-09-28 夜间轮：曾尝试对称扩展到 GPU 侧（去掉
+            // s==SIDE_CPU）——av1 整文件装入 512MB 包缓存时 demux 秒完，
+            // eof_pushed_ 在消费中段即置位，而 GPU 臂池互锁的合法停滞
+            // ≥3s（formats 运行捕获），1s 网在流中段误关有帧 chunk →
+            // 帧永久丢失 → stream 套件 3/5 FATAL（对照：仅 CPU 半边
+            // 16/16 绿）。已回退。GPU 侧修复需要真·尾部判别（消费游标
+            // 已到尾 vs 泵排空早于消费），另行立项——见
+            // tools/repro_av1_seq_stall.py 与 docs/log 取证。
             if (eof_pushed_ && s == SIDE_CPU && !emit_queue_.empty()) {
                 const auto now_tp = std::chrono::steady_clock::now();
                 if (!eof_starve_on_) {
@@ -2091,6 +2128,26 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         }
         if (f.pts < ch.start_pts) {
             // 陈旧帧（kick 边界帧在 expected 补齐后残留等）：丢弃
+            // 取证硬化（2026-09-28 夜间轮）：陈旧排放活锁假设——每次
+            // Pop 内部丢一帧（PopSide 成功复位停滞计时器）后取空返回
+            // false，消费者 1ms 重试再丢一帧 → 万级积压 ≈ 数十秒「假
+            // 停滞」，零 pop-stall 打印（计时器恒被复位）。消费者线程
+            // 累计计数（健康流全程仅十级，4096 阈值只在病理性排放触达）。
+            {
+                static thread_local int64_t stale_in_call = 0;
+                ++stale_in_call;
+                if (stale_in_call % 4096 == 0) {
+                    fprintf(stderr,
+                            "\n[stale-drain] n=%lld head=(side%d,%lld,%lld) "
+                            "pend=%d/%d em=%lld/%lld eq=%zu fp=%d\n",
+                            (long long)stale_in_call, (int)ch.side,
+                            (long long)ch.start_pts, (long long)ch.end_pts,
+                            (int)side_pending_[0], (int)side_pending_[1],
+                            (long long)ch.emitted, (long long)ch.expected,
+                            emit_queue_.size(), (int)eof_pushed_);
+                    fflush(stderr);
+                }
+            }
             std::lock_guard<std::mutex> lk(mtx_);
             --side_pending_[s];
             continue;
@@ -2154,8 +2211,35 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
     // 合并队列已空：转发 CPU 侧 drain marker，让 VideoReader 的
     // EOF/rewind 逻辑（NextFrameImpl 的 kInt64 分支）正常运转
     // （GPU 驻留模式下 PopSide(SIDE_CPU) 读已上载队列，marker 由
-    // UploadStep 直通）
-    return PopSide(SIDE_CPU, frame);
+    // UploadStep 直通）。
+    // 取证硬化（2026-09-28 夜间轮）：静默路径之三——队列空 + CPU 侧
+    // 永空（最终 marker 丢失/未发）会在此永恒 false，此前零现场。
+    // 同款一次性时间门控（stall_last_tp_ 由任何 PopSide 成功复位）。
+    if (!PopSide(SIDE_CPU, frame)) {
+        const auto now_ = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                now_ - stall_last_tp_).count() >= 3000
+                && stall_delay_ms_ == 0) {
+            stall_print_tp_ = now_;
+            stall_delay_ms_ = 1000;
+            std::size_t crdy = 0, rdy = 0;
+            {
+                std::lock_guard<std::mutex> lk(rmtx_);
+                crdy = cpu_ready_.size();
+                rdy = ready_.size();
+            }
+            fprintf(stderr,
+                    "\n[pop-stall4] empty-queue fallthrough crdy=%zu rdy=%zu "
+                    "cq=%lld cp=%lld fp=%d ef=%d/%d\n",
+                    crdy, rdy, (long long)cpu_.QueueDepth(),
+                    (long long)cpu_.PendingDepth(),
+                    (int)eof_pushed_, (int)arm_flush_sent_,
+                    (int)eof_flush_out_);
+            fflush(stderr);
+        }
+        return false;
+    }
+    return true;
 }
 
 runtime::NDArray HybridThreadedDecoder::ToHost(const runtime::NDArray &g) {

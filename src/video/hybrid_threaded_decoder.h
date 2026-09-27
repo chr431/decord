@@ -595,6 +595,9 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     // marker 顺序竞态（CPU 排空 marker 在 eof_pushed_ 置位前被「吞掉」
     // 分支误食）→ chunk 会计与实际产出永久失配 → 队头侧零产出。1s 空窗
     // （时间基准，防大 GOP 突发误伤）后按 force-close 语义关队头 chunk。
+    // ⚠️ 仅 CPU 侧：GPU 侧对称版已试并回退（2026-09-28 夜间轮——
+    // eof_pushed_ 在整文件缓存时可早于消费中段置位，GPU 臂合法池互锁
+    // 停滞 ≥3s 会被 1s 网误关 → 丢帧 FATAL，见 .cc 同名注释）。
     std::chrono::steady_clock::time_point eof_starve_tp_{};
     bool eof_starve_on_ = false;
     std::atomic<int64_t> force_eof_close_{0};  ///< 恢复网触发次数（stats 透出）

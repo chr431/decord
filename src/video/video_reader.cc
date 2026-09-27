@@ -913,6 +913,16 @@ NDArray VideoReader::NextFrameImpl() {
               if (eof_ && retry > EOF_RETRY_MAX) {
                 if (FetchCachedFrame(frame, curr_frame_)) {
                   break;
+                } else if (!decoder_->Drained()
+                           && retry <= EOF_RETRY_MAX * 10) {
+                  // 在途宽限（2026-09-28 av1 hybrid 停滞轮）：EOF_RETRY_MAX
+                  // 是上游为毫秒级尾排空设的静态预算；hybrid 在整文件装进
+                  // 包缓存时 demux 早完（eof_ 提前为真），而万级已派包的
+                  // 排空实测 10~30s（self-resolving：30s 预算 3/3 过 vs
+                  // 默认 10.4s 预算 4/6 FATAL）。解码器尚有在途工作
+                  // （Drained()==false：队列/侧 pending/池在途）时不宣判
+                  // 卡死，宽限至 10× 预算；真死锁仍在 ~104s 内 FATAL。
+                  // 纯 CPU/GPU 解码器真 EOF 时 Drained() 为真，行为不变。
                 } else {
                   LOG(FATAL) << "[" << filename_ << "]Unable to handle EOF because it takes too long to retrieve last few frames and "
                   << "`DECORD_EOF_RETRY_MAX=" << EOF_RETRY_MAX << "`. You may override the limit by `export DECORD_EOF_RETRY_MAX=20480`"
