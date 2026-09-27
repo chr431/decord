@@ -38,7 +38,7 @@ jobs:
       run: |
         # dedicated dir: scikit-build-core's own build tree lives in a
         # temporary directory, so configure a fresh one for the cpp tests
-        GTEST_LIB=/tmp/gtest/lib cmake -S . -B build-cpp -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release
+        GTEST_LIB=/tmp/gtest/lib cmake -S . -B build-cpp -DCMAKE_BUILD_TYPE=Release
         cmake --build build-cpp --target cpptest -j$(nproc)
 
   build-windows:
@@ -61,8 +61,8 @@ jobs:
         echo "$ffdir/bin" >> $env:GITHUB_PATH
     - name: install test dependencies
       run: pip install pytest
-    - name: install (CPU build via scikit-build-core)
-      run: pip install . --config-settings='cmake.args=-DUSE_CUDA=0'
+    - name: install (GPU build via scikit-build-core; 0.8.5 起 GPU-only，无需 CUDA Toolkit)
+      run: pip install .
     - name: place FFmpeg DLLs next to decord.dll
       shell: pwsh
       run: |

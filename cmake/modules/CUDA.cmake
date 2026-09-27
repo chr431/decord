@@ -26,8 +26,8 @@
 # - nvcuvid.h / cuda.h 由仓库自带（cuda_include/、nvcuvid/）；
 #   NVML 用 4 符号垫片 nvml_min.h（2026-09-19：14.5k 行官方头副本已删，省 795KB）
 
-if(USE_CUDA)
-  add_definitions(-DDECORD_USE_CUDA)
+# 2026-09-28 R3-2b：USE_CUDA 恒 ON（GPU-only），条件分支移除
+add_definitions(-DDECORD_USE_CUDA)
   include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/video/nvcodec/cuda_include)
   include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/video/nvcodec/nvcuvid)
   message(STATUS "Build with CUDA support (driver APIs dynamically loaded, no CUDA Toolkit required)")
@@ -36,9 +36,3 @@ if(USE_CUDA)
   file(GLOB NVDEC_CC_SRCS src/improc/*.cc)
   list(APPEND NVDEC_SRCS ${NVDEC_CC_SRCS})
   set(NVDEC_CUDA_SRCS "")  # 不再用 nvcc（kernel 以内嵌 PTX 提供）
-else(USE_CUDA)
-  message(STATUS "CUDA disabled, no nvdec capabilities will be enabled...")
-  set(NVDEC_SRCS "")
-  set(RUNTIME_CUDA_SRCS "")
-  set(NVDEC_CUDA_SRCS "")
-endif(USE_CUDA)

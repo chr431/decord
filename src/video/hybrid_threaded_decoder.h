@@ -47,7 +47,6 @@
 
 namespace decord {
 
-#ifdef DECORD_USE_CUDA
 /*!
  * \brief pinned 主机帧池（CPU-out 落地专用）：cudaHostAlloc 块经
  *  NDArray::FromRecycled 包装，D2H 直达最终帧 —— 替代"pinned 暂存 +
@@ -132,7 +131,6 @@ class HybridGpuBufferPool {
     DLDevice dev_{kDLCUDA, 0};
     std::function<void()> on_release_;
 };
-#endif  // DECORD_USE_CUDA
 
 namespace cuda {
 class CUThreadedDecoder;
@@ -219,7 +217,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool PopSide(Side s, runtime::NDArray *f);
     /*! \brief GPU 帧搬到主机内存（布局两侧逐字节一致，整块 D2H） */
     static runtime::NDArray ToHost(const runtime::NDArray &gpu_frame);
-#ifdef DECORD_USE_CUDA
     /*! \brief 落地线程主循环：只做 LandStep（NVDEC 收帧 → D2H → ready_） */
     void GpuWorkerLoop();
     /*! \brief 落地一步：ready_ 有余量才 gpu_->Pop → D2H → ready_。
@@ -295,7 +292,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     void AbortInflight();
     /*! \brief 停止并回收 GPU 工作线程（Stop/Clear 共用） */
     void StopGpuWorker();
-#endif
     /*! \brief kInt64 drain marker 判定（与 NextFrameImpl 的判据一致） */
     static bool IsMarker(const runtime::NDArray &f);
     /*! \brief GPU 输出缓冲池形状（与 VideoReader::FrameShape 同语义） */
@@ -344,7 +340,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
             || side_pending_[SIDE_GPU] < gpu_cap;
     }
 
-#ifdef DECORD_USE_CUDA
     /*! \brief GPU 输出缓冲池（有界，阻塞 Acquire）。声明在 gpu_ 之前：
      *  成员按声明逆序析构，保证 ~CUThreadedDecoder 销毁内部队列时
      *  在途缓冲经 deleter 回调的池仍然存活。 */
@@ -422,7 +417,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     double land_fold_ring_[kLandFoldRing]{};
     int land_fold_i_ = 0;
     int land_fold_n_ = 0;
-#endif
     /*! \brief 已路由到 GPU、尚未发射/丢弃的帧数（包粒度精确计数；
      *  诊断用途） */
 

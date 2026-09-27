@@ -19,19 +19,21 @@ endif()
 # You can create a config.cmake at build folder
 # and add set(OPTION VALUE) to override these build options.
 # Alernatively, use cmake -DOPTION=VALUE through command-line.
-# scikit-build-core(pip wheel)构建在 Windows 上默认启用 CUDA——本 fork 的
-# 发布形态是 win64-gpu,且 0.8.1 起 CUDA 构建零 Toolkit 依赖,可直接出包。
-# 显式 -DUSE_CUDA=OFF 仍然生效;普通 cmake 开发构建与非 Windows 平台不变。
-if(SKBUILD AND WIN32 AND NOT DEFINED USE_CUDA)
-  set(USE_CUDA ON)
+# 2026-09-28 R3-2b GPU-only 化：CPU-only 构建面移除。0.8.1 起 CUDA
+# 构建零 Toolkit 依赖（驱动 API 动态加载 + 内嵌 PTX），无 GPU 机器
+# 运行时优雅降级 CPU 解码；需要非 CUDA 构建请用上游 dmlc/decord。
+# 显式 -DUSE_CUDA=OFF 直接 FATAL_ERROR（防静默产出残缺构建物）。
+decord_option(USE_CUDA "Build with CUDA" ON)
+if(NOT USE_CUDA)
+  message(FATAL_ERROR
+    "USE_CUDA=OFF is no longer supported (0.8.5 GPU-only): the CUDA path "
+    "is unconditionally compiled. Runtime degrades to CPU decode on "
+    "driver-less machines. Use upstream dmlc/decord for non-CUDA builds.")
 endif()
-decord_option(USE_CUDA "Build with CUDA" OFF)
 decord_option(USE_MSVC_MT "Build with MT" OFF)
 
-# Project
-if(USE_CUDA)
+# Project（GPU-only 后无条件，原 if(USE_CUDA) 包装移除）
 project(decord C CXX)
-endif(USE_CUDA)
 
 # include directories
 include_directories("include")
@@ -108,12 +110,6 @@ file(GLOB DECORD_CORE_SRCS src/*.cc src/runtime/*.cc src/video/*.cc src/sampler/
 # Module rules
 include(cmake/modules/FFmpeg.cmake)
 include(cmake/modules/CUDA.cmake)
-
-# CPU-only 构建排除 hybrid 解码器（构造期初始化 CUDA 专属成员，与
-# nvcodec 同款处理；VideoReader 对其引用已有 DECORD_USE_CUDA 守卫）
-if(NOT USE_CUDA)
-  list(FILTER DECORD_CORE_SRCS EXCLUDE REGEX "hybrid_threaded_decoder")
-endif()
 
 # Targets
 

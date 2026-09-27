@@ -11,10 +11,8 @@
 #include "../runtime/str_util.h"
 #include "../runtime/file_util.h"
 #include "frame_trace.h"
-#if DECORD_USE_CUDA
 #include "nvcodec/cuda_threaded_decoder.h"
 #include "../runtime/cuda/cudart_shim.h"
-#endif
 #include <algorithm>
 #include <cerrno>
 #include <condition_variable>
@@ -388,15 +386,10 @@ void VideoReader::SetVideoStream(int stream_nb) {
     if (kDLCPU == ctx_.device_type) {
         decoder_ = std::unique_ptr<ThreadedDecoderInterface>(new FFMPEGThreadedDecoder());
     } else if (kDLCUDA == ctx_.device_type) {
-#ifdef DECORD_USE_CUDA
         // note: cuda threaded decoder will modify codecpar
         decoder_ = std::unique_ptr<ThreadedDecoderInterface>(new cuda::CUThreadedDecoder(
             ctx_.device_id, codecpar.get(), fmt_ctx_->iformat));
-#else
-        LOG(FATAL) << "CUDA not enabled. Requested context GPU(" << ctx_.device_id << ").";
-#endif
     } else if (IsHybridType(static_cast<int>(ctx_.device_type))) {
-#ifdef DECORD_USE_CUDA
         // 混合解码: 单 demux 按 keyframe chunk 路由 CPU 软解 + NVDEC。
         // hybrid: 输出统一落 CPU (out_ctx_)；hybrid_gpu: 输出统一驻留
         // 显存（GPU chunk 零拷贝、CPU chunk H2D 上载）。GPU 子解码器
@@ -404,9 +397,6 @@ void VideoReader::SetVideoStream(int stream_nb) {
         decoder_ = std::unique_ptr<ThreadedDecoderInterface>(new HybridThreadedDecoder(
             ctx_.device_id, codecpar.get(), fmt_ctx_->iformat,
             static_cast<int>(ctx_.device_type) == kHybridGpuDeviceType));
-#else
-        LOG(FATAL) << "CUDA not enabled. Requested context hybrid(" << ctx_.device_id << ").";
-#endif
     } else {
         LOG(FATAL) << "Unknown device type: " << ctx_.device_type;
     }
@@ -510,7 +500,6 @@ void VideoReader::SetVideoStream(int stream_nb) {
     }
     // hybrid 解码器需要 (关键帧 pts, 呈现序帧号) 表：chunk 的 expected
     // 帧数 = 相邻关键帧 rank 差，是"补满才关 chunk"合并逻辑的基准。
-#ifdef DECORD_USE_CUDA
     if (IsHybridType(static_cast<int>(ctx_.device_type))) {
         auto *hybrid = dynamic_cast<HybridThreadedDecoder *>(decoder_.get());
         if (hybrid && !frame_ts_.empty() && !key_indices_.empty()
@@ -524,7 +513,6 @@ void VideoReader::SetVideoStream(int stream_nb) {
                                      static_cast<int64_t>(frame_ts_.size()));
         }
     }
-#endif
 }
 
 unsigned int VideoReader::QueryStreams() const {
@@ -1070,7 +1058,6 @@ NDArray VideoReader::CropRoiYuv420(NDArray frame, int x1, int y1, int x2, int y2
         return out;
     }
     if (out_ctx_.device_type == kDLCUDA) {
-#if DECORD_USE_CUDA
         // 帧在设备内存（kDLCUDA 或 hybrid_gpu）：Y 与 UV 各一次 2D 拷贝到主机（ROI 尺寸），
         // 避免全帧 D2H；后续 GetBatch 会把该主机 ROI 拷回批缓冲。
         cudaError_t err = cudaSetDevice(ctx_.device_id);
@@ -1094,7 +1081,6 @@ NDArray VideoReader::CropRoiYuv420(NDArray frame, int x1, int y1, int x2, int y2
             static_cast<size_t>(2 * pairs), static_cast<size_t>(uv_rows),
             cudaMemcpyDeviceToHost);
         CHECK_EQ(err, cudaSuccess) << "cudaMemcpy2D failed in CropRoiYuv420 (UV)";
-#endif
         return out;
     }
     // 1) Y 平面：逐行精确拷贝（luma 任意坐标裁剪）
@@ -1185,7 +1171,6 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
     }
     NDArray roi = NDArray::Empty({y2 - y1, x2 - x1, OutputChannels()}, kUInt8, kCPU);
     if (ctx_.device_type == kDLCUDA) {
-#if DECORD_USE_CUDA
         // the display callback already synchronized the decode stream, so the
         // frame content is complete; a single 2D copy fetches only the ROI.
         // Pin the device explicitly: cudaMemcpy2D is a cudart call that uses
@@ -1205,7 +1190,6 @@ NDArray VideoReader::CropRoi(NDArray frame, int x1, int y1, int x2, int y2) {
                 cudaMemcpyDeviceToHost);
         }
         CHECK_EQ(err, cudaSuccess) << "cudaMemcpy2D failed in CropRoi";
-#endif
     } else {
         // CPU build: row-stride copy of only the ROI rectangle (e.g. 10KB at
         // 106x33) instead of handing out the full 6.2MB 1080p frame — the

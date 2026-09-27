@@ -14,7 +14,6 @@
 namespace decord {
 namespace cuda {
 
-#ifdef DECORD_USE_CUDA
 
 // 返回 false = kernel 启动失败(模块加载/launch 错误)。不抛异常:本函数在
 // CUVID display 回调(驱动栈帧)内运行,异常不得穿越驱动帧展开;调用方
@@ -28,7 +27,6 @@ bool ProcessFrame(cudaTextureObject_t chroma, cudaTextureObject_t luma,
                   int bit_depth = 8,
                   int output_format = 0,
                   int color_range = 0);
-#endif
 }  // namespace imp
 }  // namespace decord
 

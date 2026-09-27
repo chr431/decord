@@ -46,9 +46,7 @@
 #include "ffmpeg/ffmpeg_common.h"
 #include <decord/runtime/ndarray.h>
 
-#ifdef DECORD_USE_CUDA
 #include "nvcodec/cuda_threaded_decoder.h"
-#endif
 
 #include <dmlc/logging.h>
 
@@ -61,9 +59,7 @@
 #include <unistd.h>
 #endif
 
-#ifdef DECORD_USE_CUDA
 #include "../runtime/cuda/cudart_shim.h"
-#endif
 #include <algorithm>
 #include <cmath>
 #include <exception>
@@ -123,7 +119,6 @@ HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
         const long long v = atoll(e);
         if (v > 0) cache_budget_ = static_cast<size_t>(v) << 20;
     }
-#ifdef DECORD_USE_CUDA
     // GPU 子解码器初始化 bsf (mp4→annexb) 时会就地改写传入的 codecpar。
     // 传副本；CPU 侧继续用 VideoReader 手里的原始 AVCC 参数（其
     // avcodec_open2 发生在本构造之后），GPU 侧后续用被转换的副本。
@@ -132,9 +127,6 @@ HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
     CHECK_GE(avcodec_parameters_copy(gpu_codecpar_.get(), codecpar), 0)
         << "avcodec_parameters_copy failed";
     gpu_.reset(new cuda::CUThreadedDecoder(device_id, gpu_codecpar_.get(), iformat));
-#else
-    LOG(FATAL) << "HybridThreadedDecoder requires DECORD_USE_CUDA build";
-#endif
 }
 
 HybridThreadedDecoder::~HybridThreadedDecoder() {
@@ -143,7 +135,6 @@ HybridThreadedDecoder::~HybridThreadedDecoder() {
     if (getenv("DECORD_HYBRID_DEBUG")) fprintf(stderr, "[hybrid-d] stopped\n");
 }
 
-#ifdef DECORD_USE_CUDA
 // ── PinnedHostFramePool：D2H 直达最终帧的 pinned 主机帧池 ──
 void PinnedHostFramePool::Reset(std::size_t max_cap, std::size_t frame_bytes,
                                 std::vector<int64_t> shape) {
@@ -306,7 +297,6 @@ void HybridGpuBufferPool::Deleter(runtime::NDArray::Container *ptr) {
     }
     delete ptr;
 }
-#endif  // DECORD_USE_CUDA
 
 void HybridThreadedDecoder::ComputeBudgets() {
     // adaptive: free VRAM/RAM -> bounded budgets; alloc failure = backpressure
@@ -383,7 +373,6 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
     output_format_ = output_format;
     codec_id_ = dec_ctx->codec_id;
     ResetRouting();
-#ifdef DECORD_USE_CUDA
     if (gpu_) {
         // GPU 输出形状已知即可算预算（frame_bytes_ 自算），所有池深/队列
         // 深度在子解码器/池初始化前就位 —— 此前预算从未被调用（池恒为
@@ -394,7 +383,6 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
         for (int64_t d : gpu_frame_shape_) frame_bytes_ *= d;
         ComputeBudgets();
     }
-#endif
     // CPU 子解码器接管 VideoReader 打开的 ctx（内部 dec_ctx_.reset 持有）
     // 深存货队列：CPU chunk 的发射靠 cpu_ready_/cpu_ 内部存货瞬时完成，
     // 默认 32 帧背压会让每个 CPU chunk 退化为实时跟随解码（hevc 0.70x）。
@@ -407,7 +395,6 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
 #if defined(_WIN32)
     PinFfmpegThreads();
 #endif
-#ifdef DECORD_USE_CUDA
     if (gpu_) {
         // GPU 子解码器需要自己的 AVCodecContext（CUThreadedDecoder 的
         // SetCodecContext 同样接管所有权）。用 bsf 转换后的副本参数
@@ -460,7 +447,6 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
             }
         }
     }
-#endif
 }
 
 void HybridThreadedDecoder::SetKeyframeRanks(std::vector<int64_t> pts_list,
@@ -537,7 +523,6 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
     // 的 kDLCUDA 守卫同语义）—— ROI 必须在任何帧解码前固化。
     // 无效矩形（无法构造偶数超集等）：解码器回退全帧输出，池保持原状。
     cpu_.SetRoi(x1, y1, x2, y2);
-#ifdef DECORD_USE_CUDA
     if (gpu_) gpu_->SetRoi(x1, y1, x2, y2);
     int w = x2 - x1, h = y2 - y1;
     if (w > 0 && h > 0) {
@@ -607,7 +592,6 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
                 static_cast<std::size_t>(frame_bytes_), gpu_frame_shape_);
         }
     }
-#endif
 }
 
 void HybridThreadedDecoder::Start() {
@@ -616,7 +600,6 @@ void HybridThreadedDecoder::Start() {
     if (affinity_on_) pre_tids = SnapshotThreads();
 #endif
     cpu_.Start();
-#ifdef DECORD_USE_CUDA
     if (gpu_) gpu_->Start();
     if (!lander_run_.load()) {
         gpu_pool_.Start();
@@ -659,7 +642,6 @@ void HybridThreadedDecoder::Start() {
             uploader_ = std::move(u);
         }
     }
-#endif
 #if defined(_WIN32)
     if (affinity_on_) {
         // 差分本轮新增线程：lander/uploader → service；其余新增（cpu_
@@ -690,7 +672,6 @@ void HybridThreadedDecoder::Start() {
 #endif
 }
 
-#ifdef DECORD_USE_CUDA
 void HybridThreadedDecoder::StopGpuWorker() {
     bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
     lander_run_.store(false);
@@ -737,7 +718,6 @@ void HybridThreadedDecoder::StopGpuWorker() {
     }
     if (dbg) fprintf(stderr, "[hybrid-d] worker joined\n");
 }
-#endif
 
 void HybridThreadedDecoder::SetDecodeWindow(int64_t max_frames) {
     // Start 前由消费线程调用；与 NeedsPackets/PumpFeed 同线程，无竞态。
@@ -779,11 +759,7 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     kv("kicks_c", kicks_[0].load());
     kv("kicks_g", kicks_[1].load());
     kv("clones", fb_clones_.load());
-#ifdef DECORD_USE_CUDA
     kv("out_cuda", out_cuda_ ? 1 : 0);
-#else
-    kv("out_cuda", 0);
-#endif
     kvf("rc_now", cpu_.ProductionRate());
     kvf("rg_now", gpu_rate_landed_.load(std::memory_order_relaxed));
     kv("cache_peak_mb", (long long)(cache_peak_bytes_ >> 20));
@@ -814,7 +790,6 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     kv("busy_cpu_pkts", cpu_.DecodeBusyPkts());
     kv("busy_gpu_us", gpu_ ? gpu_->DecodeBusyUs() : 0);
     kv("busy_gpu_pics", gpu_ ? gpu_->DecodeBusyPics() : 0);
-#ifdef DECORD_USE_CUDA
     if (out_cuda_) {
         const long long fn = up_flush_n_.load();
         const long long fr = up_flush_f_.load();
@@ -824,7 +799,6 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
         kv("up_nobuf", up_nobuf_.load());
         kv("up_cempty", up_cempty_.load());
     }
-#endif
     // 份额轨迹（仅 DECORD_HYBRID_TRACE=1 且有样本时；扁平 csv 四元组）
     const size_t tn = trace_n_.load(std::memory_order_relaxed);
     if (trace_on_ && tn > 0) {
@@ -847,21 +821,15 @@ void HybridThreadedDecoder::Stop() {
                 chunks_assigned_[0], chunks_assigned_[1],
                 (long long)frames_out_[0].load(), (long long)frames_out_[1].load());
     }
-#ifdef DECORD_USE_CUDA
     // 先停工作线程（它可能正持有 GPU 侧的包/缓冲），再停子解码器
     StopGpuWorker();
-#endif
     if (getenv("DECORD_HYBRID_STATS")) {
         // 一次性汇总（非打印测量协议的唯一输出点；析构时触发，不在被测
         // 墙钟窗口内）。口径见 .h「非打印测量」注释。
         fprintf(stderr,
                 "\n[hybrid-stats] mode=%s frames c=%lld g=%lld chunks c=%d g=%d"
                 " kicks c=%lld g=%lld clones=%lld\n",
-#ifdef DECORD_USE_CUDA
                 out_cuda_ ? "gpu-out" : "cpu-out",
-#else
-                "cpu-only",
-#endif
                 (long long)frames_out_[0].load(), (long long)frames_out_[1].load(),
                 chunks_assigned_[0], chunks_assigned_[1],
                 (long long)kicks_[0].load(), (long long)kicks_[1].load(),
@@ -895,7 +863,6 @@ void HybridThreadedDecoder::Stop() {
                 (long long)cpu_.DecodeBusyPkts(),
                 (long long)(gpu_ ? gpu_->DecodeBusyUs() : 0),
                 (long long)(gpu_ ? gpu_->DecodeBusyPics() : 0));
-#ifdef DECORD_USE_CUDA
         if (out_cuda_) {
             const long long fn = (long long)up_flush_n_.load();
             const long long fr = (long long)up_flush_f_.load();
@@ -905,22 +872,15 @@ void HybridThreadedDecoder::Stop() {
                     fn, fr, fn > 0 ? (double)fr / (double)fn : 0.0,
                     (long long)up_nobuf_.load(), (long long)up_cempty_.load());
         }
-#endif
     }
     cpu_.Stop();
-#ifdef DECORD_USE_CUDA
     if (gpu_) gpu_->Stop();
-#endif
 }
 
 void HybridThreadedDecoder::Clear() {
-#ifdef DECORD_USE_CUDA
     StopGpuWorker();
-#endif
     cpu_.Clear();
-#ifdef DECORD_USE_CUDA
     if (gpu_) gpu_->Clear();
-#endif
     ResetRouting();
 }
 
@@ -950,7 +910,6 @@ void HybridThreadedDecoder::ResetRouting() {
     emitted_total_ = 0;
     sched_initialized_ = false;
     side_pending_[0] = side_pending_[1] = 0;
-#ifdef DECORD_USE_CUDA
     {
         std::lock_guard<std::mutex> lk2(lcv_mtx_);
         gpu_pkt_q_.clear();
@@ -961,7 +920,6 @@ void HybridThreadedDecoder::ResetRouting() {
         ready_.clear();
         cpu_ready_.clear();
     }
-#endif
     // kf 索引保留：Seek 后复用帧数表
 }
 
@@ -1553,11 +1511,9 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             if (ks.first == SIDE_CPU) {
                 cpu_.Push(std::move(ks.second), runtime::NDArray());
             } else {
-#ifdef DECORD_USE_CUDA
                 std::lock_guard<std::mutex> lk(lcv_mtx_);
                 gpu_pkt_q_.push_back(std::move(ks.second));
                 lcv_.notify_all();
-#endif
             }
         }
         if (clone_debt) {
@@ -1567,23 +1523,19 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             if (debt_dst == SIDE_CPU) {
                 cpu_.Push(std::move(dup_ptr), runtime::NDArray());
             } else {
-#ifdef DECORD_USE_CUDA
                 std::lock_guard<std::mutex> lk(lcv_mtx_);
                 gpu_pkt_q_.push_back(std::move(dup_ptr));
                 lcv_.notify_all();
-#endif
             }
         }
         if (s == SIDE_CPU) {
             cpu_.Push(std::move(pkt), runtime::NDArray());
         } else {
-#ifdef DECORD_USE_CUDA
             {
                 std::lock_guard<std::mutex> lk(lcv_mtx_);
                 gpu_pkt_q_.push_back(std::move(pkt));
             }
             lcv_.notify_all();
-#endif
         }
         // 缓存回收：弹出已消费前缀（取包时已扣字节，这里只收槽位）
         {
@@ -1626,16 +1578,13 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
         if (ks.first == SIDE_CPU) {
             cpu_.Push(std::move(ks.second), runtime::NDArray());
         } else {
-#ifdef DECORD_USE_CUDA
             std::lock_guard<std::mutex> lk(lcv_mtx_);
             gpu_pkt_q_.push_back(std::move(ks.second));
             lcv_.notify_all();
-#endif
         }
     }
     if (send_flush) {
         cpu_.Push(nullptr, runtime::NDArray());
-#ifdef DECORD_USE_CUDA
         if (gpu_) {
             {
                 std::lock_guard<std::mutex> lk(lcv_mtx_);
@@ -1643,7 +1592,6 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             }
             lcv_.notify_all();
         }
-#endif
     }
 }
 
@@ -1708,10 +1656,8 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                             if (s2 == SIDE_CPU) {
                                 cpu_.Push(std::move(pkt), runtime::NDArray());
                             } else {
-#ifdef DECORD_USE_CUDA
                                 std::lock_guard<std::mutex> lk2(lcv_mtx_);
                                 gpu_pkt_q_.push_back(std::move(pkt));
-#endif
                             }
                             stashed = true;
                         }
@@ -1787,7 +1733,6 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
         return true;
     }
     if (s == SIDE_CPU) {
-#ifdef DECORD_USE_CUDA
         if (out_cuda_) {
             // GPU 驻留模式：取已上载的显存帧（marker 由 UploadStep 直通），非阻塞
             std::lock_guard<std::mutex> lk(rmtx_);
@@ -1797,7 +1742,6 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
             lcv_.notify_all();  // 槽位/预算释放：即时唤醒喂包/上载线程
             return f->defined();
         }
-#endif
         // 非阻塞门（2026-09-27 停滞修复）：cpu_.Pop 是阻塞队列操作——
         // EOF 尾会计失配（marker 被「CPU 侧未推流」分支误食后 chunk 仍
         // 期望帧）时会**永眠**并绕过 stall 看门狗与 VideoReader 的 EOF
@@ -1809,7 +1753,6 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
         if (cpu_.QueueDepth() == 0) return false;
         return cpu_.Pop(f);
     }
-#ifdef DECORD_USE_CUDA
     // GPU 帧：取工作线程已落地/直通的帧，非阻塞
     std::lock_guard<std::mutex> lk(rmtx_);
     if (ready_.empty()) return false;
@@ -1817,9 +1760,6 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
     ready_.pop_front();
     lcv_.notify_all();  // 槽位/预算释放：即时唤醒喂包线程
     return f->defined();
-#else
-    return false;
-#endif
 }
 
 bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
@@ -1932,7 +1872,6 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         runtime::NDArray f;
         if (!PopSide(s, &f)) {
             static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
-#ifdef DECORD_USE_CUDA
             // 取证采样**默认开**（2026-09-12 §18 硬化：挂死现场自带签名，
             // 无需先复现再开 STATS）。判别器是**时间**不是计数——正常供帧
             // 间隙（毫秒级）就能凑满任意连败计数（实测健康路径 2000 连败
@@ -2008,9 +1947,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     }
                 }
             }
-#endif
             if (dbg) fprintf(stderr, "[hybrid-p] empty side=%d emitted_total=%lld\n", (int)s, (long long)emitted_total_);
-#ifdef DECORD_USE_CUDA
             {   // HOL 判定：head 侧空但**对侧有存货** = 保序队头阻塞（对侧
                 // 帧已产出却被排在后面的 chunk 卡住）；双侧全空 = 真·生产
                 // 不足，不计 HOL。
@@ -2045,7 +1982,6 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     hol_prev_side_ = -1;
                 }
             }
-#endif
             // ── EOF 尾恢复网（2026-09-27 停滞修复）────────────────────
             // 触发面：eof_pushed_ 已置 + **CPU 侧**队头持续 ≥1s 零产出。
             // 根因是 marker 顺序竞态：CPU 侧排空 marker 在 eof_pushed_
@@ -2258,7 +2194,6 @@ runtime::NDArray HybridThreadedDecoder::ToHost(const runtime::NDArray &g) {
     return h;
 }
 
-#ifdef DECORD_USE_CUDA
 void HybridThreadedDecoder::GpuFrameProduced() {
     // 生产侧 sustained 折（2026-09-18）：连续产出段（间隔 <50ms，
     // 断流重置——CPU 值日期不计入，"没活干"≠"能力低"）满折（16 帧）
@@ -2737,14 +2672,12 @@ void HybridThreadedDecoder::UploaderLoop() {
         }
     }
 }
-#endif  // DECORD_USE_CUDA
 
 bool HybridThreadedDecoder::Drained() const {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (!emit_queue_.empty() || has_stash_[0] || has_stash_[1]) return false;
     }
-#ifdef DECORD_USE_CUDA
     {
         std::lock_guard<std::mutex> lk(rmtx_);
         if (!ready_.empty()) return false;
@@ -2754,26 +2687,19 @@ bool HybridThreadedDecoder::Drained() const {
         std::lock_guard<std::mutex> lk(lcv_mtx_);
         if (!gpu_pkt_q_.empty() || gpu_flush_left_ > 0) return false;
     }
-#endif
     if (!cpu_.Drained()) return false;
-#ifdef DECORD_USE_CUDA
     if (gpu_ && !gpu_->Drained()) return false;
-#endif
     return true;
 }
 
 void HybridThreadedDecoder::SuggestDiscardPTS(std::vector<int64_t> dts) {
     cpu_.SuggestDiscardPTS(dts);
-#ifdef DECORD_USE_CUDA
     if (gpu_) gpu_->SuggestDiscardPTS(dts);
-#endif
 }
 
 void HybridThreadedDecoder::ClearDiscardPTS() {
     cpu_.ClearDiscardPTS();
-#ifdef DECORD_USE_CUDA
     if (gpu_) gpu_->ClearDiscardPTS();
-#endif
 }
 
 }  // namespace decord

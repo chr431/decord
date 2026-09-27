@@ -82,19 +82,19 @@ _decord_build/
 ### 从源码 pip 构建
 
 构建由 `pyproject.toml`（scikit-build-core）驱动：`pip install` 会用 CMake 编译共享
-库与 FFmpeg 运行闭包一起打进 wheel。Windows 下 pip 构建**默认启用 CUDA**（GPU 变体，
-与本 fork 发布形态一致），需要 `FFMPEG_DIR` 指向 FFmpeg SDK（include/ + lib/）：
+库与 FFmpeg 运行闭包一起打进 wheel。**构建是 GPU-only 的（0.8.5 起）**：CUDA 路径
+无条件编译（`-DUSE_CUDA=OFF` 直接 `FATAL_ERROR`），但**不需要 CUDA Toolkit**——
+0.8.1 起驱动 API 全部运行时动态加载、kernel 以内嵌 PTX 提供，构建只要求 NVIDIA
+驱动头文件（仓库自带）与 FFmpeg SDK。无 GPU 机器上运行时优雅降级为纯 CPU 解码
+（cuInit 探测失败不崩溃）。需要非 CUDA 构建（macOS 等）请用上游 dmlc/decord。
 
 ```bash
 git clone --recursive https://github.com/chr431/decord
 cd decord
 
-# Windows：GPU（默认）——只要求 NVIDIA 驱动，无需 Toolkit
+# 只要求 NVIDIA 驱动，无需 Toolkit
 export FFMPEG_DIR=D:/path/to/ffmpeg-n9.0-latest-win64-gpl-shared-9.0
 pip install .
-
-# Windows：纯 CPU 覆盖
-pip install . --config-settings="cmake.define.USE_CUDA=OFF"
 
 # 仓库内一键脚本（vcvars + FFMPEG_DIR 默认值已配好）
 make_wheel.bat
@@ -104,25 +104,26 @@ Linux 下 NVDEC 构建若报 `libnvcuvid.so` 找不到，可参考上游
 [#102](https://github.com/dmlc/decord/issues/102)：用 `ldconfig -p | grep libnvcuvid`
 找到该库并链接到 `CUDA_TOOLKIT_ROOT_DIR/lib64`。
 
-### 开发构建（CMake + PYTHONPATH）
+### 开发构建（CMakePresets + PYTHONPATH）
 
 ```bash
-# Windows（启用 CUDA）
-cmake -S . -B build -DUSE_CUDA=ON \
-      -DFFMPEG_DIR="D:/path/to/ffmpeg-n9.0-latest-win64-gpl-shared-9.0" -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
+# 三 preset（CMakePresets.json，2026-09-28 收敛 9 个历史 build-* 目录）：
+#   dev           Ninja + Release      -> build-081fix（日常开发）
+#   asan          MSVC /fsanitize      -> build-asan
+#   release-check 发版前干净树核对     -> build-rel-check
+cmake --preset dev            # FFMPEG_DIR 走环境变量（FindFFmpeg 自读）
+cmake --build --preset dev
 
-# Linux / macOS
-cmake -S . -B build -DUSE_CUDA=0 -DCMAKE_BUILD_TYPE=Release -DFFMPEG_DIR=/path/to/ffmpeg
-cmake --build build -j$(nproc)
+# Windows 一键：构建 + 部署 site-packages（md5 校验，防测量旧 DLL）
+rebuild_dev.bat
 
 # 直接用新构建的库跑 Python 绑定（无需 pip install）
 PYTHONPATH=python python -c "import decord; print(decord.__version__)"
 ```
 
-常用 CMake 选项：`-DUSE_CUDA=ON|OFF`（NVDEC；0.8.1 起无需 CUDA Toolkit）、
-`-DFFMPEG_DIR=...`、`-DDECORD_INSTALL_LIBDIR=...`。Python 绑定按
-`build/`（Windows 为 `build/Release`）→ `DECORD_LIBRARY_PATH` 的顺序找库。
+常用 CMake 选项：`-DFFMPEG_DIR=...`、`-DDECORD_INSTALL_LIBDIR=...`（`USE_CUDA`
+恒 ON 不可关）。Python 绑定按 `build/`（Windows 为 `build/Release`）→
+`DECORD_LIBRARY_PATH` 的顺序找库。
 
 ## 快速上手
 
