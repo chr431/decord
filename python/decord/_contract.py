@@ -49,7 +49,7 @@ _HYBRID_STATS_KEYS = (
     'kicks_c', 'kicks_g', 'late', 'out_cuda', 'strag',
     'strandmax_c', 'strandmax_g',
     'up_cempty', 'up_flushes', 'up_frames', 'up_nobuf',
-    'window_frames',
+    'win_subs', 'window_frames',
 )
 
 FEATURES = {
@@ -68,8 +68,9 @@ FEATURES = {
     'skip_loop_filter_env': True,
     # 已知缺陷边界：硬窗可用，但「晚起点（start ≥ 窗长）+ seek_accurate +
     # 硬窗」组合存在 fork 级尾帧缺陷（窗界停喂的排空 marker 被当 EOF，
-    # 尾帧由缓存容错替补——帧数守恒、尾部像素错误）。修复前消费方必须
-    # 避开该组合（或以无窗基线做位级对照）。
+    # 尾帧由缓存容错替补——帧数守恒、尾部像素错误）。窗激活期间的替补
+    # 有 latched 告警并计数进 hybrid_stats（win_subs，健康恒 0）；根治
+    # 前消费方必须避开该组合（或以无窗基线做位级对照）。
     'hard_decode_window': True,
 }
 

@@ -977,6 +977,9 @@ NDArray VideoReader::NextFrame() {
 }
 
 void VideoReader::SetDecodeWindow(int64_t max_frames) {
+    // reader 侧留档窗长：FetchCachedFrame 的替补观察哨（C-57）需要知道
+    // 窗是否激活；decoder 实现各自处理（非 hybrid 为接口默认空实现）。
+    decode_window_ = max_frames > 0 ? max_frames : -1;
     if (decoder_) decoder_->SetDecodeWindow(max_frames);
 }
 
@@ -991,8 +994,18 @@ std::string VideoReader::DecodeStats() const {
 }
 
 std::string VideoReader::HybridStats() {
-    // decoder_ 为 hybrid 时给全量快照；其余实现返回空串
-    return decoder_ ? decoder_->HybridStatsProbe() : std::string();
+    // decoder_ 为 hybrid 时给全量快照；其余实现返回空串。Reader 级计数
+    // 追加在尾部（窗替补观察哨，C-57）：健康路径恒 0；python 侧
+    // hybrid_stats() 按 "k=v;" 通用解析自动透传。
+    if (!decoder_) return std::string();
+    std::string s = decoder_->HybridStatsProbe();
+    if (!s.empty()) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "win_subs=%lld;",
+                 static_cast<long long>(win_subs_));
+        s += buf;
+    }
+    return s;
 }
 
 void VideoReader::SetRoi(int x1, int y1, int x2, int y2) {
@@ -1870,6 +1883,26 @@ bool VideoReader::FetchCachedFrame(NDArray &frame, int64_t pos) {
   }
   frame.CopyFrom(cached_frame_);
   failed_idx_.insert(pos);
+  if (decode_window_ > 0) {
+      // C-57 观察哨（2026-09-28 发布轮）：硬窗激活期间的缓存替补。在
+      // hybrid + 晚起点（seek 目标 ≥ 窗长）组合下这是已知的 fork 级尾帧
+      // 缺陷形态（窗界停喂的排空 marker 被当 EOF，迟包永不到达；帧数
+      // 守恒、尾 GOP 级 ~20 帧像素错）——上游的百分比告警阈值对该量级
+      // 静默（20/7761 = 0.26% << 10%）。计数进 hybrid_stats（win_subs），
+      // 首现即告警（latch，每 reader 一条）。根治前该组合的防线仍应由
+      // 消费方谓词承担；本哨只保证缺陷不再无声。
+      ++win_subs_;
+      if (!win_sub_warned_) {
+          win_sub_warned_ = true;
+          LOG(WARNING) << "[" << filename_ << "]frame substituted from cache "
+            << "while decode window is active (pos=" << pos
+            << ", window=" << decode_window_
+            << "; stats key win_subs). Under hybrid + late start (seek "
+            << "target beyond window) this is a known tail-corruption defect "
+            << "- rerun without the window, or from start < window, if "
+            << "pixel-exact output matters.";
+      }
+  }
   int64_t failed_count = failed_idx_.size();
   if (fault_tol_thresh_ >= 0) {
       if (failed_count > fault_tol_thresh_) {
