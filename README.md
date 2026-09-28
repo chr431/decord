@@ -378,7 +378,7 @@ decord.features()         # 本构建能力面快照（hybrid ctx / gray 输出 
 - 关键帧索引磁盘缓存（按 路径哈希 + 大小 + mtime 失效，写系统缓存目录）。
 - `probe()` / `get_ffmpeg_version()` C API 与 Python 绑定。
 - ROI-first 解码管线（CPU/GPU 统一只输出固定矩形）。
-- 测试：`tests/run_fast.sh` 并行四套件（md5 / 流式 / 步长 / lockstep 字节级对照）。
+- 测试：`tests/run_fast.sh` 六套件（gpu / formats / md5 / stream / stride / lockstep；默认串行——NVDEC 会话争用下并行是隐藏 flake 源，`--parallel` 选入三车道）。
 
 完整历史见 commit log；`dev` 与 `master` 均受 CI 监听。
 

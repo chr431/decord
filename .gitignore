@@ -1,6 +1,12 @@
 # Custom ignored
 .vscode
 build*/
+# 工作区产物（未跟踪；登记防 `git clean -fd` 误删——2026-09-28 夜间轮
+# 曾因此丢失测试侧改造 e5a36aa）
+ab/
+bench_videos/
+test_video_long/
+upstream-analysis/
 docs/_build
 .DS_Store
 __pycache__
