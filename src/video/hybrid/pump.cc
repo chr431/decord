@@ -26,6 +26,7 @@
 #include <mutex>
 #include <thread>
 #include <cstdio>
+#include <string>
 #include <cstring>
 #include <vector>
 
@@ -182,16 +183,32 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         }
                     }
                     last_fed_side_ = g.side;
-                    if (earlier_pending[(int)g.side]) continue;
+                if (earlier_pending[(int)g.side]) continue;
                 }
                 if (!has_pkt) continue;
-                if (!eof_cache_) {
-                    const int64_t cap = (g.side == SIDE_CPU)
-                        ? static_cast<int64_t>(queue_frames_)
-                        : static_cast<int64_t>(ready_cap_frames_);
-                    if (side_pending_[g.side] >= cap) {
-                        earlier_pending[(int)g.side] = true;
-                        continue;
+                // 容量门（2026-09-28 av1 死锁轮修订）：EOF 排空原本完全
+                // 绕过此门（「无视饥饿门排空全部剩余包」）。但整文件进
+                // 包缓存时 eof_cache_ 可在解码启动前就位——若某臂速率
+                // 从未成熟（rg/rc<=0 = 零产出证据，CU 启动冻结即此形），
+                // 盲排空会把全文件（实测 23647 包）倾倒给死臂：头块永等
+                // + side_pending 虚高 23670 + 重试预算 FATAL。修订：EOF
+                // 只对**速率已成熟**的臂保留无界排空；未熟臂照常限容
+                // （消费推进持续驱动泵，Pop 的 PumpFeed(true) 保证供料
+                // 不中断）。速率成熟的健康快解路径（hevc/h264 stream
+                // 相位）行为不变。
+                {
+                    const bool side_unmatured = (g.side == SIDE_CPU)
+                        ? cpu_.ProductionRate() <= 0.0
+                        : gpu_rate_landed_.load(
+                              std::memory_order_relaxed) <= 0.0;
+                    if (!eof_cache_ || side_unmatured) {
+                        const int64_t cap = (g.side == SIDE_CPU)
+                            ? static_cast<int64_t>(queue_frames_)
+                            : static_cast<int64_t>(ready_cap_frames_);
+                        if (side_pending_[g.side] >= cap) {
+                            earlier_pending[(int)g.side] = true;
+                            continue;
+                        }
                     }
                 }
                 gi = k;
@@ -852,6 +869,41 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                         eof_starve_on_ = false;
                         continue;
                     }
+                }
+            }
+            // ── GPU 臂冻结检测（2026-09-28 av1 死锁轮根治位）───────────
+            // CU 解码臂启动竞态冻结签名：包滞留解析队列（cud_p>0）、重排
+            // 环零帧（cud_o==0）、GPU 侧发射 3s 零增量。冻结时队头 GPU
+            // chunk 的帧永不可达——与其耗尽重试预算静默 FATAL，不如带
+            // 终态大声失败（DECORDError）。配套防线：泵侧 EOF 排空对
+            // 未熟臂限容（见 PumpFeed 容量门注释），本签名触发时
+            // side_pending 已被限在有界量级。健康路径不命中：慢落地时
+            // ord 非零波动、fg 缓增；只有「有包不解析 + 零帧完成」才是
+            // 解码臂死锁。
+            if (s == SIDE_GPU && gpu_) {
+                const auto now_g = std::chrono::steady_clock::now();
+                const int64_t fg_now = frames_out_[1].load(
+                    std::memory_order_relaxed);
+                int64_t cp_ = -1, cb_ = -1, co_ = -1;
+                gpu_->DiagDepths(&cp_, &cb_, &co_);
+                const bool frozen_sig = cp_ > 0 && co_ == 0;
+                if (frozen_sig && gpu_stall_fg_ == fg_now) {
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now_g - gpu_stall_tp_).count() >= 3000) {
+                        gpu_arm_stall_.fetch_add(1,
+                            std::memory_order_relaxed);
+                        arm_stalled_.store(true, std::memory_order_release);
+                        fprintf(stderr,
+                                "[hybrid] GPU arm stalled: CU decode worker "
+                                "frozen (pkt_queue=%lld unconsumed, "
+                                "reorder=0, no output 3s) - signaling "
+                                "VideoReader self-heal\n",
+                                (long long)cp_);
+                        fflush(stderr);
+                    }
+                } else if (frozen_sig || gpu_stall_fg_ != fg_now) {
+                    gpu_stall_tp_ = now_g;
+                    gpu_stall_fg_ = fg_now;
                 }
             }
             PumpFeed(true);   // 同 A4：空取=头部饥饿，强制泵推进

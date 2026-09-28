@@ -485,6 +485,14 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
 
 
 void HybridThreadedDecoder::Start() {
+    if (getenv("DECORD_HYBRID_FLIGHT")) {
+        FILE *lf = fopen("decord_hybrid_flight.log", "a");
+        if (lf) {
+            fprintf(lf, "# start lander_run=%d flight_run=%d\n",
+                    (int)lander_run_.load(), (int)flight_run_.load());
+            fclose(lf);
+        }
+    }
 #if defined(_WIN32)
     std::vector<unsigned long> pre_tids;
     if (affinity_on_) pre_tids = SnapshotThreads();
@@ -531,6 +539,13 @@ void HybridThreadedDecoder::Start() {
             std::thread u(&HybridThreadedDecoder::UploaderLoop, this);
             uploader_ = std::move(u);
         }
+        // 飞行记录器（取证用，env 门控；消费者路径零接触）：每实例一个
+        // 线程，4Hz 快照写 decord_hybrid_flight.log（hybrid/recorder.cc）
+        if (getenv("DECORD_HYBRID_FLIGHT") && !flight_run_.load()) {
+            flight_run_.store(true);
+            std::thread ft(&HybridThreadedDecoder::FlightRecorderLoop, this);
+            flight_th_ = std::move(ft);
+        }
     }
 #if defined(_WIN32)
     if (affinity_on_) {
@@ -565,10 +580,18 @@ void HybridThreadedDecoder::Start() {
 
 void HybridThreadedDecoder::StopGpuWorker() {
     bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
+    if (getenv("DECORD_HYBRID_FLIGHT")) {
+        FILE *lf = fopen("decord_hybrid_flight.log", "a");
+        if (lf) { fprintf(lf, "# gpu-worker-stop\n"); fclose(lf); }
+    }
     lander_run_.store(false);
     lcv_.notify_all();
     gpu_pool_.Stop();  // 唤醒阻塞在 Acquire 的工作线程
     up_pool_.Stop();
+    flight_run_.store(false);   // 记录器先停（10ms 步进退出，先于 join）
+    if (flight_th_.joinable()) {
+        flight_th_.join();
+    }
     if (dbg) fprintf(stderr, "[hybrid-d] joining worker\n");
     if (lander_.joinable()) {
         lander_.join();
@@ -660,6 +683,7 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     kv("late", late_feeds_.load(std::memory_order_relaxed));
     kv("strag", strag_total_.load(std::memory_order_relaxed));
     kv("force_eof", force_eof_close_.load(std::memory_order_relaxed));
+    kv("gpu_arm_stall", gpu_arm_stall_.load(std::memory_order_relaxed));
     kv("assigned_c", assigned_frames_[0]);
     kv("assigned_g", assigned_frames_[1]);
     kv("window_frames", window_frames_);

@@ -48,6 +48,14 @@ class ThreadedDecoderInterface {
          *        which matters for the non-blocking GPU Pop().
          */
         virtual bool Drained() const = 0;
+        /*! rief 终态取证（默认空）：VideoReader 在 EOF 重试 FATAL 前
+         *  调用——死亡位点自拍，不可能被时序扰动避开（2026-09-28 停滞轮）*/
+        virtual void DumpState(const char *tag) const { (void)tag; }
+        /*! rief 解码臂冻结标志（2026-09-28 av1 死锁轮）：hybrid 的 CU
+         *  臂启动竞态冻结时置位；VideoReader 据此自愈（Seek 重解）。 */
+        virtual bool ArmStalled() const { return false; }
+        /*! rief 清除冻结标志（自愈动作完成后调用） */
+        virtual void ClearArmStall() {}
         /*! 混合解码器建议的 demux 领先深度（包数；0 = 不建议）。
          *  VideoReader 取 max(env 基线, 本值) —— 深度是离峰生产的前提，
          *  由解码器按其自适应预算给出。 */

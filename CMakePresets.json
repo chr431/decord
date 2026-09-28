@@ -7,12 +7,14 @@
   "configurePresets": [
     {
       "name": "dev",
-      "displayName": "dev（日常开发，Ninja+Release）",
+      "displayName": "dev（日常开发，Ninja+Release+符号）",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-081fix",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "USE_CUDA": "ON"
+        "USE_CUDA": "ON",
+        "CMAKE_CXX_FLAGS": "/DWIN32 /D_WINDOWS /W3 /GR /EHsc /Zi /FS",
+        "CMAKE_SHARED_LINKER_FLAGS": "/machine:x64 /DEBUG"
       }
     },
     {

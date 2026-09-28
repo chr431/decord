@@ -290,6 +290,12 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool HarvestD2H(int k);
     /*! \brief 同步并丢弃在途 D2H/H2D（Clear/ROI 重建用） */
     void AbortInflight();
+    /*! \brief 停滞飞行记录器线程体（hybrid/recorder.cc，取证用） */
+    void FlightRecorderLoop();
+    /*! rief 终态取证：VideoReader FATAL 前调用（接口默认空实现） */
+    void DumpState(const char *tag) const override;
+    bool ArmStalled() const override;
+    void ClearArmStall() override;
     /*! \brief 停止并回收 GPU 工作线程（Stop/Clear 共用） */
     void StopGpuWorker();
     /*! \brief kInt64 drain marker 判定（与 NextFrameImpl 的判据一致） */
@@ -375,6 +381,10 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  hybrid_gpu 反而 0.71x 于纯 GPU）。 */
     std::thread uploader_;
     std::atomic<bool> lander_run_{false};
+    /*! \brief 停滞飞行记录器线程（DECORD_HYBRID_FLIGHT=1 启动，4Hz
+     *  快照到 decord_hybrid_flight.log；消费者路径零接触，取证用） */
+    std::thread flight_th_;
+    std::atomic<bool> flight_run_{false};
     /*! \brief 保护 gpu_pkt_q_ / gpu_flush_left_（demux 线程写，工作线程读） */
     mutable std::mutex lcv_mtx_;
     std::condition_variable lcv_;
@@ -595,6 +605,16 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::chrono::steady_clock::time_point eof_starve_tp_{};
     bool eof_starve_on_ = false;
     std::atomic<int64_t> force_eof_close_{0};  ///< 恢复网触发次数（stats 透出）
+    // ── GPU 臂冻结检测（2026-09-28 av1 死锁轮；仅消费者线程读写）────
+    // CU 解码臂启动竞态冻结的实测签名：DiagDepths pkt>0（包滞留解析
+    // 队列）∧ ord==0（重排环零帧）∧ frames_out_[GPU] 3s 零增量。此时
+    // 队头 GPU chunk 的帧**永不可达**——静默等待只会耗尽重试预算，
+    // 大声失败（DECORDError 带终态）是唯一诚实动作。健康慢路径不会
+    // 命中：即使消费端大拷贝拖慢落地，ord 会非零波动、fg 缓增。
+    std::chrono::steady_clock::time_point gpu_stall_tp_{};
+    int64_t gpu_stall_fg_ = -1;
+    std::atomic<int64_t> gpu_arm_stall_{0};   ///< 冻结检测触发次数（stats）
+    std::atomic<bool> arm_stalled_{false};    ///< 冻结标志（VideoReader 自愈用）
     // ── 遥测直通（2026-09-17 引擎穿透轮）──────────────────────────
     // HOL episode 入口的对侧存货分布（log2 桶 ×24，per-episode 一次
     // 数组写，默认累计——成本≈零）：sum/max 之外补形状，"连续中等

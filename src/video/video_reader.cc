@@ -841,6 +841,7 @@ NDArray VideoReader::NextFrameImpl() {
     bool ret = false;
     int rewind_offset = 0;
     int retry = 0;
+    int arm_heals = 1;   // 解码臂冻结自愈计数（1 起：首次检测即用第 1 次）
     while (!ret) {
         // 无条件 PushNext 的账目问题（D3 历史）由 decoder 侧精确在途
         // 计数解决：hybrid 的 pkts_pushed_-frames_popped_ 因侧丢弃
@@ -897,6 +898,32 @@ NDArray VideoReader::NextFrameImpl() {
                 ret = false;
               }
             } else {
+              // 解码臂冻结自愈（2026-09-28 av1 死锁轮）：hybrid 的 CU 臂
+              // 启动竞态冻结时帧永不可达——Seek 回当前帧所在关键帧全量
+              // 重解（解码器/路由全复位，CU 会话重开 = 启动竞态重掷，
+              // 实测单次冻结率 ~30% → 3 次自愈后残差 ~2.7%）。超过
+              // 3 次仍冻结才放弃（DumpState 带终态）。
+              if (decoder_->ArmStalled()) {
+                  if (arm_heals <= 3) {
+                      int64_t kp = LocateKeyframe(curr_frame_);
+                      fprintf(stderr,
+                              "[decord] decoder arm stalled - self-heal "
+                              "#%d: Seek(%lld) curr=%lld\n",
+                              arm_heals, (long long)kp,
+                              (long long)curr_frame_);
+                      decoder_->ClearArmStall();
+                      if (Seek(kp, /*force_backward=*/true)) {
+                          ++arm_heals;
+                          retry = 0;
+                          continue;
+                      }
+                  } else {
+                      decoder_->DumpState("arm-stall-fatal");
+                      LOG(FATAL) << "[" << filename_ << "]decoder arm stalled "
+                      << "after " << arm_heals << " self-heal attempts (CU "
+                      << "decode worker frozen); frames unreachable.";
+                  }
+              }
               // skipped frames or waiting for more packets
               if (eof_ && retry > EOF_RETRY_MAX) {
                 if (FetchCachedFrame(frame, curr_frame_)) {
@@ -905,13 +932,13 @@ NDArray VideoReader::NextFrameImpl() {
                            && retry <= EOF_RETRY_MAX * 10) {
                   // 在途宽限（2026-09-28 av1 hybrid 停滞轮）：EOF_RETRY_MAX
                   // 是上游为毫秒级尾排空设的静态预算；hybrid 在整文件装进
-                  // 包缓存时 demux 早完（eof_ 提前为真），而万级已派包的
-                  // 排空实测 10~30s（self-resolving：30s 预算 3/3 过 vs
-                  // 默认 10.4s 预算 4/6 FATAL）。解码器尚有在途工作
-                  // （Drained()==false：队列/侧 pending/池在途）时不宣判
-                  // 卡死，宽限至 10× 预算；真死锁仍在 ~104s 内 FATAL。
-                  // 纯 CPU/GPU 解码器真 EOF 时 Drained() 为真，行为不变。
+                  // 包缓存时 demux 早完（eof_ 提前为真），万级已派包的
+                  // 排空可达数十秒（self-resolving）。解码器尚有在途工作
+                  // （Drained()==false）时不宣判卡死，宽限至 10× 预算；
+                  // 真死锁仍在 ~104s 内 FATAL。纯 CPU/GPU 解码器真 EOF
+                  // 时 Drained() 为真，行为不变。
                 } else {
+                  decoder_->DumpState("eof-retry-fatal");
                   LOG(FATAL) << "[" << filename_ << "]Unable to handle EOF because it takes too long to retrieve last few frames and "
                   << "`DECORD_EOF_RETRY_MAX=" << EOF_RETRY_MAX << "`. You may override the limit by `export DECORD_EOF_RETRY_MAX=20480`"
                   << " for example to allow more EOF retry attempts, exit...";
