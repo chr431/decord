@@ -631,6 +631,15 @@ bool VideoReader::Seek(int64_t pos, bool force_backward) {
     decoder_->Start();
     if (ret >= 0) {
         curr_frame_ = pos;
+        // C-57 根治记账：本次落锚于 ≤pos 的关键帧，[anchor, pos) 前缀
+        // 解码但不交付（见 SetDecodeWindow 注释）——落锚即按新锚点
+        // 重推窗预算。SeekAccurate 内层调用本函数时 pos=key_pos
+        // （前缀 0），随后由其按精确目标二次重推。
+        seek_prefix_ = pos - LocateKeyframe(pos);
+        if (seek_prefix_ < 0) seek_prefix_ = 0;
+        if (decode_window_ > 0 && decoder_) {
+            decoder_->SetDecodeWindow(decode_window_ + seek_prefix_);
+        }
     }
     return ret >= 0;
 }
@@ -666,6 +675,13 @@ bool VideoReader::SeekAccurate(int64_t pos) {
         if (s_dbg) fprintf(stderr, "[seek-dbg] Seek(%lld) -> %d curr=%lld\n",
                            (long long)key_pos, (int)ret, (long long)curr_frame_);
         if (!ret) return false;
+        // C-57 根治配套：精确目标的前缀 [key_pos, pos) 须补进窗预算
+        // （内层 Seek 已按 key_pos 记账前缀 0，此处按真实目标重推；
+        // SkipFramesImpl 尚未驱动解码，预算先于首包生效）。
+        seek_prefix_ = pos - key_pos;
+        if (decode_window_ > 0 && decoder_) {
+            decoder_->SetDecodeWindow(decode_window_ + seek_prefix_);
+        }
         // double check if keyframe was jumpped correctly
         if(CheckKeyFrame()){
             if (s_dbg) fprintf(stderr, "[seek-dbg] CheckKeyFrame OK, SkipFramesImpl(%lld)\n",
@@ -977,10 +993,21 @@ NDArray VideoReader::NextFrame() {
 }
 
 void VideoReader::SetDecodeWindow(int64_t max_frames) {
-    // reader 侧留档窗长：FetchCachedFrame 的替补观察哨（C-57）需要知道
-    // 窗是否激活；decoder 实现各自处理（非 hybrid 为接口默认空实现）。
+    // reader 侧留档声明窗长（FetchCachedFrame 的替补观察哨需要知道窗
+    // 是否激活）。C-57 根治（2026-09-28 发布轮）：fork 硬窗按**已派帧
+    // 量**计数，而 keyframe-seek 的锚点前缀（[anchor, target)）会被
+    // 解码但在合并队列按陈旧丢弃（不交付）——前缀吃预算会使请求尾部
+    // 落进未派 GOP，被 EOF 容错静默替补（实测 test5 GOP=299 晚起点窗：
+    // assigned=4×299=1196，请求尾 [5980,6000) 落第 5 个未派 GOP，20 帧
+    // 像素错）。转发值 = 声明值 + 最近落锚前缀，语义 =
+    // 「seek(T) 后从 T 起声明值帧可用」；每次从声明值重推，无累积。
+    // 纯解码器 SetDecodeWindow 为接口默认空实现，不受影响。
     decode_window_ = max_frames > 0 ? max_frames : -1;
-    if (decoder_) decoder_->SetDecodeWindow(max_frames);
+    if (decoder_) {
+        decoder_->SetDecodeWindow(
+            decode_window_ > 0 ? decode_window_ + seek_prefix_
+                               : max_frames);
+    }
 }
 
 std::string VideoReader::DecodeStats() const {

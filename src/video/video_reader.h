@@ -205,7 +205,8 @@ class VideoReader : public VideoReaderInterface {
         std::unordered_set<int64_t> failed_idx_;  // idx of failed frames(recovered from other frames)
         int64_t fault_tol_thresh_;  // fault tolerance threshold, raise if recovered frames retrieved exceeds thresh
         bool fault_warn_emit_;  // whether a fault warning has been emitted
-        int64_t decode_window_ = -1;  // SetDecodeWindow 窗长（-1=未设）；窗激活期间的缓存替补显式告警并计数（C-57 观察哨）
+        int64_t decode_window_ = -1;  // SetDecodeWindow 声明窗长（-1=未设）；窗激活期间的缓存替补显式告警并计数（C-57 观察哨）
+        int64_t seek_prefix_ = 0;     // 最近 keyframe-seek 落锚前缀（C-57 根治：硬窗按已派帧量计，前缀解码但不交付，须补进窗预算）
         int64_t win_subs_ = 0;        // 窗激活期间的缓存替补帧数（健康恒 0；hybrid_stats 键 win_subs）
         bool win_sub_warned_ = false; // 窗替补告警 latch（每个 reader 至多一条）
 };  // class VideoReader
