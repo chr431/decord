@@ -10,7 +10,7 @@ rem    command and tools/env_doctor.py verifies md5 afterwards.
 rem  - CMAKE_BUILD_TYPE used to silently drift (Debug vs Release). It is now
 rem    explicit and overridable, and defaults to Release.
 rem 2026-09-28 R3-4: switch to CMakePresets ("dev" = Ninja + Release +
-rem  USE_CUDA=ON into build-081fix). FFMPEG_DIR goes through the env
+rem  USE_CUDA=ON into build-dev). FFMPEG_DIR goes through the env
 rem (FindFFmpeg reads $ENV{FFMPEG_DIR}); CMAKE_BUILD_TYPE override now maps
 rem to a plain -D on top of the preset (preset keeps Release as default).
 call "C:\Program Files\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul

@@ -29,7 +29,7 @@ OUT = Path(os.environ.get('TEMP', '/tmp')) / 'stall_watch'
 OUT.mkdir(exist_ok=True)
 
 env = dict(os.environ)
-env['DECORD_LIBRARY_PATH'] = str(ROOT / 'build-081fix')
+env['DECORD_LIBRARY_PATH'] = str(ROOT / 'build-dev')
 env['DECORD_EOF_RETRY_MAX'] = BUDGET
 
 for run in range(1, RUNS + 1):

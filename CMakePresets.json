@@ -9,7 +9,7 @@
       "name": "dev",
       "displayName": "dev（日常开发，Ninja+Release+符号）",
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build-081fix",
+      "binaryDir": "${sourceDir}/build-dev",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "USE_CUDA": "ON",

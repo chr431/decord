@@ -22,7 +22,7 @@ for a in "$@"; do
   esac
 done
 export HYB_TEST_N="$N"
-export DECORD_LIBRARY_PATH="${DECORD_LIBRARY_PATH:-D:/Repo/decord/build-081fix}"
+export DECORD_LIBRARY_PATH="${DECORD_LIBRARY_PATH:-D:/Repo/decord/build-dev}"
 TIMEOUT="${HYB_TEST_TIMEOUT:-900}"
 
 # Windows Git Bash 无 /tmp 以外的稳定临时位；用固定子目录便于事后取证

@@ -23,7 +23,7 @@ OUT = Path(os.environ.get('TEMP', '/tmp')) / 'stall_trig'
 OUT.mkdir(exist_ok=True)
 
 env = dict(os.environ)
-env['DECORD_LIBRARY_PATH'] = str(ROOT / 'build-081fix')
+env['DECORD_LIBRARY_PATH'] = str(ROOT / 'build-dev')
 env['DECORD_HYBRID_FLIGHT'] = '1'
 env['DECORD_EOF_RETRY_MAX'] = BUDGET
 

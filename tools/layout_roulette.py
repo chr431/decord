@@ -19,7 +19,7 @@ MARK = '// LAYOUT-SHIFT:'
 start = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 nprobe = int(sys.argv[2]) if len(sys.argv) > 2 else 4
 env = dict(os.environ)
-env['DECORD_LIBRARY_PATH'] = str(ROOT / 'build-081fix')
+env['DECORD_LIBRARY_PATH'] = str(ROOT / 'build-dev')
 # grace 修复后默认预算下 FATAL 不可能（在途宽限 10×）——用 1024 把
 # 在途停滞的 FATAL 阈值拉回 ~10.4s，FATAL 即停滞探测器
 env['DECORD_EOF_RETRY_MAX'] = '1024'
@@ -29,7 +29,7 @@ import hashlib
 
 def dll_md5():
     return hashlib.md5(
-        (ROOT / 'build-081fix/decord.dll').read_bytes()).hexdigest()[:12]
+        (ROOT / 'build-dev/decord.dll').read_bytes()).hexdigest()[:12]
 
 
 for shift in range(start, start + 608, 16):
@@ -39,7 +39,7 @@ for shift in range(start, start + 608, 16):
                if l.startswith('bool HybridThreadedDecoder::Pop('))
     lines.insert(idx, MARK + ' ' + 'x' * shift)
     PUMP.write_text('\n'.join(lines), encoding='utf-8', newline='')
-    r = subprocess.run(['cmd', '/c', 'build-081fix\\_build_busy.bat'],
+    r = subprocess.run(['cmd', '/c', 'build-dev\\_build_busy.bat'],
                        cwd=str(ROOT), capture_output=True, text=True,
                        encoding='utf-8', errors='replace', timeout=600)
     if 'Linking' not in r.stdout:

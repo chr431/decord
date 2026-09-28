@@ -10,7 +10,7 @@
 
 用法:
     python tests/smoke_release.py [dll_dir] [video]
-    dll_dir 默认 build-081fix（dev 构建）；video 默认 RACELOG_VIDEO_DIR
+    dll_dir 默认 build-dev（dev 构建）；video 默认 RACELOG_VIDEO_DIR
     环境变量下第一个 mp4，再退 racelog_test/test.mp4。
 退出码 0 = 全绿；视频缺失时 skip（exit 0，CI 无视频环境的诚实降级）。
 """
@@ -21,7 +21,7 @@ import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, 'python'))
-_dll_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_ROOT, 'build-081fix')
+_dll_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_ROOT, 'build-dev')
 os.environ['DECORD_LIBRARY_PATH'] = _dll_dir
 
 import decord  # noqa: E402

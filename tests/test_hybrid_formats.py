@@ -17,7 +17,7 @@
 import os
 import sys
 
-os.environ.setdefault('DECORD_LIBRARY_PATH', 'D:/Repo/decord/build-081fix')
+os.environ.setdefault('DECORD_LIBRARY_PATH', 'D:/Repo/decord/build-dev')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 import numpy as np  # noqa: E402

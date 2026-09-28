@@ -15,7 +15,7 @@ import time
 
 os.environ.setdefault('DECORD_LIBRARY_PATH',
                       os.environ.get('DECORD_LIBRARY_PATH',
-                                     r'D:/Repo/decord/build-081fix'))
+                                     r'D:/Repo/decord/build-dev'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 from decord import VideoReader, cpu, gpu, hybrid  # noqa: E402

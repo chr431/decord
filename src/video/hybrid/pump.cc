@@ -233,11 +233,22 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                 bool all_assigned_fed = true;
                 for (const GopRec &g3 : gops_) {
                     if (g3.side == Side(-1)) continue;
-                    const int64_t ae3 = g3.closed ? g3.pkt_end : cache_seq_;
-                    if (g3.fed_upto < ae3
-                            || (g3.closed && g3.straggler_idx
-                                           < static_cast<int64_t>(
-                                               g3.stragglers.size()))) {
+                    // C-57 根治配套（2026-09-28 发布轮）：已派**未闭合**
+                    // 的 GOP ≠ 已喂完——此前 avail_end 取 cache_seq_ 使
+                    // 缓存截断点被空真判为喂完，窗界 flush 在边界 GOP
+                    // 尾包到达前就合法化（排空接受缺帧 → VideoReader
+                    // EOF 容错替补）。与 NeedsPackets 的未闭合续读门
+                    // 配对：flush 须等边界 GOP 闭合且喂尽。真 EOF 路径
+                    // 不受影响——Push(nullptr) 先 CloseGopLocked 再置
+                    // eof_cache_，flush 评估时全部 GOP 已闭合。
+                    if (!g3.closed) {
+                        all_assigned_fed = false;
+                        break;
+                    }
+                    if (g3.fed_upto < g3.pkt_end
+                            || g3.straggler_idx
+                                   < static_cast<int64_t>(
+                                       g3.stragglers.size())) {
                         all_assigned_fed = false;
                         break;
                     }

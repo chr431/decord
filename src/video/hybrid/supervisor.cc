@@ -641,16 +641,24 @@ void HybridThreadedDecoder::SetDecodeWindow(int64_t max_frames) {
 
 
 bool HybridThreadedDecoder::HasPartialSupplyLocked() const {
-    // 游标 GOP 已派侧且未供完（主区间未到已见末端，或还有迟到包）→
-    // 边界 GOP 仍需 demux 供包（硬窗的解码语义例外）。
+    // 游标 GOP 已派侧且未供完 → 边界 GOP 仍需 demux 供包（硬窗的解码
+    // 语义例外）。"未供完"三态（C-57 根治，2026-09-28 发布轮）：
+    // ① 已派但**未闭合**——主区间终点未知（下一 keyframe 未读），
+    //    fed_upto==cache_seq_ 只是"缓存里的都喂了"而非"喂完了"：此前
+    //    该态被误判已喂完 → demux 停在 GOP 中间 → 尾部包永不到达 →
+    //    臂排空接受缺帧 → VideoReader EOF 容错替补尾帧（实测 test5 晚
+    //    起点窗 POP 止于 5979、尾 20 帧像素错）。已派 GOP 必须供给到
+    //    闭合——与泵游标"开放 GOP 不得越过"的既有不变量同源；代价 =
+    //    窗缘多读 ≤1 GOP 的包，有界。
+    // ② 已闭合未喂完（fed_upto < pkt_end）。
+    // ③ 已闭合且迟到包未尽。
     if (feed_gop_idx_ >= static_cast<int64_t>(gops_.size())) return false;
     const GopRec &g = gops_[feed_gop_idx_];
     if (g.side == Side(-1)) return false;   // 未派侧 = 窗外，不供
-    const int64_t avail_end = g.closed ? g.pkt_end : cache_seq_;
-    return g.fed_upto < avail_end
-        || (g.closed
-            && g.straggler_idx
-                   < static_cast<int64_t>(g.stragglers.size()));
+    if (!g.closed) return true;             // ①已派未闭合：须读到闭合
+    return g.fed_upto < g.pkt_end
+        || g.straggler_idx
+               < static_cast<int64_t>(g.stragglers.size());
 }
 
 

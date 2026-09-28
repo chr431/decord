@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 
-os.environ.setdefault('DECORD_LIBRARY_PATH', 'D:/Repo/decord/build-081fix')
+os.environ.setdefault('DECORD_LIBRARY_PATH', 'D:/Repo/decord/build-dev')
 os.environ['DECORD_EOF_RETRY_MAX'] = '99999999'
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 

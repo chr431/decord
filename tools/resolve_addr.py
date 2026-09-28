@@ -18,8 +18,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DLL = ROOT / 'build-081fix' / 'decord.dll'
-PDB_DIR = str(ROOT / 'build-081fix')
+DLL = ROOT / 'build-dev' / 'decord.dll'
+PDB_DIR = str(ROOT / 'build-dev')
 
 dbghelp = ctypes.WinDLL('dbghelp.dll')
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)

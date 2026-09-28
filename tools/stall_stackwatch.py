@@ -19,7 +19,7 @@ BUDGET = sys.argv[1] if len(sys.argv) > 1 else '10240'
 ROUNDS = int(sys.argv[2]) if len(sys.argv) > 2 else 8
 
 env = dict(os.environ)
-env['DECORD_LIBRARY_PATH'] = str(ROOT / 'build-081fix')
+env['DECORD_LIBRARY_PATH'] = str(ROOT / 'build-dev')
 env['DECORD_EOF_RETRY_MAX'] = BUDGET
 
 for rnd in range(1, ROUNDS + 1):

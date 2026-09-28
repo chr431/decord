@@ -107,7 +107,7 @@ Linux 下 NVDEC 构建若报 `libnvcuvid.so` 找不到，可参考上游
 
 ```bash
 # 三 preset（CMakePresets.json，2026-09-28 收敛 9 个历史 build-* 目录）：
-#   dev           Ninja + Release      -> build-081fix（日常开发）
+#   dev           Ninja + Release      -> build-dev（日常开发）
 #   asan          MSVC /fsanitize      -> build-asan
 #   release-check 发版前干净树核对     -> build-rel-check
 cmake --preset dev            # FFMPEG_DIR 走环境变量（FindFFmpeg 自读）

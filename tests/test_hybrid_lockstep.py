@@ -10,7 +10,7 @@ import os
 import sys
 
 os.environ.setdefault('DECORD_LIBRARY_PATH',
-                      'D:/Repo/decord/build-081fix')
+                      'D:/Repo/decord/build-dev')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 _VIDEO_DIR = 'D:/Videos/racelog_test'
