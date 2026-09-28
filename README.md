@@ -65,11 +65,10 @@ avfilter/swresample/swscale` 共 6 个 DLL，约 163 MB 原始 / 64 MB 压缩）
 
 ### 便携 zip（Windows）
 
-Releases 同时提供 `decord-<版本>-win64-gpu.zip`（布局 = RaceVideoToLog 的
-`_decord_build/`，解压即用）：
+Releases 同时提供 `decord-<版本>-win64-gpu.zip`（便携布局，解压即用）：
 
 ```
-_decord_build/
+<任意目录>/
 ├── decord.dll            # CPU+NVDEC 构建
 ├── avcodec-63.dll 等     # FFmpeg 9.0 运行库
 ├── ffprobe.exe
@@ -303,11 +302,26 @@ batch = vr.get_batch(range(0, 1000))         # 与普通 reader 完全同 API
 | `vr.next_roi(x1,y1,x2,y2)` / `get_batch(..., roi=…)` | ROI 读取（ROI-first 时解码器只输出该矩形） |
 | `vr.get_frame_timestamp(idx)` / `get_avg_fps()` | 时间戳 / 平均帧率 |
 | `vr.get_codec()` / `get_color_range()` | 编码名 / 流 color range |
+| `vr.hybrid_stats()` | hybrid 解码器的调度遥测快照（dict；键集见 `features()['hybrid_stats_keys']`） |
 | `probe(uri)`（模块级） | 不开解码器的容器/流元数据（dict） |
 | `get_ffmpeg_version()` / `decord.__ffmpeg_version__` | 加载中的原生库实际链接的 FFmpeg 版本 |
 
 模块级：`cpu(id)`、`gpu(id)`、`hybrid(id)`、`hybrid_gpu(id)`、`probe`、
 `bridge.set_bridge(...)`、`VideoLoader`、`AudioReader`、`AVReader`。
+
+### 能力自省（0.8.5 起）
+
+```python
+import decord
+decord.CONTRACT_VERSION   # 契约面版本（int）
+decord.features()         # 本构建能力面快照（hybrid ctx / gray 输出 / 硬窗 /
+                          # hybrid_stats() 键集 等）
+```
+
+供下游做能力协商，替代版本号比较与 hasattr 探测。上游原版 decord 没有
+这两个属性——按「无契约面」处理（回退消费方自有探测）。**契约政策**：
+`features()` 新增键 = 向后兼容；删键 / 改名 / 语义变更 =
+`CONTRACT_VERSION` +1。键集与语义见 `python/decord/_contract.py`。
 
 ## 环境变量参考
 
@@ -387,6 +401,10 @@ Run workflow：填版本号（如 `0.8.1`）与 ref（默认 `master`），workf
 tag `vX.Y.Z` → 构建 pip wheel（`decord-<ver>-cp3xx-win_amd64.whl`）→ 打包
 `decord-<ver>-win64-gpu.zip` → 创建 Release 并上传两个产物。构建失败不产生任何
 commit/tag/release。tag push 不触发 PyPI 发布（已移除）。
+
+发布说明必须单列：`CONTRACT_VERSION` 变更（若有）与 `features()` 契约键集
+差异（新增键向后兼容；删键/改名须先 `CONTRACT_VERSION` +1——下游靠契约面
+做能力协商，键集漂移是破坏性变更）。
 
 ## 致谢与许可
 

@@ -76,11 +76,11 @@ This fork does **not** depend on the PyPI `decord` package (that is upstream
 
 ### Portable zip (Windows)
 
-Releases also provide `decord-<version>-win64-gpu.zip` (layout =
-RaceVideoToLog's `_decord_build/`, unzip and run):
+Releases also provide `decord-<version>-win64-gpu.zip` (portable layout,
+unzip and run):
 
 ```
-_decord_build/
+<any directory>/
 ├── decord.dll            # CPU+NVDEC build
 ├── avcodec-63.dll etc.   # FFmpeg 9.0 runtime
 ├── ffprobe.exe
@@ -338,11 +338,29 @@ Notes:
 | `vr.next_roi(x1,y1,x2,y2)` / `get_batch(..., roi=…)` | ROI access (ROI-first decoders output only that rectangle) |
 | `vr.get_frame_timestamp(idx)` / `get_avg_fps()` | timestamps / average fps |
 | `vr.get_codec()` / `get_color_range()` | codec name / stream colour range |
+| `vr.hybrid_stats()` | hybrid decoder scheduling telemetry snapshot (dict; key set in `features()['hybrid_stats_keys']`) |
 | `probe(uri)` (module-level) | container/stream metadata without a decoder (dict) |
 | `get_ffmpeg_version()` / `decord.__ffmpeg_version__` | FFmpeg version actually linked into the loaded native library |
 
 Module-level: `cpu(id)`, `gpu(id)`, `hybrid(id)`, `hybrid_gpu(id)`, `probe`,
 `bridge.set_bridge(...)`, `VideoLoader`, `AudioReader`, `AVReader`.
+
+### Capability introspection (since 0.8.5)
+
+```python
+import decord
+decord.CONTRACT_VERSION   # contract surface version (int)
+decord.features()         # capability snapshot of this build (hybrid ctx /
+                          # gray output / hard window / hybrid_stats() key set
+                          # / ...)
+```
+
+Lets downstream consumers negotiate capabilities instead of comparing version
+strings or probing with hasattr. Upstream decord does not expose these two
+attributes — treat that as "no contract surface" and fall back to your own
+probing. **Contract policy**: adding keys to `features()` is backward
+compatible; removing / renaming keys or changing semantics requires
+`CONTRACT_VERSION` +1. Key set and semantics: `python/decord/_contract.py`.
 
 ## Environment variables
 
@@ -439,6 +457,12 @@ pip wheel (`decord-<ver>-cp3xx-win_amd64.whl`) → packages
 `decord-<ver>-win64-gpu.zip` → creates the Release with both artifacts. A
 failed build produces no commit/tag/release. Tag pushes do not
 trigger PyPI publishing (removed).
+
+Release notes must call out: `CONTRACT_VERSION` changes (if any) and
+`features()` contract key-set differences (added keys are backward compatible;
+removed/renamed keys require `CONTRACT_VERSION` +1 first — downstream
+consumers rely on the contract surface for capability negotiation, so key-set
+drift is a breaking change).
 
 ## Acknowledgements & license
 
