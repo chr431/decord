@@ -818,28 +818,29 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     hol_prev_side_ = -1;
                 }
             }
-            // ── EOF 尾恢复网（2026-09-27 停滞修复）────────────────────
-            // 触发面：eof_pushed_ 已置 + **CPU 侧**队头持续 ≥1s 零产出。
-            // 根因是 marker 顺序竞态：CPU 侧排空 marker 在 eof_pushed_
-            // 置位前到达时走「吞掉」分支被误食，真到 EOF 时无 marker 可
-            // 收口，chunk 会计（expected/pending）与解码器实际产出永久
-            // 失配。时间基准（非计数）：CPU 侧大 GOP 解码突发 >100ms 属
-            // 正常，计数判别会误伤；1s 空产出在 EOF 后只可能是失配。
-            // 限定 CPU 侧：GPU 侧 EOF 走独立 flush 记账（gpu_flush_left_
-            // /ready_ marker），语义不同不套用。命中 → 按既有
-            // force-close 同款语义关队头 chunk（身份复查防并发漂移），
-            // 计数器入 stats。marker 正常到达的路径不受影响（任何产出
-            // 都会走下面的重置）。
+            // ── EOF 尾恢复网（2026-09-27 停滞修复；2026-09-28 对称扩展 v2）──
+            // 触发面：eof_pushed_ 已置 + 队头 chunk 所在侧持续 ≥1s 零产出。
+            // 根因是 marker 顺序竞态：侧排空 marker 在 eof_pushed_ 置位前
+            // 到达时走「吞掉」分支被误食，真到 EOF 时无 marker 可收口，
+            // chunk 会计（expected/pending）与解码器实际产出永久失配。
+            // 时间基准（非计数）：大 GOP 解码突发 >100ms 属正常，计数判别
+            // 会误伤；1s 空产出在 EOF 后只可能是失配。
             //
-            // ⚠️ 2026-09-28 夜间轮：曾尝试对称扩展到 GPU 侧（去掉
-            // s==SIDE_CPU）——av1 整文件装入 512MB 包缓存时 demux 秒完，
-            // eof_pushed_ 在消费中段即置位，而 GPU 臂池互锁的合法停滞
-            // ≥3s（formats 运行捕获），1s 网在流中段误关有帧 chunk →
-            // 帧永久丢失 → stream 套件 3/5 FATAL（对照：仅 CPU 半边
-            // 16/16 绿）。已回退。GPU 侧修复需要真·尾部判别（消费游标
-            // 已到尾 vs 泵排空早于消费），另行立项——见
-            // tools/repro_av1_seq_stall.py 与 docs/log 取证。
-            if (eof_pushed_ && s == SIDE_CPU && !emit_queue_.empty()) {
+            // 真·尾部判别（对称扩展 v2，2026-09-28 发布轮）：首轮裸对称
+            // 扩展（直接去掉 s==SIDE_CPU）已回退——av1 整文件装进 512MB
+            // 包缓存时 demux 秒完，eof_pushed_ 在**消费中段**即置位，而
+            // GPU 臂池互锁的合法停滞 ≥3s（formats 运行捕获）会被 1s 网
+            // 误关有帧 chunk → 帧永久丢失 → stream 套件 3/5 FATAL。v2
+            // 对 GPU 侧增加 side_pending_[s]==0 门：该侧仍有在途工作
+            // （已解码未上载/未消费的帧都计入 pending，合法互锁停滞必然
+            // pending>0）时永不强关，只在「该侧确无任何可再到达的帧」时
+            // 收口。CPU 半边保持首轮语义（16/16 绿证据面，不加门）：软解
+            // 无池互锁类合法长停，1s 空窗本就只为失配设计。
+            // 命中 → 按既有 force-close 同款语义关队头 chunk（身份复查
+            // 防并发漂移），计数器入 stats。marker 正常到达的路径不受
+            // 影响（任何产出都会走下面的重置）。
+            if (eof_pushed_ && !emit_queue_.empty()
+                    && (s == SIDE_CPU || side_pending_[s] == 0)) {
                 const auto now_tp = std::chrono::steady_clock::now();
                 if (!eof_starve_on_) {
                     eof_starve_on_ = true;

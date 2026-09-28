@@ -596,12 +596,12 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     std::atomic<int64_t> late_feeds_{0};  ///< 迟到包直供次数（GOP 已供完后到达）
     std::atomic<int64_t> strag_total_{0};  ///< 迟到包挂 straggler 列表总次数                    ///< 反馈式清偿累计克隆包数
     // ── EOF 尾恢复网（2026-09-27 停滞修复；仅消费者线程读写时基）──────
-    // marker 顺序竞态（CPU 排空 marker 在 eof_pushed_ 置位前被「吞掉」
+    // marker 顺序竞态（侧排空 marker 在 eof_pushed_ 置位前被「吞掉」
     // 分支误食）→ chunk 会计与实际产出永久失配 → 队头侧零产出。1s 空窗
-    // （时间基准，防大 GOP 突发误伤）后按 force-close 语义关队头 chunk。
-    // ⚠️ 仅 CPU 侧：GPU 侧对称版已试并回退（2026-09-28 夜间轮——
-    // eof_pushed_ 在整文件缓存时可早于消费中段置位，GPU 臂合法池互锁
-    // 停滞 ≥3s 会被 1s 网误关 → 丢帧 FATAL，见 .cc 同名注释）。
+    // （时间基准，防大 GOP 突发误伤）+ GPU 侧真·尾部判别门
+    // （side_pending_[s]==0；2026-09-28 对称扩展 v2——首轮裸对称版因
+    // GPU 臂合法池互锁停滞 ≥3s 被误关而回退，CPU 半边保持首轮语义）后
+    // 按 force-close 语义关队头 chunk。
     std::chrono::steady_clock::time_point eof_starve_tp_{};
     bool eof_starve_on_ = false;
     std::atomic<int64_t> force_eof_close_{0};  ///< 恢复网触发次数（stats 透出）
