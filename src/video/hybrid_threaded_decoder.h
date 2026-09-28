@@ -47,6 +47,9 @@
 
 namespace decord {
 
+/*! TR2 取证缓冲一次性 dump（DECORD_HYBRID_TRACE2；定义在 hybrid/pump.cc）*/
+void HybridThreadedTrace2Dump();
+
 /*!
  * \brief pinned 主机帧池（CPU-out 落地专用）：cudaHostAlloc 块经
  *  NDArray::FromRecycled 包装，D2H 直达最终帧 —— 替代"pinned 暂存 +

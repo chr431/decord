@@ -26,11 +26,47 @@
 #include <mutex>
 #include <thread>
 #include <cstdio>
+#include <cstdarg>
 #include <string>
 #include <cstring>
 #include <vector>
 
 namespace decord {
+
+// ── TR2 取证（kick 竞态定位，夜间轮）：内存缓冲 + close 时一次性 dump。
+// 直接 fprintf(stderr) 会扰动时序使竞态消失（Heisenbug，同 av1 停滞
+// 前科）；缓冲追加 ~µs 级、不改变调度。仅 DECORD_HYBRID_TRACE2=1 生效。
+namespace tr2probe {
+std::mutex mtx;
+std::vector<std::string> log;
+std::atomic<long long> t0_us{-1};
+bool on() { static const bool v = getenv("DECORD_HYBRID_TRACE2") != nullptr; return v; }
+long long now_us() {
+    auto d = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long t0 = t0_us.load(std::memory_order_relaxed);
+    if (t0 < 0) { t0_us.compare_exchange_strong(t0, d); t0 = t0_us.load(); }
+    return d - t0;
+}
+void add(const char *fmt, ...) {
+    if (!on()) return;
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf), "[%lld] ", now_us());
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf + n, sizeof(buf) - n - 1, fmt, ap);
+    va_end(ap);
+    std::lock_guard<std::mutex> lk(mtx);
+    if (log.size() < 40000) log.emplace_back(buf);
+}
+void dump() {
+    std::lock_guard<std::mutex> lk(mtx);
+    for (auto &s : log) fprintf(stderr, "%s", s.c_str());
+    fflush(stderr);
+    log.clear();
+}
+}  // namespace tr2probe
+
+void HybridThreadedTrace2Dump() { tr2probe::dump(); }
 
 void HybridThreadedDecoder::PumpFeed(bool force_head) {
     // 供料泵（层0/1 重设计核心）：Push 只入缓存，这里在**分配时点**把
@@ -178,6 +214,9 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         // 逐帧 hash 全绿——"解码器完美但段数漂移"的谜底）。
                         ffmpeg::AVPacketPtr kp = CloneCachePacket(g.pkt_begin);
                         if (kp && pending_kicks_.size() < 8) {
+                            tr2probe::add("[tr2] KICK-create dst=%d pts=%lld gop=%lld\n",
+                                            (int)last_fed_side_,
+                                            (long long)kp->pts, (long long)(k - 1));
                             pending_kicks_.push_back(PendingKick{
                                 std::move(kp), last_fed_side_, k - 1});
                         }
@@ -278,6 +317,11 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         for (auto it = pending_kicks_.begin();
                              it != pending_kicks_.end();) {
                             if (it->after_gop >= last_assigned_gop) {
+                                tr2probe::add("[tr2] KICK-windrop dst=%d after=%lld pts=%lld last_assigned=%lld\n",
+                                                (int)it->dst,
+                                                (long long)it->after_gop,
+                                                (long long)it->pkt->pts,
+                                                (long long)last_assigned_gop);
                                 it = pending_kicks_.erase(it);
                             } else {
                                 ++it;
@@ -312,6 +356,13 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                 if (!koff) {
                     for (auto it = pending_kicks_.begin();
                          it != pending_kicks_.end(); ) {
+                        tr2probe::add("[tr2] KICK-eval dst=%d after=%lld pts=%lld | s=%d g=%lld%s\n",
+                                        (int)it->dst,
+                                        (long long)it->after_gop,
+                                        (long long)it->pkt->pts,
+                                        (int)s, (long long)g.id,
+                                        (it->dst == s && g.id > it->after_gop)
+                                            ? " MATCH" : "");
                         if (it->dst == s && g.id > it->after_gop) {
                             ++side_pending_[s];
                             kicks_[s].fetch_add(1, std::memory_order_relaxed);
@@ -349,6 +400,8 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             return e != nullptr && atoi(e) > 0;
         }();
         for (auto &ks : kicks_to_send) {
+            tr2probe::add("[tr2] KICK-inject dst=%d pts=%lld\n",
+                          (int)ks.first, (long long)ks.second->pts);
             if (ks.first == SIDE_CPU) {
                 cpu_.Push(std::move(ks.second), runtime::NDArray());
             } else {
@@ -408,6 +461,9 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             // EOF 兜底：未注入的 kick 全发（IDR 重置冲刷离场侧尾帧）
             for (auto it = pending_kicks_.begin();
                  it != pending_kicks_.end(); ) {
+                tr2probe::add("[tr2] KICK-backstop dst=%d pts=%lld after_gop=%lld\n",
+                                (int)it->dst, (long long)it->pkt->pts,
+                                (long long)it->after_gop);
                 ++side_pending_[it->dst];
                 kicks_[it->dst].fetch_add(1, std::memory_order_relaxed);
                 eof_kicks.emplace_back(it->dst, std::move(it->pkt));
@@ -574,6 +630,8 @@ bool HybridThreadedDecoder::IsMarker(const runtime::NDArray &f) {
 bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
     // 取帧优先级：stash（越界暂存）→ 子解码器 / ready_ 队列
     if (has_stash_[s]) {
+        tr2probe::add("[tr2] STASH-consume s=%d f=%lld\n",
+                      (int)s, (long long)stash_[s].pts);
         *f = stash_[s];
         has_stash_[s] = false;
         return true;
@@ -932,6 +990,10 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 // 全局 EOF：清空合并队列，marker 原样转发给调用方
                 //（NextFrameImpl 的 kInt64 分支依赖它走 EOF 逻辑；后续
                 // marker 继续透传）
+                tr2probe::add("[tr2] MARKER-forward ch=%lld s%d em=%lld/%lld eq=%zu\n",
+                                 (long long)ch.id, (int)ch.side,
+                                 (long long)ch.emitted, (long long)ch.expected,
+                                 emit_queue_.size());
                 std::lock_guard<std::mutex> lk(mtx_);
                 emit_queue_.pop_front();
                 emit_queue_.clear();
@@ -941,11 +1003,19 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             }
             // GPU drain marker（或 CPU 侧未推流的 marker）：吞掉，
             // chunk 完成，继续下一 chunk
+            tr2probe::add("[tr2] MARKER-swallow ch=%lld s%d em=%lld/%lld\n",
+                             (long long)ch.id, (int)ch.side,
+                             (long long)ch.emitted, (long long)ch.expected);
             std::lock_guard<std::mutex> lk(mtx_);
             emit_queue_.pop_front();
             continue;
         }
         if (f.pts < ch.start_pts) {
+            tr2probe::add("[tr2] STALE ch=%lld s%d [%lld,%lld) f=%lld em=%lld/%lld\n",
+                             (long long)ch.id, (int)ch.side,
+                             (long long)ch.start_pts, (long long)ch.end_pts,
+                             (long long)f.pts, (long long)ch.emitted,
+                             (long long)ch.expected);
             // 陈旧帧（kick 边界帧在 expected 补齐后残留等）：丢弃
             // 取证硬化（2026-09-28 夜间轮）：陈旧排放活锁假设——每次
             // Pop 内部丢一帧（PopSide 成功复位停滞计时器）后取空返回
@@ -976,6 +1046,11 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             // 不关 chunk —— 本 chunk 的重排尾部帧（pts < end）可能仍在途。
             // 迟到帧继续从该侧产出、正常发射计数；expected 补满时在
             // 发射路径关闭 chunk。
+            tr2probe::add("[tr2] STASH ch=%lld s%d [%lld,%lld) f=%lld em=%lld/%lld\n",
+                             (long long)ch.id, (int)ch.side,
+                             (long long)ch.start_pts, (long long)ch.end_pts,
+                             (long long)f.pts, (long long)ch.emitted,
+                             (long long)ch.expected);
             std::lock_guard<std::mutex> lk(mtx_);
             CHECK(!has_stash_[s]) << "stash overflow: side " << s;
             stash_[s] = f;
@@ -988,6 +1063,13 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             if (!emit_queue_.empty()) {
                 Chunk &front = emit_queue_.front();
                 ++front.emitted;
+                tr2probe::add("[tr2] EMIT ch=%lld s%d [%lld,%lld) f=%lld em=%lld/%lld%s\n",
+                                 (long long)ch.id, (int)ch.side,
+                                 (long long)ch.start_pts, (long long)ch.end_pts,
+                                 (long long)f.pts, (long long)front.emitted,
+                                 (long long)front.expected,
+                                 (front.expected > 0 && front.emitted >= front.expected
+                                  && front.end_pts != INT64_MAX) ? " CLOSE" : "");
                 if (front.expected > 0 && front.emitted >= front.expected
                         && front.end_pts != INT64_MAX) {
                     // 补满 expected 且非末 chunk：关闭。stash 里的越界帧
