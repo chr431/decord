@@ -6,6 +6,7 @@
 
 #include "nv_gpu_dyn.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
