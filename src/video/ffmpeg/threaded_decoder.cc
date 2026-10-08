@@ -546,7 +546,7 @@ void FFMPEGThreadedDecoder::FilterWorkerThreadImpl() {
             // EOF drain finished on the decode side: emit the drain
             // markers the consumer recognises (kInt64 size-1 arrays)
             for (int cnt = 0; cnt < ThreadedDecoderInterface::kDrainMarkerCount; ++cnt) {
-                frame_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
+                frame_queue_->Push(MakeDrainMarker(kDrainMarkerEOF));
                 ++frame_count_;
             }
             if (on_output_) on_output_();
@@ -590,7 +590,7 @@ void FFMPEGThreadedDecoder::ConvertWorkerLoop() {
         }
         case RawKind::DrainEnd: {
             for (int cnt = 0; cnt < ThreadedDecoderInterface::kDrainMarkerCount; ++cnt)
-                outs.push_back(NDArray::Empty({1}, kInt64, kCPU));
+                outs.push_back(MakeDrainMarker(kDrainMarkerEOF));
             call_on_output = true;
             clear_draining = true;
             break;

@@ -631,15 +631,10 @@ bool VideoReader::Seek(int64_t pos, bool force_backward) {
     decoder_->Start();
     if (ret >= 0) {
         curr_frame_ = pos;
-        // C-57 根治记账：本次落锚于 ≤pos 的关键帧，[anchor, pos) 前缀
-        // 解码但不交付（见 SetDecodeWindow 注释）——落锚即按新锚点
-        // 重推窗预算。SeekAccurate 内层调用本函数时 pos=key_pos
-        // （前缀 0），随后由其按精确目标二次重推。
-        seek_prefix_ = pos - LocateKeyframe(pos);
-        if (seek_prefix_ < 0) seek_prefix_ = 0;
-        if (decode_window_ > 0 && decoder_) {
-            decoder_->SetDecodeWindow(decode_window_ + seek_prefix_);
-        }
+        // 窗区间重推（区间版重做，2026-10-08）：落锚目标即区间起点，
+        // [pos, pos+n) 整体下发——锚点前缀 [anchor, pos) 由解码器的
+        // GOP 判交门天然覆盖（门只看 GOP 起点 < hi），无预算算术。
+        RefreshWindowRange(pos);
     }
     return ret >= 0;
 }
@@ -675,13 +670,10 @@ bool VideoReader::SeekAccurate(int64_t pos) {
         if (s_dbg) fprintf(stderr, "[seek-dbg] Seek(%lld) -> %d curr=%lld\n",
                            (long long)key_pos, (int)ret, (long long)curr_frame_);
         if (!ret) return false;
-        // C-57 根治配套：精确目标的前缀 [key_pos, pos) 须补进窗预算
-        // （内层 Seek 已按 key_pos 记账前缀 0，此处按真实目标重推；
-        // SkipFramesImpl 尚未驱动解码，预算先于首包生效）。
-        seek_prefix_ = pos - key_pos;
-        if (decode_window_ > 0 && decoder_) {
-            decoder_->SetDecodeWindow(decode_window_ + seek_prefix_);
-        }
+        // 精确目标落位（区间版重做）：区间起点 = 精确目标 pos（内层
+        // Seek 已按 key_pos 建过一次区间，此处按真实目标重推；
+        // SkipFramesImpl 尚未驱动解码，区间先于首包生效）。
+        RefreshWindowRange(pos);
         // double check if keyframe was jumpped correctly
         if(CheckKeyFrame()){
             if (s_dbg) fprintf(stderr, "[seek-dbg] CheckKeyFrame OK, SkipFramesImpl(%lld)\n",
@@ -706,6 +698,10 @@ bool VideoReader::SeekAccurate(int64_t pos) {
     } else {
         // no need to seek to keyframe, since both current and seek position belong to same keyframe
         if (s_dbg) fprintf(stderr, "[seek-dbg] same-GOP Skip(%lld)\n", (long long)(pos - curr_frame_));
+        // 同 GOP 前进（区间版重做补点）：[curr, pos) 解码丢弃同属锚点
+        // GOP，区间按新目标重推（旧计数法在此不重推是前缀算术的已知
+        // 残余缺口，区间法顺带关掉）。先于 SkipFramesImpl 生效。
+        RefreshWindowRange(pos);
         SkipFramesImpl(pos - curr_frame_);
     }
 
@@ -891,12 +887,28 @@ NDArray VideoReader::NextFrameImpl() {
         }
         if (frame.Size() <= 1) {
             if (frame.defined() && frame.data_->dl_tensor.dtype == kInt64) {
-              // draining finished
+              // 排空 marker（重做，2026-10-08）：载荷分流——0=真 EOF
+              // （旧语义），1=硬窗缘（解码器已交清区间内全部帧）。
+              // 窗激活时 FetchCachedFrame 恒 false（禁替补），两种载荷
+              // 都走 rewind 自愈 → 耗尽后 FATAL；非窗读保留上游替补。
+              const int64_t mval = DrainMarkerValue(frame);
               if (FetchCachedFrame(frame, curr_frame_)) {
                 break;
               } else {
                 if (rewind_offset > REWIND_RETRY_MAX) {
-                  LOG(FATAL) << "[" << filename_ << "]Unable to handle EOF because the video might have corrupted frames" 
+                  decoder_->DumpState(mval == kDrainMarkerWindowEnd
+                                          ? "window-end-fatal"
+                                          : "eof-retry-fatal");
+                  LOG(FATAL) << "[" << filename_ << "]Unable to handle "
+                  << (mval == kDrainMarkerWindowEnd
+                          ? "decode-window end"
+                          : "EOF")
+                  << " at frame " << curr_frame_
+                  << (decode_window_ > 0
+                          ? " (window active: substitution disabled, "
+                            "pixel-exact contract)"
+                          : "")
+                  << " because the video might have corrupted frames"
                   << "and `DECORD_REWIND_RETRY_MAX=" << REWIND_RETRY_MAX << "`. You may override the limit by `export DECORD_REWIND_RETRY_MAX=32`"
                   << " for example to allow more auto-substituded frames, exit...";
                 }
@@ -993,21 +1005,22 @@ NDArray VideoReader::NextFrame() {
 }
 
 void VideoReader::SetDecodeWindow(int64_t max_frames) {
-    // reader 侧留档声明窗长（FetchCachedFrame 的替补观察哨需要知道窗
-    // 是否激活）。C-57 根治（2026-09-28 发布轮）：fork 硬窗按**已派帧
-    // 量**计数，而 keyframe-seek 的锚点前缀（[anchor, target)）会被
-    // 解码但在合并队列按陈旧丢弃（不交付）——前缀吃预算会使请求尾部
-    // 落进未派 GOP，被 EOF 容错静默替补（实测 test5 GOP=299 晚起点窗：
-    // assigned=4×299=1196，请求尾 [5980,6000) 落第 5 个未派 GOP，20 帧
-    // 像素错）。转发值 = 声明值 + 最近落锚前缀，语义 =
-    // 「seek(T) 后从 T 起声明值帧可用」；每次从声明值重推，无累积。
-    // 纯解码器 SetDecodeWindow 为接口默认空实现，不受影响。
+    // reader 侧只留档声明窗长 n（哨兵 + 区间计算用）。窗口的实际语义
+    // 由 RefreshWindowRange 以绝对帧区间 [target, target+n) 下发
+    // （区间版重做 2026-10-08，取代旧「计数窗 + seek_prefix_ 前缀补偿」
+    // 的两方算术——那曾是 C-57 一族缺陷的结构根源）。设窗时以当前
+    // 位置建立临时区间，seek 落锚会按真实目标重推。纯解码器
+    // SetDecodeWindowRange 为接口默认空实现，不受影响。
     decode_window_ = max_frames > 0 ? max_frames : -1;
-    if (decoder_) {
-        decoder_->SetDecodeWindow(
-            decode_window_ > 0 ? decode_window_ + seek_prefix_
-                               : max_frames);
-    }
+    RefreshWindowRange(curr_frame_);
+}
+
+void VideoReader::RefreshWindowRange(int64_t target) {
+    // 区间版窗口的唯一下发点：[target, target+n)。设窗、Seek 落锚、
+    // SeekAccurate 精确目标、同 GOP 前进四处调用；每次整区间重推、
+    // 无累积；n ≤ 0 / target < 0 时不设窗（全片语义）。
+    if (decode_window_ <= 0 || target < 0 || !decoder_) return;
+    decoder_->SetDecodeWindowRange(target, target + decode_window_);
 }
 
 std::string VideoReader::DecodeStats() const {
@@ -1898,6 +1911,13 @@ void VideoReader::CacheFrame(NDArray frame) {
 
 bool VideoReader::FetchCachedFrame(NDArray &frame, int64_t pos) {
   if (!use_cached_frame_) return false;
+  // 窗模式禁替补（窗口架构重做，2026-10-08）：缓存顶替 = 静默交出
+  // 错误帧（帧数守恒、像素错）——C-57 一族缺陷的全部损害都经此放大
+  // （含 2026-10-08 复发的健康格单帧替换 flake）。窗激活时返回 false，
+  // 让调用方走 rewind/arm-heal 重试，重试耗尽后 DumpState + FATAL
+  // 响亮失败——静默损坏在架构上不再可达（win_subs 哨兵因此结构性
+  // 恒 0，键保留供消费方断言）。非窗读保留上游容错语义不变。
+  if (decode_window_ > 0) return false;
   if (cached_frame_.Size() <= 1) return false;
   if (!frame.defined() || frame.Size() != cached_frame_.Size()) {
       // 以缓存帧自身形状分配：ROI-first 下缓存帧是 ROI 尺寸（混合解码
@@ -1910,26 +1930,6 @@ bool VideoReader::FetchCachedFrame(NDArray &frame, int64_t pos) {
   }
   frame.CopyFrom(cached_frame_);
   failed_idx_.insert(pos);
-  if (decode_window_ > 0) {
-      // C-57 观察哨（2026-09-28 发布轮）：硬窗激活期间的缓存替补。在
-      // hybrid + 晚起点（seek 目标 ≥ 窗长）组合下这是已知的 fork 级尾帧
-      // 缺陷形态（窗界停喂的排空 marker 被当 EOF，迟包永不到达；帧数
-      // 守恒、尾 GOP 级 ~20 帧像素错）——上游的百分比告警阈值对该量级
-      // 静默（20/7761 = 0.26% << 10%）。计数进 hybrid_stats（win_subs），
-      // 首现即告警（latch，每 reader 一条）。根治前该组合的防线仍应由
-      // 消费方谓词承担；本哨只保证缺陷不再无声。
-      ++win_subs_;
-      if (!win_sub_warned_) {
-          win_sub_warned_ = true;
-          LOG(WARNING) << "[" << filename_ << "]frame substituted from cache "
-            << "while decode window is active (pos=" << pos
-            << ", window=" << decode_window_
-            << "; stats key win_subs). Under hybrid + late start (seek "
-            << "target beyond window) this is a known tail-corruption defect "
-            << "- rerun without the window, or from start < window, if "
-            << "pixel-exact output matters.";
-      }
-  }
   int64_t failed_count = failed_idx_.size();
   if (fault_tol_thresh_ >= 0) {
       if (failed_count > fault_tol_thresh_) {

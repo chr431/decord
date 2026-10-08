@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
-"""kick 竞态布局轮盘（夜间轮 2026-09-28）：hevc 晚起点窗位级探针版。
+"""kick 竞态布局轮盘（夜间轮 2026-09-28；2026-10-08 参数化）：窗口位级
+探针版。
 
 时序竞态对二进制布局敏感（layout_roulette.py 同款方法论）：迭代注入
 冷注释移位 .text 布局，纯 ninja 重建（不经 rebuild_dev.bat 的部署步），
-每布局跑 N 次 hevc seek_acc(5000)+win(3000) hybrid vs nvdec 位级对照，
-命中即停（保留布局 + md5 + TR2 全量 trace 供取证）。
+每布局跑 N 次指定格 hybrid vs nvdec 位级对照，命中即停（保留布局 +
+md5 + TR2 全量 trace 供取证）。
 
 用法：python tools/_kick_roulette.py [起始移位] [每布局探针数] [探针轮]
+                                  [video=...|start=...|win=...|roi=...]
+  默认格 = hevc 晚起点 seek_acc(5000)+win(3000)（僵尸 kick 历史形态）；
+  KEY=VAL 覆盖：video=<mp4 路径> start=<int> win=<int> roi=<(x1,y1,x2,y2)>
+  例：... _kick_roulette.py 16 3 1 video=test6.mp4 start=0 win=3000
 """
 import hashlib
 import os
@@ -22,15 +27,21 @@ MARK = '// LAYOUT-SHIFT:'
 start = int(sys.argv[1]) if len(sys.argv) > 1 else 16
 nprobe = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 rounds = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+CELL = {'video': r'D:\Videos\racelog_test\test6_hevc.mp4',
+        'roi': '(841, 994, 949, 1026)', 'start': 5000, 'win': 3000}
+for a in sys.argv[4:]:
+    k, _, v = a.partition('=')
+    if k in CELL:
+        CELL[k] = int(v) if v.lstrip('-').isdigit() else v
 
 PROBE = r'''
 import sys, os
 sys.stdout.reconfigure(encoding="utf-8")
 import numpy as np
 from decord import VideoReader, gpu, hybrid
-path = r"D:\Videos\racelog_test\test6_hevc.mp4"
-roi = (841, 994, 949, 1026)
-START, N = 5000, 3000
+path = r"{video}"
+roi = {roi}
+START, N = {start}, {win}
 def frames(ctx, use_win):
     vr = VideoReader(path, ctx=ctx, output_format="gray", roi=roi, num_threads=32)
     if use_win: vr.set_decode_window(N)
@@ -46,7 +57,7 @@ base = frames(gpu(0), False)
 a = frames(hybrid(0), True)
 bad = [i for i in range(N) if (a[i] != base[i]).any()]
 print("BAD", len(bad), (bad[0], bad[-1]) if bad else "")
-'''
+'''.format(**CELL)
 
 
 def dll_md5():

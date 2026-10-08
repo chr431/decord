@@ -460,7 +460,15 @@ class VideoReader(object):
         hybrid pump stops demuxing and GOP assignment at the window
         edge -- not one packet beyond it is read (the boundary GOP is
         still supplied whole, which decoding inside the window
-        requires). Must be called before the first ``get_batch``."""
+        requires). Must be called before the first ``get_batch``.
+
+        Semantics (range-based redo, 2026-10-08): after seek(T), n
+        frames from T are available -- the window is the absolute frame
+        range [T, T+n), re-derived at every seek landing. WARNING:
+        reading past the declared window is no longer silently papered
+        over with cached frames -- substitution is disabled while a
+        window is active; missing frames go through rewind retries and
+        then fail loudly (pixel-exact contract)."""
         _CAPI_VideoReaderSetDecodeWindow(self._handle, int(n))
 
     def get_color_range(self):

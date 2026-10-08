@@ -323,6 +323,13 @@ decord.features()         # 本构建能力面快照（hybrid ctx / gray 输出 
 `features()` 新增键 = 向后兼容；删键 / 改名 / 语义变更 =
 `CONTRACT_VERSION` +1。键集与语义见 `python/decord/_contract.py`。
 
+**硬窗语义（0.9.0 窗口架构重做）**：`set_decode_window(n)` = 绝对帧区间
+`[seek(T), T+n)`，每次 seek 落锚整体重推（「seek(T) 后从 T 起声明值帧
+可用」）；demux 与 GOP 派工按 GOP 判交在窗缘硬停（边界 GOP 整体供给，
+越窗 ≤1 GOP）。窗缘 drain marker 与真 EOF 语义分家（载荷 0/1）；窗模式
+禁用缓存替补——缺帧 rewind 重试后响亮 FATAL（像素精确契约），静默换帧
+在架构上不可达（`win_subs` 结构性恒 0）。
+
 ## 环境变量参考
 
 常用（全部可选，不设即用自适应默认值）：
@@ -378,7 +385,7 @@ decord.features()         # 本构建能力面快照（hybrid ctx / gray 输出 
 - 关键帧索引磁盘缓存（按 路径哈希 + 大小 + mtime 失效，写系统缓存目录）。
 - `probe()` / `get_ffmpeg_version()` C API 与 Python 绑定。
 - ROI-first 解码管线（CPU/GPU 统一只输出固定矩形）。
-- 测试：`tests/run_fast.sh` 六套件（gpu / formats / md5 / stream / stride / lockstep；默认串行——NVDEC 会话争用下并行是隐藏 flake 源，`--parallel` 选入三车道）。
+- 测试：`tests/run_fast.sh` 七套件（gpu / formats / md5 / stream / stride / lockstep / window；默认串行——NVDEC 会话争用下并行是隐藏 flake 源，`--parallel` 选入三车道）。window 套件 = 硬窗三读法位级 + win_subs==0（2026-10-08 窗口架构重做）。
 
 完整历史见 commit log；`dev` 与 `master` 均受 CI 监听。
 

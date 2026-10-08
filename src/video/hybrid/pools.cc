@@ -102,7 +102,7 @@ bool HybridThreadedDecoder::LandStep() {
     if (!gpu_) return false;
     {
         std::lock_guard<std::mutex> lk(rmtx_);
-        if (ready_.size() >= ReadyCap()) return false;  // 预算内背压
+        if (sess_.ready_.size() >= ReadyCap()) return false;  // 预算内背压
     }
     // 预取 pinned 池帧（CPU-out 直达 D2H 用）：必须在 gpu_->Pop 之前 ——
     // pop 之后无法把帧塞回解码器。池尽**不背压而是降级**：走下方暂存
@@ -122,17 +122,17 @@ bool HybridThreadedDecoder::LandStep() {
     // GPU 驻留模式逐帧回调亦天然解除旧"统计挂 ToHost 后 rg 恒 0"坑。
     if (IsMarker(f)) {
         // drain marker（kCPU kInt64）：在途 D2H 帧必须先于 marker 入队
-        // （发射顺序 = ready_ 顺序）。ready_ 满时容忍越界（软限，仅
+        // （发射顺序 = sess_.ready_ 顺序）。sess_.ready_ 满时容忍越界（软限，仅
         // EOF 尾部发生一次）。
         FlushD2H();
         std::lock_guard<std::mutex> lk(rmtx_);
-        ready_.push_back(std::move(f));
+        sess_.ready_.push_back(std::move(f));
         return true;
     }
     if (out_cuda_) {
         // GPU 驻留模式：帧留在显存直通入队（零拷贝），随消费归还池
         std::lock_guard<std::mutex> lk(rmtx_);
-        ready_.push_back(std::move(f));
+        sess_.ready_.push_back(std::move(f));
         return true;
     }
     // 异步 D2H：提交到 pinned 中转环，滞后 kD2HRingSlots 帧收割
@@ -163,7 +163,7 @@ bool HybridThreadedDecoder::LandStep() {
         }
         const char *src = static_cast<const char *>
             (const_cast<DLTensor *>(f.operator->())->data);
-        // pinned 池路径：D2H 直达最终帧（收割零拷贝入 ready_，消除
+        // pinned 池路径：D2H 直达最终帧（收割零拷贝入 sess_.ready_，消除
         // 暂存 memcpy + 每帧 Empty 分配）。pooled 帧在 LandStep 入口
         // （gpu_->Pop 之前）预取 —— pop 之后无法把帧塞回解码器，池尽
         // 若在此时才失败 = 已弹出的帧被丢弃 = 永久缺帧死等（lockstep
@@ -189,7 +189,7 @@ bool HybridThreadedDecoder::LandStep() {
             cudaMemcpy(dst, src, static_cast<size_t>(frame_bytes_),
                        cudaMemcpyDeviceToHost);
             std::lock_guard<std::mutex> lk(rmtx_);
-            ready_.push_back(std::move(pooled));
+            sess_.ready_.push_back(std::move(pooled));
             return true;
         }
         if (d2h_staging_[k] != nullptr && d2h_ev_[k] != nullptr
@@ -204,7 +204,7 @@ bool HybridThreadedDecoder::LandStep() {
             // pinned/event 分配失败：退回同步 D2H（必然完成）
             runtime::NDArray h = ToHost(f);
             std::lock_guard<std::mutex> lk(rmtx_);
-            ready_.push_back(std::move(h));
+            sess_.ready_.push_back(std::move(h));
             return true;
         }
         const DLTensor &ft = *f.operator->();
@@ -222,19 +222,19 @@ bool HybridThreadedDecoder::LandStep() {
 bool HybridThreadedDecoder::HarvestD2H(int k) {
     {
         std::lock_guard<std::mutex> lk(rmtx_);
-        if (ready_.size() >= ReadyCap()) return false;  // 预算内背压
+        if (sess_.ready_.size() >= ReadyCap()) return false;  // 预算内背压
     }
     cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(d2h_ev_[k]));
     if (d2h_pooled_[k]) {
-        // pinned 池帧：D2H 已直达，零拷贝入 ready_
+        // pinned 池帧：D2H 已直达，零拷贝入 sess_.ready_
         std::lock_guard<std::mutex> lk(rmtx_);
-        ready_.push_back(std::move(d2h_host_[k]));
+        sess_.ready_.push_back(std::move(d2h_host_[k]));
     } else {
         std::memcpy(d2h_host_[k].operator->()->data, d2h_staging_[k],
                     static_cast<size_t>(frame_bytes_));
         {
             std::lock_guard<std::mutex> lk(rmtx_);
-            ready_.push_back(std::move(d2h_host_[k]));
+            sess_.ready_.push_back(std::move(d2h_host_[k]));
         }
     }
     d2h_pooled_[k] = false;
@@ -252,7 +252,7 @@ void HybridThreadedDecoder::FlushD2H() {
         if (i < 0) continue;
         const int k = static_cast<int>(i & (kD2HRingSlots - 1));
         if (!d2h_valid_[k]) continue;
-        // marker 前的保序冲刷：ready_ 越界容忍（软限）；Stop 时放弃等待
+        // marker 前的保序冲刷：sess_.ready_ 越界容忍（软限）；Stop 时放弃等待
         while (lander_run_.load() && !HarvestD2H(k)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -295,24 +295,24 @@ bool HybridThreadedDecoder::FeedStep() {
     int flush_left = 0;
     {
         std::lock_guard<std::mutex> lk(lcv_mtx_);
-        if (!gpu_pkt_q_.empty()) {
-            pkt = std::move(gpu_pkt_q_.front());
-            gpu_pkt_q_.pop_front();
+        if (!sess_.gpu_pkt_q_.empty()) {
+            pkt = std::move(sess_.gpu_pkt_q_.front());
+            sess_.gpu_pkt_q_.pop_front();
             has_pkt = true;
-        } else if (gpu_flush_left_ > 0) {
-            flush_left = gpu_flush_left_;
+        } else if (sess_.gpu_flush_left_ > 0) {
+            flush_left = sess_.gpu_flush_left_;
         } else {
             return false;
         }
     }
     {
         std::lock_guard<std::mutex> lk(rmtx_);
-        // ready_ 接近上限即暂停喂包，越界的包留在宿主队列（RAM）。
-        // GPU 驻留模式：ready_ 帧本身持有池缓冲，物理上限 = 池深
+        // sess_.ready_ 接近上限即暂停喂包，越界的包留在宿主队列（RAM）。
+        // GPU 驻留模式：sess_.ready_ 帧本身持有池缓冲，物理上限 = 池深
         // （预留 NVDEC 在途 surface）；旧公式把整个池重复计入
         // （ready+pool ≥ ReadyCap → ready 到 ReadyCap-pool 即停喂），
         // CPU 块发射期 NVDEC 有效产出被压到 ~1200fps（hevc/h264 混跑
-        // 的主要损耗源）。CPU-out：ready_ 是宿主帧，池缓冲仅在途
+        // 的主要损耗源）。CPU-out：sess_.ready_ 是宿主帧，池缓冲仅在途
         // （D2H 环 + surface ≈ kGpuPoolBuffers），上限仍是 ReadyCap。
         {
             const std::size_t cap = out_cuda_
@@ -322,9 +322,9 @@ bool HybridThreadedDecoder::FeedStep() {
                 ? static_cast<std::size_t>(
                       ThreadedDecoderInterface::kMaxOutputSurfaces + 8)
                 : kGpuPoolBuffers;
-            if (ready_.size() + reserve >= cap) {
+            if (sess_.ready_.size() + reserve >= cap) {
                 std::lock_guard<std::mutex> lk2(lcv_mtx_);
-                if (has_pkt) gpu_pkt_q_.push_front(std::move(pkt));
+                if (has_pkt) sess_.gpu_pkt_q_.push_front(std::move(pkt));
                 return false;
             }
         }
@@ -341,14 +341,14 @@ bool HybridThreadedDecoder::FeedStep() {
             ++fed;
         }
         std::lock_guard<std::mutex> lk(lcv_mtx_);
-        gpu_flush_left_ = flush_left - fed;
+        sess_.gpu_flush_left_ = flush_left - fed;
         return fed > 0;
     }
     runtime::NDArray buf;
     if (!gpu_pool_.Acquire(&buf)) {
         // 池耗尽：包放回队首，等 LandStep 回收后重试（不阻塞工作线程）
         std::lock_guard<std::mutex> lk(lcv_mtx_);
-        gpu_pkt_q_.push_front(std::move(pkt));
+        sess_.gpu_pkt_q_.push_front(std::move(pkt));
         return false;
     }
     gpu_->Push(std::move(pkt), buf);
@@ -365,7 +365,7 @@ bool HybridThreadedDecoder::UploadStep() {
     // 帧），CPU 块发射退化为上载实时跟随。批次化：≤kUploadBatch 帧逐
     // 帧 memcpy 到各自 pinned 槽 + async 提交（驱动流水化：H2D(i) 与
     // 宿主 memcpy(i+1) 重叠），批末一次 sync 统一收割。
-    // 语义与逐帧同步完全一致：帧只在 H2D 完成后进 cpu_ready_、顺序 =
+    // 语义与逐帧同步完全一致：帧只在 H2D 完成后进 sess_.cpu_ready_、顺序 =
     // 提交顺序；marker/池尽/CPU 断流等所有提前退出路径先冲刷批再处理
     //（此前事件环方案的 marker/EOF 语义腐坏在这里不存在 —— 冲刷在
     // UploadStep 栈内同步完成，无跨调用在途状态）。
@@ -409,7 +409,7 @@ bool HybridThreadedDecoder::UploadStep() {
         {
             std::lock_guard<std::mutex> lk(rmtx_);
             for (int i = 0; i < nf; ++i) {
-                cpu_ready_.push_back(std::move(bufs[i]));  // pts 提交时已设
+                sess_.cpu_ready_.push_back(std::move(bufs[i]));  // pts 提交时已设
             }
         }
         if (dbg) fprintf(stderr, "[hybrid-u] flush %d", nf);
@@ -450,7 +450,7 @@ bool HybridThreadedDecoder::UploadStep() {
             // marker 保序：批内帧全部 H2D 完成后才入队 marker
             flush();
             std::lock_guard<std::mutex> lk(rmtx_);
-            cpu_ready_.push_back(std::move(f));
+            sess_.cpu_ready_.push_back(std::move(f));
             return true;
         }
         const int k = nf;
@@ -507,10 +507,10 @@ void HybridThreadedDecoder::GpuWorkerLoop() {
             lcv_.notify_all();   // 唤醒消费者：Pop 处转 DECORDError
             break;               // 退出线程（不再 rethrow=不再 terminate）
         }
-        if (dbg && did) fprintf(stderr, "[hybrid-w] did=%d ready=%zu cpuready=%zu pktq=%zu\n", (int)did, ready_.size(), cpu_ready_.size(), gpu_pkt_q_.size());
+        if (dbg && did) fprintf(stderr, "[hybrid-w] did=%d ready=%zu cpuready=%zu pktq=%zu\n", (int)did, sess_.ready_.size(), sess_.cpu_ready_.size(), sess_.gpu_pkt_q_.size());
         if (!did) {
             if (dbg) fprintf(stderr, "[hybrid-w] idle rdy=%zu crdy=%zu q=%zu",
-                             ready_.size(), cpu_ready_.size(), gpu_pkt_q_.size());
+                             sess_.ready_.size(), sess_.cpu_ready_.size(), sess_.gpu_pkt_q_.size());
             std::unique_lock<std::mutex> lk(lcv_mtx_);
             lcv_.wait_for(lk, std::chrono::milliseconds(1));
         }
