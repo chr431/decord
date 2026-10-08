@@ -32,6 +32,8 @@
   hybrid_stats_keys    hybrid_stats() 键集（遥测穿透面）
   skip_loop_filter_env DECORD_SKIP_LOOP_FILTER 透传
   hard_decode_window   set_decode_window 硬窗（缺陷边界见下方键注）
+  window_seek_safe     硬窗 × seek(start>0) 位级安全（僵尸 kick 根治，
+                       ResetRouting 清 pending_kicks_；含前缀预算修复）
 """
 from __future__ import annotations
 
@@ -66,12 +68,15 @@ FEATURES = {
     'device_ptr_layout': 'contiguous_uint8_no_pitch',
     'hybrid_stats_keys': _HYBRID_STATS_KEYS,
     'skip_loop_filter_env': True,
-    # 已知缺陷边界：硬窗可用，但「晚起点（start ≥ 窗长）+ seek_accurate +
-    # 硬窗」组合存在 fork 级尾帧缺陷（窗界停喂的排空 marker 被当 EOF，
-    # 尾帧由缓存容错替补——帧数守恒、尾部像素错误）。窗激活期间的替补
-    # 有 latched 告警并计数进 hybrid_stats（win_subs，健康恒 0）；根治
-    # 前消费方必须避开该组合（或以无窗基线做位级对照）。
+    # 硬窗 × 晚起点（start ≥ 窗长）的两个历史缺陷均已根治（分支
+    # p3-window-prefix，2026-09-28 夜间轮）：①GOP 粒度 × 锚点前缀预算
+    # 算术（VideoReader seek_prefix_ 记账）；②seek 首锚会话的僵尸 kick
+    # 跨 reset 存活（ResetRouting 补清 pending_kicks_——旧会话的
+    # dst/after_gop 撞上新会话侧分配 → GOP 关键帧双解码 → 首帧重复/
+    # 末帧被挤）。窗口矩阵 12/12 位级一致（三码 × start × win × 三读法）。
+    # win_subs 哨兵保留为回归观测（健康恒 0）。
     'hard_decode_window': True,
+    'window_seek_safe': True,
 }
 
 

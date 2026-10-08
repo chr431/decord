@@ -743,6 +743,7 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
 
 
 void HybridThreadedDecoder::Stop() {
+    HybridThreadedTrace2Dump();   // TR2 取证：close 时一次性 dump（无 TRACE2 则空操作）
     if (getenv("DECORD_HYBRID_DEBUG")) {
         fprintf(stderr, "[hybrid] chunks cpu=%d gpu=%d frames cpu=%lld gpu=%lld\n",
                 chunks_assigned_[0], chunks_assigned_[1],
@@ -818,6 +819,14 @@ void HybridThreadedDecoder::ResetRouting() {
     routing_active_ = false;
     kick_side_ = Side(-1);
     kick_owed_ = kick_cloned_ = 0;
+    // 僵尸 kick 防线（夜间轮 2026-09-28 根因修复）：pending_kicks_ 携带
+    // 旧会话的 dst/after_gop（侧分配随时序变），跨 reset 存活会在新会话
+    // 的流序注入点命中——克隆包发给「恰好拥有该 pts-GOP 的一侧」→ 该侧
+    // 把自己 GOP 的关键帧解码两遍 → chunk 首帧重复/末帧被挤（实测 hevc
+    // 晚起点窗 221 帧分歧，布局双骰子：旧会话 flush 是否跑完 × 新会话
+    // 侧分配是否撞上僵尸 dst）。与 stash_/emit_queue_ 同属 reset 必清的
+    // 运行态，此前是唯一漏网项。
+    pending_kicks_.clear();
     emit_queue_.clear();
     stash_[0] = runtime::NDArray();
     stash_[1] = runtime::NDArray();
