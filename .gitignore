@@ -6,6 +6,7 @@ build*/
 ab/
 bench_videos/
 test_video_long/
+tmp_kick_probe/
 upstream-analysis/
 docs/_build
 .DS_Store
