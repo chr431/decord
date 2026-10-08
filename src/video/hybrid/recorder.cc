@@ -39,19 +39,19 @@ void HybridThreadedDecoder::FlightRecorderLoop() {
             const double dl = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - tl0).count();
             if (dl > 0.2) fprintf(f, "# LOCK-SLOW mtx %.3fs\n", dl);
-            eq = emit_queue_.size();
-            gsz = gops_.size();
-            if (!emit_queue_.empty()) {
-                const Chunk &c = emit_queue_.front();
+            eq = sess_.emit_queue_.size();
+            gsz = sess_.gops_.size();
+            if (!sess_.emit_queue_.empty()) {
+                const Chunk &c = sess_.emit_queue_.front();
                 hside = static_cast<int>(c.side);
                 hs = c.start_pts;
                 hexp = c.expected;
                 hem = c.emitted;
             }
-            eofp = eof_pushed_;
-            armf = arm_flush_sent_;
-            eofo = eof_flush_out_;
-            hpend = side_pending_[0] + side_pending_[1];
+            eofp = sess_.eof_pushed_;
+            armf = sess_.arm_flush_sent_;
+            eofo = sess_.eof_flush_out_;
+            hpend = sess_.side_pending_[0] + sess_.side_pending_[1];
         }
         std::size_t crdy = 0, rdy = 0;
         {
@@ -60,8 +60,8 @@ void HybridThreadedDecoder::FlightRecorderLoop() {
             const double dl = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - tl0).count();
             if (dl > 0.2) fprintf(f, "# LOCK-SLOW rmtx %.3fs\n", dl);
-            crdy = cpu_ready_.size();
-            rdy = ready_.size();
+            crdy = sess_.cpu_ready_.size();
+            rdy = sess_.ready_.size();
         }
         std::size_t qpk = 0;
         int64_t gfl = 0;
@@ -71,8 +71,8 @@ void HybridThreadedDecoder::FlightRecorderLoop() {
             const double dl = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - tl0).count();
             if (dl > 0.2) fprintf(f, "# LOCK-SLOW lcv_mtx %.3fs\n", dl);
-            qpk = gpu_pkt_q_.size();
-            gfl = gpu_flush_left_;
+            qpk = sess_.gpu_pkt_q_.size();
+            gfl = sess_.gpu_flush_left_;
         }
         int64_t cud_p = -1, cud_b = -1, cud_o = -1;
         if (gpu_) gpu_->DiagDepths(&cud_p, &cud_b, &cud_o);
@@ -93,7 +93,7 @@ void HybridThreadedDecoder::FlightRecorderLoop() {
                 (long long)cud_b, (long long)cud_o,
                 (long long)frames_out_[0].load(std::memory_order_relaxed),
                 (long long)frames_out_[1].load(std::memory_order_relaxed),
-                (long long)emitted_total_,
+                (long long)sess_.emitted_total_,
                 (long long)force_eof_close_.load(std::memory_order_relaxed),
                 (int)eofp, (int)armf, (int)eofo);
         fflush(f);
@@ -113,17 +113,17 @@ void HybridThreadedDecoder::DumpState(const char *tag) const {
     int64_t hs = -1, hexp = -1, hem = -1;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        eq = emit_queue_.size();
-        if (!emit_queue_.empty()) {
-            const Chunk &c = emit_queue_.front();
+        eq = sess_.emit_queue_.size();
+        if (!sess_.emit_queue_.empty()) {
+            const Chunk &c = sess_.emit_queue_.front();
             hside = static_cast<int>(c.side);
             hs = c.start_pts; hexp = c.expected; hem = c.emitted;
         }
     }
     std::size_t crdy = 0, rdy = 0;
-    { std::lock_guard<std::mutex> lk(rmtx_); crdy = cpu_ready_.size(); rdy = ready_.size(); }
+    { std::lock_guard<std::mutex> lk(rmtx_); crdy = sess_.cpu_ready_.size(); rdy = sess_.ready_.size(); }
     std::size_t qpk = 0; int64_t gfl = 0;
-    { std::lock_guard<std::mutex> lk(lcv_mtx_); qpk = gpu_pkt_q_.size(); gfl = gpu_flush_left_; }
+    { std::lock_guard<std::mutex> lk(lcv_mtx_); qpk = sess_.gpu_pkt_q_.size(); gfl = sess_.gpu_flush_left_; }
     int64_t cud_p = -1, cud_b = -1, cud_o = -1;
     if (gpu_) gpu_->DiagDepths(&cud_p, &cud_b, &cud_o);
     fprintf(stderr,
@@ -132,15 +132,15 @@ void HybridThreadedDecoder::DumpState(const char *tag) const {
             "cud=%lld/%lld/%lld "
             "fc=%lld fg=%lld em=%lld fe=%lld eof=%d%d%d drained=%d\n",
             tag, eq, hside, (long long)hs, (long long)hexp, (long long)hem,
-            (int)side_pending_[0], (int)side_pending_[1], crdy, rdy, qpk,
+            (int)sess_.side_pending_[0], (int)sess_.side_pending_[1], crdy, rdy, qpk,
             (long long)gfl, (long long)cpu_.QueueDepth(),
             (long long)cpu_.PendingDepth(),
             (long long)cud_p, (long long)cud_b, (long long)cud_o,
             (long long)frames_out_[0].load(std::memory_order_relaxed),
             (long long)frames_out_[1].load(std::memory_order_relaxed),
-            (long long)emitted_total_,
+            (long long)sess_.emitted_total_,
             (long long)force_eof_close_.load(std::memory_order_relaxed),
-            (int)eof_pushed_, (int)arm_flush_sent_, (int)eof_flush_out_,
+            (int)sess_.eof_pushed_, (int)sess_.arm_flush_sent_, (int)sess_.eof_flush_out_,
             (int)Drained());
     fflush(stderr);
 }

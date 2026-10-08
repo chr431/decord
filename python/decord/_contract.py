@@ -51,7 +51,7 @@ _HYBRID_STATS_KEYS = (
     'kicks_c', 'kicks_g', 'late', 'out_cuda', 'strag',
     'strandmax_c', 'strandmax_g',
     'up_cempty', 'up_flushes', 'up_frames', 'up_nobuf',
-    'win_subs', 'window_frames',
+    'win_subs', 'window_frames', 'window_hi', 'window_lo',
 )
 
 FEATURES = {

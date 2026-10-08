@@ -7,6 +7,7 @@
   2. 四 ctx 打开 + 解码（cpu / gpu / hybrid / hybrid_gpu）
   3. hybrid 帧 == cpu 帧逐位（gray，bit-exact 契约）
   4. get_codec / get_color_range / next_roi / hybrid_stats 键集抽查
+  5. 硬窗冒烟：窗读 == gpu 基线逐位 + win_subs==0（2026-10-08 重做）
 
 用法:
     python tests/smoke_release.py [dll_dir] [video]
@@ -27,12 +28,16 @@ os.environ['DECORD_LIBRARY_PATH'] = _dll_dir
 import decord  # noqa: E402
 from decord import VideoReader, cpu, gpu, hybrid, hybrid_gpu  # noqa: E402
 
-_vid = (sys.argv[2] if len(sys.argv) > 2 else
-        (lambda d: os.path.join(d, sorted(f for f in os.listdir(d)
-                                          if f.endswith('.mp4'))[0])
-         (os.environ['RACELOG_VIDEO_DIR'])
-         if os.environ.get('RACELOG_VIDEO_DIR') else
-         r'D:\Videos\racelog_test\test.mp4'))
+# （2026-10-08 修复既有潜伏 bug：原三元链里 lambda 体吞掉了后续条件
+# 表达式——无 argv 且无 RACELOG_VIDEO_DIR 时 _vid 是未调用的 lambda，
+# isfile 直接 TypeError；此前发布轮均带 video argv 跑从未触发。）
+if len(sys.argv) > 2:
+    _vid = sys.argv[2]
+else:
+    _d = os.environ.get('RACELOG_VIDEO_DIR')
+    _vid = (os.path.join(_d, sorted(f for f in os.listdir(_d)
+                                    if f.endswith('.mp4'))[0]) if _d
+            else r'D:\Videos\racelog_test\test.mp4')
 
 if not os.path.isfile(_vid):
     print('skip: 无测试视频（%s）——契约面检查仍执行' % _vid)
@@ -99,6 +104,25 @@ def api_probes():
     return ' '.join(out)
 
 
+def window_bitexact():
+    # 硬窗冒烟（窗口架构重做 2026-10-08）：窗=无窗==纯 gpu 逐位 +
+    # win_subs==0（窗模式禁替补后结构性恒 0）。完整矩阵在引擎仓
+    # _probe_window_matrix.py；这里是发布产物最小面。
+    n = min(N, len(VideoReader(_vid)))
+    vh = VideoReader(_vid, ctx=hybrid(0), output_format='gray')
+    vh.set_decode_window(n)
+    vh.seek_accurate(0)
+    bh = vh.get_batch(list(range(n))).asnumpy()
+    st = vh.hybrid_stats() or {}
+    del vh
+    vg = VideoReader(_vid, ctx=gpu(0), output_format='gray')
+    bg = vg.get_batch(list(range(n))).asnumpy()
+    del vg
+    assert bh.shape == bg.shape and (bh == bg).all(), '窗读 != gpu 基线'
+    assert st.get('win_subs') == 0, 'win_subs=%s（应恒 0）' % st.get('win_subs')
+    return '%d 帧逐位一致 win_subs=0' % n
+
+
 check('契约面（CONTRACT_VERSION+features）', contract_surface)
 if _vid:
     check('cpu 解码', decode_n(cpu(0)))
@@ -106,6 +130,7 @@ if _vid:
     check('hybrid 解码', decode_n(hybrid(0)))
     check('hybrid_gpu 解码（yuv420）', decode_n(hybrid_gpu(0), 'yuv420'))
     check('hybrid == cpu 逐位', hybrid_bitexact)
+    check('硬窗 == gpu 逐位 + win_subs==0', window_bitexact)
     check('API 面（codec/cr/next_roi/stats）', api_probes)
 
 print('SMOKE', 'ALL PASS' if not FAILS else 'FAIL: %s' % FAILS)

@@ -594,7 +594,7 @@ void CUThreadedDecoder::LaunchThreadImpl() {
             for (int i = 0; i < ThreadedDecoderInterface::kDrainMarkerCount; ++i) {
                 // marker 无需等待：配对空事件保持与 reorder 出队序 1:1
                 { std::lock_guard<std::mutex> lk(ev_mtx_); frame_events_.push_back(nullptr); }
-                reorder_queue_->Push(NDArray::Empty({1}, kInt64, kCPU));
+                reorder_queue_->Push(MakeDrainMarker(kDrainMarkerEOF));
             }
             if (on_output_) on_output_(true);
         }

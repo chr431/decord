@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # hybrid 快速回归（2026-09-27 按主仓标准改造版）。
 #
-# 六套件：gpu / formats / md5 / stream / stride / lockstep。
+# 七套件：gpu / formats / md5 / stream / stride / lockstep / window。
 # 默认串行逐套件跑（NVDEC 会话争用 C-01：并行跑 formats 会互相拖垮，
 # 旧版三套件并行是隐藏 flake 源）；--parallel 释放三车道：
 #   lane A = gpu        lane B = formats
-#   lane C = md5 → stream → stride → lockstep（链式串行）
+#   lane C = md5 → stream → stride → lockstep → window（链式串行）
+# window 套件（2026-10-08 窗口架构重做）：硬窗三读法位级 + win_subs==0，
+# 固定网格（早 3000 / 晚 1000），不吃 HYB_TEST_N。
 #
 # 逐套件判定（PASS/FAIL + 退出码），聚合退出码非 0 即有失败。
 # 用法: DECORD_LIBRARY_PATH=<dll目录> bash tests/run_fast.sh [N] [--parallel]
@@ -48,7 +50,8 @@ run_lane_c() {
   run_suite stream  python tests/test_hybrid_stream.py;         c2=$?
   run_suite stride  python tests/test_hybrid_stride.py;         c3=$?
   run_suite lockstep python tests/test_hybrid_lockstep.py 600;  c4=$?
-  return $(( c1 | c2 | c3 | c4 ))
+  run_suite window  python tests/test_hybrid_window.py;         c5=$?
+  return $(( c1 | c2 | c3 | c4 | c5 ))
 }
 
 FAILS=0

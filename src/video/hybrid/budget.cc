@@ -42,7 +42,7 @@ void HybridThreadedDecoder::ComputeBudgets() {
     double ram_budget = 1536.0 * 1024 * 1024;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > 0)
-        // VRAM 0.65：VRAM 模式的 GPU 库存(ready_)持有池缓冲、与 NVDEC
+        // VRAM 0.65：VRAM 模式的 GPU 库存(sess_.ready_)持有池缓冲、与 NVDEC
         // 喂包共用一个池，池深 = 库存上限 —— av1 引擎口径实测预算
         // 3198→5200MB 时 1529→1805(GPU 主导码流需要最深库存；
         // hevc/h264 已饱和不受影响)。仍按空闲量自适应，留 35% 余量。
@@ -98,6 +98,20 @@ void HybridThreadedDecoder::ComputeBudgets() {
 }
 
 
+int64_t HybridThreadedDecoder::FrameIndexOfPts(int64_t pts) const {
+    // kf 索引查 pts 的呈现序帧号（窗口架构重做 2026-10-08）：GOP 判交门
+    // 的基准。GOP 起点本身是关键帧 pts（精确命中）； tolerate 落点回退
+    // 到 ≤pts 的最近关键帧（VFR 抖动防御），单调性保证门判定只依赖
+    // 相对序。索引未注入（kf_pts_ 空）返回 -1 = 判交不可能（调用方按
+    // 无窗退化）。
+    if (kf_pts_.empty()) return -1;
+    auto it = std::upper_bound(kf_pts_.begin(), kf_pts_.end(), pts);
+    if (it == kf_pts_.begin()) return kf_rank_.front();
+    --it;
+    return kf_rank_[it - kf_pts_.begin()];
+}
+
+
 int64_t HybridThreadedDecoder::ExpectedFrames(int64_t start_pts,
                                                int64_t end_pts) const {
     // 在 kf 索引中查 [start,end) 的帧数 = rank(end_kf) - rank(start_kf)；
@@ -139,7 +153,7 @@ std::size_t HybridThreadedDecoder::ReadyCap() const {
     // 若将来有路径把它置 0（如新预算模型），这里的换算仍然正确。
     // 2026-09-19 冻结前审计标记，未删。
     // 字节预算 → 帧数上限（随分辨率自适应）。下限必须 > kGpuPoolBuffers：
-    // FeedStep 的喂包闸门是 ready_ 余量 ≥ 池大小，下限过小会让 GPU 永远
+    // FeedStep 的喂包闸门是 sess_.ready_ 余量 ≥ 池大小，下限过小会让 GPU 永远
     // 吃不到包（活锁）。GPU 驻留模式预算翻倍（帧驻留显存直到按序消费，
     // NVDEC 超前需覆盖一个 CPU chunk 的发射期）。
     std::size_t budget = out_cuda_ ? kReadyMaxBytesGpu : kReadyMaxBytes;
@@ -196,34 +210,49 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
     if (av1_cpu_off && !IsIdrLikeCodec()) {
         return SIDE_GPU;   // 消融：AV1 纯 GPU（复评对照臂）
     }
-    if (eof_cache_ && gop_seq_ - feed_gop_idx_ <= 4) {
-        return side_pending_[SIDE_CPU] <= side_pending_[SIDE_GPU]
+    if (sess_.eof_cache_ && sess_.gop_seq_ - sess_.feed_gop_idx_ <= 4) {
+        return sess_.side_pending_[SIDE_CPU] <= sess_.side_pending_[SIDE_GPU]
                    ? SIDE_CPU : SIDE_GPU;
     }
-    if (chunks_assigned_[SIDE_CPU] == 0) {
-        return chunks_assigned_[SIDE_GPU] >= 1 ? SIDE_CPU : SIDE_GPU;
+    if (sess_.chunks_assigned_[SIDE_CPU] == 0) {
+        return sess_.chunks_assigned_[SIDE_GPU] >= 1 ? SIDE_CPU : SIDE_GPU;
     }
-    // 窗口尾收口（2026-09-18 启动轮续）：EOF 的「末段给最少积压侧」
-    // 规则原本只在 eof_cache_ 触发——窗口运行没有尾意识，末段 GOP 按
-    // 供水比例可能落到慢臂，窗口尾部被拖满额 GOP 时间（hevc w1500/
-    // w2000 交叉点卡噪声带的主嫌疑）。窗口剩余预算 ≤ ~4 GOP 时切最少
-    // 积压侧，两侧一同收尾。全片（window<0）零影响；gop0/gop1 起步
-    // 启发在前，采样语义不变。
+    // 窗口尾收口（2026-09-18 启动轮续；2026-10-08 区间版）：EOF 的
+    // 「末段给最少积压侧」规则原本只在 sess_.eof_cache_ 触发——窗口运行
+    // 没有尾意识，末段 GOP 按供水比例可能落到慢臂，窗口尾部被拖满额
+    // GOP 时间（hevc w1500/w2000 交叉点卡噪声带的主嫌疑）。窗口剩余
+    // ≤ ~4 GOP 时切 ETA 最短侧，两侧一同收尾。剩余 = hi −（首个未派
+    // GOP 的起始帧号）（区间版口径，取代旧 window−assigned 计数差）。
+    // 全片（未设窗）零影响；gop0/gop1 起步启发在前，采样语义不变。
     {
         int64_t gop_est = est_chunk_frames_;
         if (gop_est <= 0 && kf_pts_.size() > 1 && frame_count_ > 0) {
             gop_est = std::max<int64_t>(
                 frame_count_ / static_cast<int64_t>(kf_pts_.size() - 1), 1);
         }
-        if (window_frames_ > 0 && gop_est > 0
-                && window_frames_
-                       - (assigned_frames_[0] + assigned_frames_[1])
-                       <= 4 * gop_est) {
+        int64_t window_remaining = INT64_MAX;
+        if (window_hi_ > window_lo_ && gop_est > 0) {
+            for (size_t wi = static_cast<size_t>(
+                     std::max<int64_t>(sess_.feed_gop_idx_, 0));
+                 wi < sess_.gops_.size(); ++wi) {
+                if (sess_.gops_[wi].side != Side(-1)) continue;
+                const int64_t ws =
+                    FrameIndexOfPts(sess_.gops_[wi].start_pts);
+                // kf 缺失（ws<0）：判交不可能，尾规则退化为不触发
+                //（与派工门同退化路径——宁按无窗调度）。
+                if (ws >= 0) {
+                    window_remaining =
+                        std::max<int64_t>(window_hi_ - ws, 0);
+                }
+                break;
+            }
+        }
+        if (window_remaining <= 4 * gop_est) {
             // ETA 口径（首版 least-pending 实测大回归 1.6-1.7s：
-            // side_pending_ 含按序合并的等待发射帧——GPU 臂解码完成但
+            // sess_.side_pending_ 含按序合并的等待发射帧——GPU 臂解码完成但
             // 排在 CPU chunk 后等发射时 pending 虚高，尾被系统性派给
             // 慢的 CPU 臂）。ETA=未解码余量/实测速率：pending 扣除
-            // 已解码存货（CPU=filter 队列深，GPU=ready_/cpu_ready_），
+            // 已解码存货（CPU=filter 队列深，GPU=sess_.ready_/sess_.cpu_ready_），
             // 谁先腾手给谁；速率未熟退回供水比例（下方 water-fill）。
             const double r_c = cpu_.ProductionRate();
             const double r_g = gpu_rate_landed_.load(
@@ -232,8 +261,8 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
                 std::size_t gpu_inv = 0;
                 {
                     std::lock_guard<std::mutex> lk(rmtx_);
-                    gpu_inv = ready_.size()
-                        + (out_cuda_ ? cpu_ready_.size() : 0);
+                    gpu_inv = sess_.ready_.size()
+                        + (out_cuda_ ? sess_.cpu_ready_.size() : 0);
                 }
                 // 已解码存货另含 cuvid reorder 输出队列（LandStep 尚未
                 // 收割；co≤0 时诊断口径未启用，跳过）。宿主包队列与
@@ -246,9 +275,9 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
                     if (co > 0) gpu_inv += static_cast<std::size_t>(co);
                 }
                 const int64_t cpu_und = std::max<int64_t>(
-                    side_pending_[SIDE_CPU] - cpu_.QueueDepth(), 0);
+                    sess_.side_pending_[SIDE_CPU] - cpu_.QueueDepth(), 0);
                 const int64_t gpu_und = std::max<int64_t>(
-                    side_pending_[SIDE_GPU]
+                    sess_.side_pending_[SIDE_GPU]
                         - static_cast<int64_t>(gpu_inv), 0);
                 return (static_cast<double>(cpu_und) / r_c
                         <= static_cast<double>(gpu_und) / r_g)
@@ -259,13 +288,13 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
     const double rc = cpu_.ProductionRate();
     const double rg = gpu_rate_landed_.load(std::memory_order_relaxed);
     if (rc <= 0.0 || rg <= 0.0) {
-        return chunks_assigned_[SIDE_CPU] <= chunks_assigned_[SIDE_GPU]
+        return sess_.chunks_assigned_[SIDE_CPU] <= sess_.chunks_assigned_[SIDE_GPU]
                    ? SIDE_CPU : SIDE_GPU;
     }
-    if (!sched_initialized_) {
+    if (!sess_.sched_initialized_) {
         // 首次双侧速率就绪：cpu-out 的库存帽按产率比分账（旧 inv-split
         // 语义不变；gpu-out 的 ready 由显存池决定不可动）
-        sched_initialized_ = true;
+        sess_.sched_initialized_ = true;
         if (!out_cuda_) {
             const int64_t total_inv =
                 static_cast<int64_t>(queue_frames_) + ready_cap_frames_;
@@ -307,15 +336,15 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
             trace_n_.store(ti + 1, std::memory_order_relaxed);
         }
     }
-    return (static_cast<double>(assigned_frames_[SIDE_CPU]) * (1.0 - f)
-            <= static_cast<double>(assigned_frames_[SIDE_GPU]) * f)
+    return (static_cast<double>(sess_.assigned_frames_[SIDE_CPU]) * (1.0 - f)
+            <= static_cast<double>(sess_.assigned_frames_[SIDE_GPU]) * f)
                ? SIDE_CPU : SIDE_GPU;
 }
 
 ffmpeg::AVPacketPtr HybridThreadedDecoder::CloneCachePacket(int64_t seq) {
     // 仅 Push/泵线程（持 mtx_ 的调用方）使用
-    if (seq < cache_base_seq_ || seq >= cache_seq_) return nullptr;
-    const auto &src = pkt_cache_[seq - cache_base_seq_];
+    if (seq < sess_.cache_base_seq_ || seq >= sess_.cache_seq_) return nullptr;
+    const auto &src = sess_.pkt_cache_[seq - sess_.cache_base_seq_];
     if (!src) return nullptr;
     AVPacket *c = av_packet_clone(src.get());
     if (!c) return nullptr;

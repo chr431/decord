@@ -47,9 +47,9 @@ namespace decord {
  *   │        (到新 chunk 起点的距离 / 速率 EWMA；GPU 待发射字节超预算  │
  *   │        则强制 CPU，防调度失衡)                                 │
  *   │   ├─► FFMPEGThreadedDecoder   (CPU 软解, 多线程, 自带背压)     │
- *   │   └─► gpu_pkt_q_ ─► GpuWorkerLoop ─► CUThreadedDecoder (NVDEC)│
- *   │                        └─► gpu_->Pop → D2H → ready_（有界）    │
- *   │  合并: emit_queue_ 按分配序记录 chunk {side, start_pts, end_pts,│
+ *   │   └─► sess_.gpu_pkt_q_ ─► GpuWorkerLoop ─► CUThreadedDecoder (NVDEC)│
+ *   │                        └─► gpu_->Pop → D2H → sess_.ready_（有界）    │
+ *   │  合并: sess_.emit_queue_ 按分配序记录 chunk {side, start_pts, end_pts,│
  *   │        expected}. Pop 只从队首 chunk 的侧取帧; 发射满 expected  │
  *   │        帧才关闭 chunk —— 与原型 "块长已知" 的语义对齐。          │
  *   └──────────────────────────────────────────────────────────────┘
@@ -324,7 +324,7 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
         ComputeBudgets();
     }
     // CPU 子解码器接管 VideoReader 打开的 ctx（内部 dec_ctx_.reset 持有）
-    // 深存货队列：CPU chunk 的发射靠 cpu_ready_/cpu_ 内部存货瞬时完成，
+    // 深存货队列：CPU chunk 的发射靠 sess_.cpu_ready_/cpu_ 内部存货瞬时完成，
     // 默认 32 帧背压会让每个 CPU chunk 退化为实时跟随解码（hevc 0.70x）。
     cpu_.SetQueueDepth(queue_frames_);  // 存货深度与 prefetch 匹配（~1.2GB RAM@1080p）
 #if defined(_WIN32)
@@ -363,7 +363,7 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
         gpu_pool_.SetOnRelease([this] { lcv_.notify_all(); });
         up_pool_.SetOnRelease([this] { lcv_.notify_all(); });
         if (out_cuda_) {
-            // 上载池容量 = ready_ 预算的一半（帧数）：CPU chunk 的
+            // 上载池容量 = sess_.ready_ 预算的一半（帧数）：CPU chunk 的
             // 显存帧容器，独立于 GPU 解码池（防饿死）
             up_pool_.Reset(up_pool_frames_, gpu_frame_shape_, kUInt8,
                            DLDevice{kDLCUDA, device_id_});
@@ -416,8 +416,8 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
     int w = x2 - x1, h = y2 - y1;
     if (w > 0 && h > 0) {
         if (frames_out_[0].load() != 0 || frames_out_[1].load() != 0
-                || !emit_queue_.empty() || !gpu_pkt_q_.empty()
-                || !ready_.empty() || !cpu_ready_.empty()) {
+                || !sess_.emit_queue_.empty() || !sess_.gpu_pkt_q_.empty()
+                || !sess_.ready_.empty() || !sess_.cpu_ready_.empty()) {
             LOG(FATAL) << "hybrid SetRoi must be called before any decode "
                        << "(frames cpu=" << frames_out_[0].load()
                        << " gpu=" << frames_out_[1].load() << ")";
@@ -431,7 +431,7 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
         // ROI 后输出帧仅 ROI 大小（如 1080p NV12 全帧 ~3.1MB → ROI
         // ~5.4KB）：按 ROI 帧字节重算 GPU 池/上载池深度。原深度按全帧
         // 字节预算，ROI 场景虚小 ~570× —— FeedStep 喂包闸
-        // （ready_ + reserve >= gpu_pool_frames_）在 GPU 提前解码约千帧
+        // （sess_.ready_ + reserve >= gpu_pool_frames_）在 GPU 提前解码约千帧
         // 后长期关闭：CPU 块期间拉取掉到 dav1d 速率、GPU 空有已路由包
         // 不喂（[hybrid-w] idle rdy≈1006 q≈786 轨迹实测），混跑吞吐
         // 退化近交替（av1 损耗 29.5%）。ROI 帧 5.4KB × 8192 ≈ 44MB。
@@ -634,9 +634,12 @@ void HybridThreadedDecoder::StopGpuWorker() {
 }
 
 
-void HybridThreadedDecoder::SetDecodeWindow(int64_t max_frames) {
-    // Start 前由消费线程调用；与 NeedsPackets/PumpFeed 同线程，无竞态。
-    window_frames_ = max_frames > 0 ? max_frames : -1;
+void HybridThreadedDecoder::SetDecodeWindowRange(int64_t lo, int64_t hi) {
+    // 与 NeedsPackets/PumpFeed 同线程（消费线程），无竞态。跨会话存活：
+    // reader 每次 seek 落锚重推（RefreshWindowRange），无累积。
+    // hi ≤ lo = 撤销窗（全片读）。
+    window_lo_ = lo;
+    window_hi_ = hi;
 }
 
 
@@ -644,7 +647,7 @@ bool HybridThreadedDecoder::HasPartialSupplyLocked() const {
     // 游标 GOP 已派侧且未供完 → 边界 GOP 仍需 demux 供包（硬窗的解码
     // 语义例外）。"未供完"三态（C-57 根治，2026-09-28 发布轮）：
     // ① 已派但**未闭合**——主区间终点未知（下一 keyframe 未读），
-    //    fed_upto==cache_seq_ 只是"缓存里的都喂了"而非"喂完了"：此前
+    //    fed_upto==sess_.cache_seq_ 只是"缓存里的都喂了"而非"喂完了"：此前
     //    该态被误判已喂完 → demux 停在 GOP 中间 → 尾部包永不到达 →
     //    臂排空接受缺帧 → VideoReader EOF 容错替补尾帧（实测 test5 晚
     //    起点窗 POP 止于 5979、尾 20 帧像素错）。已派 GOP 必须供给到
@@ -652,8 +655,8 @@ bool HybridThreadedDecoder::HasPartialSupplyLocked() const {
     //    窗缘多读 ≤1 GOP 的包，有界。
     // ② 已闭合未喂完（fed_upto < pkt_end）。
     // ③ 已闭合且迟到包未尽。
-    if (feed_gop_idx_ >= static_cast<int64_t>(gops_.size())) return false;
-    const GopRec &g = gops_[feed_gop_idx_];
+    if (sess_.feed_gop_idx_ >= static_cast<int64_t>(sess_.gops_.size())) return false;
+    const GopRec &g = sess_.gops_[sess_.feed_gop_idx_];
     if (g.side == Side(-1)) return false;   // 未派侧 = 窗外，不供
     if (!g.closed) return true;             // ①已派未闭合：须读到闭合
     return g.fed_upto < g.pkt_end
@@ -679,8 +682,8 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     };
     kv("frames_c", frames_out_[0].load());
     kv("frames_g", frames_out_[1].load());
-    kv("chunks_c", chunks_assigned_[0]);
-    kv("chunks_g", chunks_assigned_[1]);
+    kv("chunks_c", sess_.chunks_assigned_[0]);
+    kv("chunks_g", sess_.chunks_assigned_[1]);
     kv("kicks_c", kicks_[0].load());
     kv("kicks_g", kicks_[1].load());
     kv("clones", fb_clones_.load());
@@ -692,10 +695,15 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     kv("strag", strag_total_.load(std::memory_order_relaxed));
     kv("force_eof", force_eof_close_.load(std::memory_order_relaxed));
     kv("gpu_arm_stall", gpu_arm_stall_.load(std::memory_order_relaxed));
-    kv("assigned_c", assigned_frames_[0]);
-    kv("assigned_g", assigned_frames_[1]);
-    kv("window_frames", window_frames_);
-    kv("assigned_total", assigned_frames_[0] + assigned_frames_[1]);
+    kv("assigned_c", sess_.assigned_frames_[0]);
+    kv("assigned_g", sess_.assigned_frames_[1]);
+    // 窗区间（重做）：window_lo/hi 为绝对帧号；window_frames = hi-lo
+    // 兼容旧键（未设窗 = -1）。
+    kv("window_lo", window_hi_ > window_lo_ ? window_lo_ : -1);
+    kv("window_hi", window_hi_ > window_lo_ ? window_hi_ : -1);
+    kv("window_frames", window_hi_ > window_lo_ ? window_hi_ - window_lo_
+                                                 : -1);
+    kv("assigned_total", sess_.assigned_frames_[0] + sess_.assigned_frames_[1]);
     kv("hol_us_c", hol_us_[0].load());
     kv("hol_ev_c", hol_ev_[0].load());
     kv("strandmax_c", hol_strand_max_[0].load());
@@ -746,7 +754,7 @@ void HybridThreadedDecoder::Stop() {
     HybridThreadedTrace2Dump();   // TR2 取证：close 时一次性 dump（无 TRACE2 则空操作）
     if (getenv("DECORD_HYBRID_DEBUG")) {
         fprintf(stderr, "[hybrid] chunks cpu=%d gpu=%d frames cpu=%lld gpu=%lld\n",
-                chunks_assigned_[0], chunks_assigned_[1],
+                sess_.chunks_assigned_[0], sess_.chunks_assigned_[1],
                 (long long)frames_out_[0].load(), (long long)frames_out_[1].load());
     }
     // 先停工作线程（它可能正持有 GPU 侧的包/缓冲），再停子解码器
@@ -759,19 +767,19 @@ void HybridThreadedDecoder::Stop() {
                 " kicks c=%lld g=%lld clones=%lld\n",
                 out_cuda_ ? "gpu-out" : "cpu-out",
                 (long long)frames_out_[0].load(), (long long)frames_out_[1].load(),
-                chunks_assigned_[0], chunks_assigned_[1],
+                sess_.chunks_assigned_[0], sess_.chunks_assigned_[1],
                 (long long)kicks_[0].load(), (long long)kicks_[1].load(),
                 (long long)fb_clones_.load());
         fprintf(stderr,
                 "[hybrid-stats] disp gops c=%d g=%d cache_peak=%zuMB late=%lld strag=%lld rc_now=%.0f"
                 " rg_now=%.0f assigned c=%lld g=%lld\n",
-                chunks_assigned_[0], chunks_assigned_[1],
+                sess_.chunks_assigned_[0], sess_.chunks_assigned_[1],
                 cache_peak_bytes_ >> 20,
                 (long long)late_feeds_.load(std::memory_order_relaxed),
                 (long long)strag_total_.load(std::memory_order_relaxed),
                 cpu_.ProductionRate(),
                 gpu_rate_landed_.load(std::memory_order_relaxed),
-                (long long)assigned_frames_[0], (long long)assigned_frames_[1]);
+                (long long)sess_.assigned_frames_[0], (long long)sess_.assigned_frames_[1]);
         fprintf(stderr,
                 "[hybrid-stats] hol cpu-head us=%lld ev=%lld strandmax=%lld"
                 " | gpu-head us=%lld ev=%lld strandmax=%lld\n",
@@ -815,48 +823,20 @@ void HybridThreadedDecoder::Clear() {
 
 
 void HybridThreadedDecoder::ResetRouting() {
+    // 会话重置（窗口架构重做，2026-10-08）：整体重建 SessionState，
+    // 取代此前的手写逐字段清空清单——清单式重置对新增字段零防御，
+    // sess_.pending_kicks_ 曾是唯一漏网项（僵尸 kick，夜间轮 2026-09-28
+    // 根因：旧会话 kick 跨 reset 存活 → 新会话流序注入点命中 → GOP
+    // 关键帧双解码 → 首帧重复/末帧被挤）。对象化后新增会话字段默认
+    // 被清；跨会话白名单（kf 索引/速率 EWMA/est_chunk_frames_/cache
+    // 峰值/窗区间声明）显式留在结构体外。
+    // 锁序 mtx_→lcv_mtx_→rmtx_ 与既有嵌套一致；三锁齐持下赋值，
+    // lander/uploader 线程对各队列的访问本就持对应锁。
     std::lock_guard<std::mutex> lk(mtx_);
-    routing_active_ = false;
-    kick_side_ = Side(-1);
-    kick_owed_ = kick_cloned_ = 0;
-    // 僵尸 kick 防线（夜间轮 2026-09-28 根因修复）：pending_kicks_ 携带
-    // 旧会话的 dst/after_gop（侧分配随时序变），跨 reset 存活会在新会话
-    // 的流序注入点命中——克隆包发给「恰好拥有该 pts-GOP 的一侧」→ 该侧
-    // 把自己 GOP 的关键帧解码两遍 → chunk 首帧重复/末帧被挤（实测 hevc
-    // 晚起点窗 221 帧分歧，布局双骰子：旧会话 flush 是否跑完 × 新会话
-    // 侧分配是否撞上僵尸 dst）。与 stash_/emit_queue_ 同属 reset 必清的
-    // 运行态，此前是唯一漏网项。
-    pending_kicks_.clear();
-    emit_queue_.clear();
-    stash_[0] = runtime::NDArray();
-    stash_[1] = runtime::NDArray();
-    has_stash_[0] = has_stash_[1] = false;
-    eof_pushed_ = false;
-    chunks_assigned_[0] = chunks_assigned_[1] = 0;
-    assigned_frames_[0] = assigned_frames_[1] = 0;
-    pkt_cache_.clear();
-    cache_seq_ = 0;
-    cache_base_seq_ = 0;
-    cache_bytes_ = 0;
-    gops_.clear();
-    feed_gop_idx_ = 0;
-    gop_seq_ = 0;
-    last_fed_side_ = Side(-1);
-    eof_cache_ = false;
-    arm_flush_sent_ = false;
-    eof_flush_out_ = false;
-    emitted_total_ = 0;
-    sched_initialized_ = false;
-    side_pending_[0] = side_pending_[1] = 0;
     {
         std::lock_guard<std::mutex> lk2(lcv_mtx_);
-        gpu_pkt_q_.clear();
-        gpu_flush_left_ = 0;
-    }
-    {
-        std::lock_guard<std::mutex> lk2(rmtx_);
-        ready_.clear();
-        cpu_ready_.clear();
+        std::lock_guard<std::mutex> lk3(rmtx_);
+        sess_ = SessionState{};
     }
     // kf 索引保留：Seek 后复用帧数表
 }
@@ -953,16 +933,16 @@ void HybridThreadedDecoder::InitAffinityMasks() {
 bool HybridThreadedDecoder::Drained() const {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (!emit_queue_.empty() || has_stash_[0] || has_stash_[1]) return false;
+        if (!sess_.emit_queue_.empty() || sess_.has_stash_[0] || sess_.has_stash_[1]) return false;
     }
     {
         std::lock_guard<std::mutex> lk(rmtx_);
-        if (!ready_.empty()) return false;
-        if (out_cuda_ && !cpu_ready_.empty()) return false;
+        if (!sess_.ready_.empty()) return false;
+        if (out_cuda_ && !sess_.cpu_ready_.empty()) return false;
     }
     {
         std::lock_guard<std::mutex> lk(lcv_mtx_);
-        if (!gpu_pkt_q_.empty() || gpu_flush_left_ > 0) return false;
+        if (!sess_.gpu_pkt_q_.empty() || sess_.gpu_flush_left_ > 0) return false;
     }
     if (!cpu_.Drained()) return false;
     if (gpu_ && !gpu_->Drained()) return false;

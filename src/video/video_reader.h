@@ -205,10 +205,20 @@ class VideoReader : public VideoReaderInterface {
         std::unordered_set<int64_t> failed_idx_;  // idx of failed frames(recovered from other frames)
         int64_t fault_tol_thresh_;  // fault tolerance threshold, raise if recovered frames retrieved exceeds thresh
         bool fault_warn_emit_;  // whether a fault warning has been emitted
-        int64_t decode_window_ = -1;  // SetDecodeWindow 声明窗长（-1=未设）；窗激活期间的缓存替补显式告警并计数（C-57 观察哨）
-        int64_t seek_prefix_ = 0;     // 最近 keyframe-seek 落锚前缀（C-57 根治：硬窗按已派帧量计，前缀解码但不交付，须补进窗预算）
-        int64_t win_subs_ = 0;        // 窗激活期间的缓存替补帧数（健康恒 0；hybrid_stats 键 win_subs）
-        bool win_sub_warned_ = false; // 窗替补告警 latch（每个 reader 至多一条）
+        // ── 硬窗（区间版重做，2026-10-08）────────────────────────────
+        // reader 只留档声明窗长 n（-1=未设）并负责把「区间」算出来：
+        // RefreshWindowRange(target) = [target, target+n) 经
+        // SetDecodeWindowRange 下发解码器。旧 seek_prefix_ 前缀补偿已
+        // 删——区间语义下锚点前缀 [anchor, target) 天然在边界 GOP 内，
+        // 无预算算术。win_subs 哨兵保留（结构性恒 0：窗模式禁替补，
+        // FetchCachedFrame 在窗激活时直接返 false——静默换帧在架构上
+        // 不再可达，键保留供消费方断言与回归观察）。
+        int64_t decode_window_ = -1;  // SetDecodeWindow 声明窗长（-1=未设）
+        int64_t win_subs_ = 0;        // 窗激活期间的缓存替补帧数（结构性恒 0）
+        bool win_sub_warned_ = false; // 窗替补告警 latch（防御性保留）
+        /*! \brief 把窗区间 [target, target+decode_window_) 下发解码器；
+         *  设窗与每次 seek 落锚（含同 GOP 前进）时调用，无累积。 */
+        void RefreshWindowRange(int64_t target);
 };  // class VideoReader
 }  // namespace decord
 #endif  // DECORD_VIDEO_VIDEO_READER_H_
