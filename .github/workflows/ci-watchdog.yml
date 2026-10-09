@@ -1,0 +1,87 @@
+# ci-watchdog —— CI 红了不再无声（2026-10-09；与引擎仓同款，
+# 监视本仓全部工作流：C/C++ CI / engine contract linkage / Release）
+#
+# 痛点：CI 跑数分钟，推送后不可能每次盯着；红了经常事后多日才发现。
+# 机制：workflow_run 在被监视工作流**完成时**触发（零轮询、零等待）——
+#   红 → 开 issue（label ci-red，同 commit 去重为评论）→ GitHub 通知即达；
+#   master 绿 → 自动关闭所有挂着的 ci-red issue（附绿色运行链接）。
+# 实现注：幽灵 BuildFailed 事件（事件名空）会留 startup_failure 记录
+#   但零副作用（无 job、无 issue）。
+# 注意：本文件必须在默认分支上才会收到事件（workflow_run 语义）；
+# 权限收敛 issues:write + actions:read。
+
+name: ci-watchdog
+
+on:
+  workflow_run:
+    # ⚠️ workflows 过滤键必填；名字含斜杠匹配不了（原 "C/C++ CI" 已因此
+    # 改名 Build，2026-10-09）
+    workflows: [Build, engine contract linkage, Release]
+    types: [completed]
+
+permissions:
+  issues: write
+  actions: read
+
+concurrency:
+  group: ci-watchdog-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  red-to-issue:
+    # 门卫：失败的且不是看门狗自己的完成事件（事件名空/BuildFailed 的
+    # 幽灵事件在此被 skip）
+    if: >
+      github.event.workflow_run.conclusion == 'failure'
+      && github.event.workflow_run.name != 'ci-watchdog'
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI 红 → 开 issue（同 commit 去重）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          URL: ${{ github.event.workflow_run.html_url }}
+          TITLE: ${{ github.event.workflow_run.name }}
+        run: |
+          short="${SHA:0:7}"
+          gh label create ci-red --color d73a4a --repo "$REPO" 2>/dev/null || true
+          num=$(gh issue list --repo "$REPO" --label ci-red --state open \
+                  --json number,title \
+                  --jq ".[] | select(.title | contains(\"$short\")) | .number" \
+                  | head -1 || true)
+          if [ -n "$num" ] && [ "$num" != "null" ]; then
+            gh issue comment "$num" --repo "$REPO" \
+              --body "仍在红（$BRANCH @$short）：$URL"
+          else
+            gh issue create --repo "$REPO" --label ci-red \
+              --title "CI 红：$TITLE @ $BRANCH ($short)" \
+              --body "CI 失败：$URL
+
+          commit: $SHA
+          branch: $BRANCH
+
+          （本 issue 由 ci-watchdog 自动创建；master 转绿后自动关闭）"
+          fi
+
+  green-close-issues:
+    # 只认主干转绿（分支绿不该关主干的红）；主干绿 = 全部 ci-red 已过时
+    if: >
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.name != 'ci-watchdog'
+      && github.event.workflow_run.head_branch == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: 主干绿 → 关闭挂着的 ci-red issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          gh label create ci-red --color d73a4a --repo "$REPO" 2>/dev/null || true
+          for num in $(gh issue list --repo "$REPO" --label ci-red --state open \
+                         --json number --jq '.[].number' || true); do
+            gh issue close "$num" --repo "$REPO" \
+              --comment "master 已转绿，自动关闭：$URL"
+          done

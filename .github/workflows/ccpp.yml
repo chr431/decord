@@ -1,4 +1,6 @@
-name: C/C++ CI
+name: Build  # 原 "C/C++ CI"：斜杠名匹配不了 workflow_run 的
+             # workflows 过滤键（ci-watchdog 实测 startup_failure），
+             # 2026-10-09 改名
 
 on:
   push:
