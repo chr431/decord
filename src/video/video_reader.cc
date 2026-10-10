@@ -1035,15 +1035,18 @@ std::string VideoReader::DecodeStats() const {
 
 std::string VideoReader::HybridStats() {
     // decoder_ 为 hybrid 时给全量快照；其余实现返回空串。Reader 级计数
-    // 追加在尾部（窗替补观察哨，C-57）：健康路径恒 0；python 侧
-    // hybrid_stats() 按 "k=v;" 通用解析自动透传。
+    // （窗替补观察哨，C-57）：健康路径恒 0；python 侧按 "k=v;" 通用解析
+    // 自动透传。⚠ 必须前缀插入：decoder 的 trace= 段在其串尾且省略终结
+    // ';'（供 python 按 'trace=' 前缀单独解析）——尾部追加会把 kv 粘进
+    // trace 四元组（实测 '1485.8win_subs=0' 解析崩、引擎侧 _fs() 异常被
+    // 吞 → report.hybrid 整段消失；2026-10-10 稳定轮定位）。
     if (!decoder_) return std::string();
     std::string s = decoder_->HybridStatsProbe();
     if (!s.empty()) {
         char buf[48];
         snprintf(buf, sizeof(buf), "win_subs=%lld;",
                  static_cast<long long>(win_subs_));
-        s += buf;
+        s = std::string(buf) + s;
     }
     return s;
 }
