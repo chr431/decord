@@ -413,6 +413,19 @@ commit/tag/release。tag push 不触发 PyPI 发布（已移除）。
 差异（新增键向后兼容；删键/改名须先 `CONTRACT_VERSION` +1——下游靠契约面
 做能力协商，键集漂移是破坏性变更）。
 
+**tag 纪律（2026-10-10 治理改革轮）**：版本提交必须带同名 tag `vX.Y.Z`。
+走 release workflow 会自动打；**本地手 bump（`tools/update_version.py X.Y.Z`
++ commit）必须当轮补打** `git tag -a vX.Y.Z && git push --tags`——0.9.1/
+0.9.2 曾本地 bump 未打 tag，下游（video_ocr_engine 的 DEPENDENCIES 版本
+口径与审计项 decord_pin）按"版本=tag"对账时对不上。发版 checklist：
+
+1. `python tools/update_version.py X.Y.Z`（三源对齐）→ commit；
+2. 同名 tag（手动或 release workflow 自动）；
+3. README_EN 刷新或确认「以中文版为准」声明仍成立（英文版是滞后镜像，
+   性能口径版本标记两版必须一致）；
+4. 下游同步：video_ocr_engine `docs/DEPENDENCIES.md` decord 行 +
+   `python tools/conclusions_sweep.py` 清扫。
+
 ## 致谢与许可
 
 - 上游项目 [dmlc/decord](https://github.com/dmlc/decord)——本 fork 的全部基础架构

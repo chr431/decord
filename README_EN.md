@@ -2,6 +2,13 @@
 
 English | [简体中文](README.md)
 
+> **The Chinese README is the source of truth.** This English mirror lags behind
+> by roughly one release cycle (2026-10-10 policy): version-specific facts added
+> since v0.8.5 — GPU-only builds (`USE_CUDA=OFF` is now a fatal error), the three
+> CMake presets, the seven test suites, and the v0.9.0 hard-window architecture
+> (`set_decode_window`) — may be missing here. The performance table's caliber
+> version marker must stay identical across both files (release checklist item).
+
 ![CI Build](https://github.com/chr431/decord/workflows/C/C++%20CI/badge.svg?branch=dev)
 
 ![symbol](docs/symbol.png)
