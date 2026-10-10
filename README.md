@@ -389,6 +389,18 @@ decord.features()         # 本构建能力面快照（hybrid ctx / gray 输出 
 
 完整历史见 commit log；`dev` 与 `master` 均受 CI 监听。
 
+## 代码风格（维护者）
+
+- **C++（fork 新增文件）**：`.clang-format`（Google 基线 + 4 空格缩进 +
+  行宽 100），白名单 = `src/video/hybrid/**`、`hybrid_threaded_decoder.h`、
+  `frame_trace.h`；Build workflow 首步 `--dry-run --Werror` 强制（版本钉
+  23.1.3 与本地一致）。上游遗留文件不重排（保 blame）。
+- **python/（fork 新增/重写）**：跟随下游 video_ocr_engine 风格——双引号、
+  带类型注解、中文散文 docstring（`_contract.py` 即此形态）；上游遗留
+  文件保持上游风格不动。python 侧暂无 CI 门禁，新增文件请自觉对齐。
+- 源码统一 UTF-8 **无 BOM**（CMake 已强制 `/utf-8`，2026-10-11 清理
+  video_reader.cc/.h 的 BOM）。
+
 ## 测试
 
 ```bash

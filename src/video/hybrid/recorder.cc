@@ -22,10 +22,10 @@
 namespace decord {
 
 void HybridThreadedDecoder::FlightRecorderLoop() {
-    FILE *f = fopen("decord_hybrid_flight.log", "a");
+    FILE* f = fopen("decord_hybrid_flight.log", "a");
     if (!f) return;
     const auto t0 = std::chrono::steady_clock::now();
-    fprintf(f, "# flight begin this=%p\n", static_cast<void *>(this));
+    fprintf(f, "# flight begin this=%p\n", static_cast<void*>(this));
     fflush(f);
     while (flight_run_.load(std::memory_order_relaxed)) {
         const auto tw0 = std::chrono::steady_clock::now();
@@ -36,13 +36,13 @@ void HybridThreadedDecoder::FlightRecorderLoop() {
         {
             const auto tl0 = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> lk(mtx_);
-            const double dl = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - tl0).count();
+            const double dl =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
             if (dl > 0.2) fprintf(f, "# LOCK-SLOW mtx %.3fs\n", dl);
             eq = sess_.emit_queue_.size();
             gsz = sess_.gops_.size();
             if (!sess_.emit_queue_.empty()) {
-                const Chunk &c = sess_.emit_queue_.front();
+                const Chunk& c = sess_.emit_queue_.front();
                 hside = static_cast<int>(c.side);
                 hs = c.start_pts;
                 hexp = c.expected;
@@ -57,8 +57,8 @@ void HybridThreadedDecoder::FlightRecorderLoop() {
         {
             const auto tl0 = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> lk(rmtx_);
-            const double dl = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - tl0).count();
+            const double dl =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
             if (dl > 0.2) fprintf(f, "# LOCK-SLOW rmtx %.3fs\n", dl);
             crdy = sess_.cpu_ready_.size();
             rdy = sess_.ready_.size();
@@ -68,37 +68,34 @@ void HybridThreadedDecoder::FlightRecorderLoop() {
         {
             const auto tl0 = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> lk(lcv_mtx_);
-            const double dl = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - tl0).count();
+            const double dl =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tl0).count();
             if (dl > 0.2) fprintf(f, "# LOCK-SLOW lcv_mtx %.3fs\n", dl);
             qpk = sess_.gpu_pkt_q_.size();
             gfl = sess_.gpu_flush_left_;
         }
         int64_t cud_p = -1, cud_b = -1, cud_o = -1;
         if (gpu_) gpu_->DiagDepths(&cud_p, &cud_b, &cud_o);
-        const double t = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t0).count();
-        const double tw = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - tw0).count();
+        const double t =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double tw =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
         if (tw > 0.5) fprintf(f, "# SNAP-SLOW %.3fs (t=%.3f)\n", tw, t);
         fprintf(f,
                 "%7.3f eq=%zu gops=%zu head=%d,%lld,%lld,%lld pend=%lld "
                 "crdy=%zu rdy=%zu qpk=%zu gfl=%lld cq=%lld cp=%lld "
                 "cud=%lld/%lld/%lld fc=%lld fg=%lld em=%lld fe=%lld "
                 "eof=%d%d%d\n",
-                t, eq, gsz, hside, (long long)hs, (long long)hexp,
-                (long long)hem, (long long)hpend, crdy, rdy, qpk,
-                (long long)gfl, (long long)cpu_.QueueDepth(),
-                (long long)cpu_.PendingDepth(), (long long)cud_p,
-                (long long)cud_b, (long long)cud_o,
-                (long long)frames_out_[0].load(std::memory_order_relaxed),
+                t, eq, gsz, hside, (long long)hs, (long long)hexp, (long long)hem, (long long)hpend,
+                crdy, rdy, qpk, (long long)gfl, (long long)cpu_.QueueDepth(),
+                (long long)cpu_.PendingDepth(), (long long)cud_p, (long long)cud_b,
+                (long long)cud_o, (long long)frames_out_[0].load(std::memory_order_relaxed),
                 (long long)frames_out_[1].load(std::memory_order_relaxed),
                 (long long)sess_.emitted_total_,
-                (long long)force_eof_close_.load(std::memory_order_relaxed),
-                (int)eofp, (int)armf, (int)eofo);
+                (long long)force_eof_close_.load(std::memory_order_relaxed), (int)eofp, (int)armf,
+                (int)eofo);
         fflush(f);
-        for (int i = 0; i < 25 && flight_run_.load(std::memory_order_relaxed);
-             ++i) {
+        for (int i = 0; i < 25 && flight_run_.load(std::memory_order_relaxed); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
@@ -106,8 +103,7 @@ void HybridThreadedDecoder::FlightRecorderLoop() {
     fclose(f);
 }
 
-
-void HybridThreadedDecoder::DumpState(const char *tag) const {
+void HybridThreadedDecoder::DumpState(const char* tag) const {
     std::size_t eq = 0;
     int hside = -2;
     int64_t hs = -1, hexp = -1, hem = -1;
@@ -115,33 +111,41 @@ void HybridThreadedDecoder::DumpState(const char *tag) const {
         std::lock_guard<std::mutex> lk(mtx_);
         eq = sess_.emit_queue_.size();
         if (!sess_.emit_queue_.empty()) {
-            const Chunk &c = sess_.emit_queue_.front();
+            const Chunk& c = sess_.emit_queue_.front();
             hside = static_cast<int>(c.side);
-            hs = c.start_pts; hexp = c.expected; hem = c.emitted;
+            hs = c.start_pts;
+            hexp = c.expected;
+            hem = c.emitted;
         }
     }
     std::size_t crdy = 0, rdy = 0;
-    { std::lock_guard<std::mutex> lk(rmtx_); crdy = sess_.cpu_ready_.size(); rdy = sess_.ready_.size(); }
-    std::size_t qpk = 0; int64_t gfl = 0;
-    { std::lock_guard<std::mutex> lk(lcv_mtx_); qpk = sess_.gpu_pkt_q_.size(); gfl = sess_.gpu_flush_left_; }
+    {
+        std::lock_guard<std::mutex> lk(rmtx_);
+        crdy = sess_.cpu_ready_.size();
+        rdy = sess_.ready_.size();
+    }
+    std::size_t qpk = 0;
+    int64_t gfl = 0;
+    {
+        std::lock_guard<std::mutex> lk(lcv_mtx_);
+        qpk = sess_.gpu_pkt_q_.size();
+        gfl = sess_.gpu_flush_left_;
+    }
     int64_t cud_p = -1, cud_b = -1, cud_o = -1;
     if (gpu_) gpu_->DiagDepths(&cud_p, &cud_b, &cud_o);
-    fprintf(stderr,
-            "[dump@%s] eq=%zu head=%d,%lld,%lld,%lld pend=%d/%d "
-            "crdy=%zu rdy=%zu qpk=%zu gfl=%lld cq=%lld cp=%lld "
-            "cud=%lld/%lld/%lld "
-            "fc=%lld fg=%lld em=%lld fe=%lld eof=%d%d%d drained=%d\n",
-            tag, eq, hside, (long long)hs, (long long)hexp, (long long)hem,
-            (int)sess_.side_pending_[0], (int)sess_.side_pending_[1], crdy, rdy, qpk,
-            (long long)gfl, (long long)cpu_.QueueDepth(),
-            (long long)cpu_.PendingDepth(),
-            (long long)cud_p, (long long)cud_b, (long long)cud_o,
-            (long long)frames_out_[0].load(std::memory_order_relaxed),
-            (long long)frames_out_[1].load(std::memory_order_relaxed),
-            (long long)sess_.emitted_total_,
-            (long long)force_eof_close_.load(std::memory_order_relaxed),
-            (int)sess_.eof_pushed_, (int)sess_.arm_flush_sent_, (int)sess_.eof_flush_out_,
-            (int)Drained());
+    fprintf(
+        stderr,
+        "[dump@%s] eq=%zu head=%d,%lld,%lld,%lld pend=%d/%d "
+        "crdy=%zu rdy=%zu qpk=%zu gfl=%lld cq=%lld cp=%lld "
+        "cud=%lld/%lld/%lld "
+        "fc=%lld fg=%lld em=%lld fe=%lld eof=%d%d%d drained=%d\n",
+        tag, eq, hside, (long long)hs, (long long)hexp, (long long)hem, (int)sess_.side_pending_[0],
+        (int)sess_.side_pending_[1], crdy, rdy, qpk, (long long)gfl, (long long)cpu_.QueueDepth(),
+        (long long)cpu_.PendingDepth(), (long long)cud_p, (long long)cud_b, (long long)cud_o,
+        (long long)frames_out_[0].load(std::memory_order_relaxed),
+        (long long)frames_out_[1].load(std::memory_order_relaxed), (long long)sess_.emitted_total_,
+        (long long)force_eof_close_.load(std::memory_order_relaxed), (int)sess_.eof_pushed_,
+        (int)sess_.arm_flush_sent_, (int)sess_.eof_flush_out_, (int)Drained());
     fflush(stderr);
 }
 

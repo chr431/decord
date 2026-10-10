@@ -1,4 +1,4 @@
-﻿/*!
+/*!
  *  Copyright (c) 2019 by Contributors if not otherwise specified
  * \file video_reader.h
  * \brief FFmpeg video reader, implements VideoReaderInterface

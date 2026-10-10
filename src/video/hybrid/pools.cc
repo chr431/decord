@@ -31,22 +31,21 @@
 
 namespace decord {
 
-runtime::NDArray HybridThreadedDecoder::ToHost(const runtime::NDArray &g) {
+runtime::NDArray HybridThreadedDecoder::ToHost(const runtime::NDArray& g) {
     CHECK(g.defined()) << "ToHost on undefined frame";
-    const DLTensor *gtp = g.operator->();
-    const DLTensor &gt = *gtp;
-    runtime::NDArray h = runtime::NDArray::Empty(
-        std::vector<int64_t>(gt.shape, gt.shape + gt.ndim), kUInt8, kCPU);
+    const DLTensor* gtp = g.operator->();
+    const DLTensor& gt = *gtp;
+    runtime::NDArray h =
+        runtime::NDArray::Empty(std::vector<int64_t>(gt.shape, gt.shape + gt.ndim), kUInt8, kCPU);
     h.pts = g.pts;
     // 三种输出格式 (rgb/gray/yuv420) 两侧布局逐字节一致：本 fork 的
     // yuv420 输出统一为 (h+ceil(h/2), w) 的 Y + 交错 UV 行（CPU filter 搬运
     // 与 GPU improc 直出的 packed 布局相同，实测逐字节相等）—— 无需重排，
     // 整块 D2H 即可。
-    runtime::NDArray::CopyFromTo(const_cast<DLTensor *>(gtp),
-                                 const_cast<DLTensor *>(h.operator->()), nullptr);
+    runtime::NDArray::CopyFromTo(const_cast<DLTensor*>(gtp), const_cast<DLTensor*>(h.operator->()),
+                                 nullptr);
     return h;
 }
-
 
 void HybridThreadedDecoder::GpuFrameProduced() {
     // 生产侧 sustained 折（2026-09-18）：连续产出段（间隔 <50ms，
@@ -69,23 +68,18 @@ void HybridThreadedDecoder::GpuFrameProduced() {
                 if (land_fold_n_ >= 4) {
                     double best = 0.0;
                     const int oldest =
-                        (land_fold_i_ - land_fold_n_ + 2 * kLandFoldRing)
-                        % kLandFoldRing;
+                        (land_fold_i_ - land_fold_n_ + 2 * kLandFoldRing) % kLandFoldRing;
                     for (int i = 0; i + 4 <= land_fold_n_; ++i) {
-                        double w = land_fold_ring_[
-                            (oldest + i) % kLandFoldRing];
+                        double w = land_fold_ring_[(oldest + i) % kLandFoldRing];
                         for (int j = 1; j < 4; ++j) {
-                            const double v = land_fold_ring_[
-                                (oldest + i + j) % kLandFoldRing];
+                            const double v = land_fold_ring_[(oldest + i + j) % kLandFoldRing];
                             if (v < w) w = v;
                         }
                         if (w > best) best = w;
                     }
-                    const double prev = gpu_rate_landed_.load(
-                        std::memory_order_relaxed);
-                    gpu_rate_landed_.store(
-                        prev > 0 ? std::max(best, prev * 0.997) : best,
-                        std::memory_order_relaxed);
+                    const double prev = gpu_rate_landed_.load(std::memory_order_relaxed);
+                    gpu_rate_landed_.store(prev > 0 ? std::max(best, prev * 0.997) : best,
+                                           std::memory_order_relaxed);
                 }
                 land_seg_frames_ = 0;
                 land_seg_secs_ = 0.0;
@@ -140,45 +134,40 @@ bool HybridThreadedDecoder::LandStep() {
     {
         const int k = static_cast<int>(d2h_seq_ & (kD2HRingSlots - 1));
         if (d2h_valid_[k] && !HarvestD2H(k)) return false;  // ready 满，稍后重试
-        if (d2h_staging_[k] == nullptr
-                || d2h_bytes_ != static_cast<std::size_t>(frame_bytes_)) {
+        if (d2h_staging_[k] == nullptr || d2h_bytes_ != static_cast<std::size_t>(frame_bytes_)) {
             if (d2h_staging_[k] != nullptr) cudaFreeHost(d2h_staging_[k]);
             d2h_staging_[k] = nullptr;
-            if (cudaMallocHost(&d2h_staging_[k],
-                               static_cast<size_t>(frame_bytes_)) == cudaSuccess) {
+            if (cudaMallocHost(&d2h_staging_[k], static_cast<size_t>(frame_bytes_)) ==
+                cudaSuccess) {
                 d2h_bytes_ = static_cast<std::size_t>(frame_bytes_);
             }
             if (d2h_ev_[k] == nullptr) {
                 cudaEvent_t ev = nullptr;
-                if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming)
-                        == cudaSuccess) {
+                if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess) {
                     d2h_ev_[k] = ev;
                 }
             }
             if (d2h_stream_ == nullptr) {
-                cudaStreamCreateWithFlags(
-                    reinterpret_cast<cudaStream_t *>(&d2h_stream_),
-                    cudaStreamNonBlocking);
+                cudaStreamCreateWithFlags(reinterpret_cast<cudaStream_t*>(&d2h_stream_),
+                                          cudaStreamNonBlocking);
             }
         }
-        const char *src = static_cast<const char *>
-            (const_cast<DLTensor *>(f.operator->())->data);
+        const char* src = static_cast<const char*>(const_cast<DLTensor*>(f.operator->())->data);
         // pinned 池路径：D2H 直达最终帧（收割零拷贝入 sess_.ready_，消除
         // 暂存 memcpy + 每帧 Empty 分配）。pooled 帧在 LandStep 入口
         // （gpu_->Pop 之前）预取 —— pop 之后无法把帧塞回解码器，池尽
         // 若在此时才失败 = 已弹出的帧被丢弃 = 永久缺帧死等（lockstep
         // 慢消费实测挂死）。入口预取失败 = 干净背压，帧留在解码器内。
         if (pooled.defined()) {
-            void *dst = const_cast<DLTensor *>(pooled.operator->())->data;
+            void* dst = const_cast<DLTensor*>(pooled.operator->())->data;
             if (d2h_stream_ != nullptr && d2h_ev_[k] != nullptr) {
                 pooled.pts = f.pts;
-                cudaMemcpyAsync(dst, src, static_cast<size_t>(frame_bytes_),
-                                cudaMemcpyDeviceToHost,
+                cudaMemcpyAsync(dst, src, static_cast<size_t>(frame_bytes_), cudaMemcpyDeviceToHost,
                                 reinterpret_cast<cudaStream_t>(d2h_stream_));
                 cudaEventRecord(reinterpret_cast<cudaEvent_t>(d2h_ev_[k]),
                                 reinterpret_cast<cudaStream_t>(d2h_stream_));
                 d2h_host_[k] = std::move(pooled);
-                d2h_gpu_[k] = f;    // 源保活（事件前不回池）
+                d2h_gpu_[k] = f;  // 源保活（事件前不回池）
                 d2h_pooled_[k] = true;
                 d2h_valid_[k] = true;
                 ++d2h_seq_;
@@ -186,18 +175,14 @@ bool HybridThreadedDecoder::LandStep() {
             }
             // 无流/事件：池块上同步 D2H（罕见兜底），直接交付
             pooled.pts = f.pts;
-            cudaMemcpy(dst, src, static_cast<size_t>(frame_bytes_),
-                       cudaMemcpyDeviceToHost);
+            cudaMemcpy(dst, src, static_cast<size_t>(frame_bytes_), cudaMemcpyDeviceToHost);
             std::lock_guard<std::mutex> lk(rmtx_);
             sess_.ready_.push_back(std::move(pooled));
             return true;
         }
-        if (d2h_staging_[k] != nullptr && d2h_ev_[k] != nullptr
-                && d2h_stream_ != nullptr) {
-            cudaMemcpyAsync(d2h_staging_[k], src,
-                            static_cast<size_t>(frame_bytes_),
-                            cudaMemcpyDeviceToHost,
-                            reinterpret_cast<cudaStream_t>(d2h_stream_));
+        if (d2h_staging_[k] != nullptr && d2h_ev_[k] != nullptr && d2h_stream_ != nullptr) {
+            cudaMemcpyAsync(d2h_staging_[k], src, static_cast<size_t>(frame_bytes_),
+                            cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(d2h_stream_));
             cudaEventRecord(reinterpret_cast<cudaEvent_t>(d2h_ev_[k]),
                             reinterpret_cast<cudaStream_t>(d2h_stream_));
         } else {
@@ -207,17 +192,16 @@ bool HybridThreadedDecoder::LandStep() {
             sess_.ready_.push_back(std::move(h));
             return true;
         }
-        const DLTensor &ft = *f.operator->();
-        d2h_host_[k] = runtime::NDArray::Empty(
-            std::vector<int64_t>(ft.shape, ft.shape + ft.ndim), kUInt8, kCPU);
+        const DLTensor& ft = *f.operator->();
+        d2h_host_[k] = runtime::NDArray::Empty(std::vector<int64_t>(ft.shape, ft.shape + ft.ndim),
+                                               kUInt8, kCPU);
         d2h_host_[k].pts = f.pts;
-        d2h_gpu_[k] = f;    // 源保活（D2H 完成前不回池）
+        d2h_gpu_[k] = f;  // 源保活（D2H 完成前不回池）
         d2h_valid_[k] = true;
         ++d2h_seq_;
     }
     return true;
 }
-
 
 bool HybridThreadedDecoder::HarvestD2H(int k) {
     {
@@ -244,7 +228,6 @@ bool HybridThreadedDecoder::HarvestD2H(int k) {
     return true;
 }
 
-
 void HybridThreadedDecoder::FlushD2H() {
     if (d2h_seq_ == 0) return;
     const int64_t base = d2h_seq_ - kD2HRingSlots;
@@ -266,7 +249,6 @@ void HybridThreadedDecoder::FlushD2H() {
     d2h_seq_ = 0;
 }
 
-
 void HybridThreadedDecoder::AbortInflight() {
     // Clear/ROI 重建：同步在途拷贝（缓冲安全释放）后丢弃。
     // H2D 批量上载无跨 UploadStep 的在途状态（所有路径批内 sync 完成后
@@ -286,7 +268,6 @@ void HybridThreadedDecoder::AbortInflight() {
         cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(up_stream_));
     }
 }
-
 
 bool HybridThreadedDecoder::FeedStep() {
     if (!gpu_) return false;
@@ -315,13 +296,12 @@ bool HybridThreadedDecoder::FeedStep() {
         // 的主要损耗源）。CPU-out：sess_.ready_ 是宿主帧，池缓冲仅在途
         // （D2H 环 + surface ≈ kGpuPoolBuffers），上限仍是 ReadyCap。
         {
-            const std::size_t cap = out_cuda_
-                ? static_cast<std::size_t>(std::max(gpu_pool_frames_, 1))
-                : ReadyCap();
-            const std::size_t reserve = out_cuda_
-                ? static_cast<std::size_t>(
-                      ThreadedDecoderInterface::kMaxOutputSurfaces + 8)
-                : kGpuPoolBuffers;
+            const std::size_t cap =
+                out_cuda_ ? static_cast<std::size_t>(std::max(gpu_pool_frames_, 1)) : ReadyCap();
+            const std::size_t reserve =
+                out_cuda_
+                    ? static_cast<std::size_t>(ThreadedDecoderInterface::kMaxOutputSurfaces + 8)
+                    : kGpuPoolBuffers;
             if (sess_.ready_.size() + reserve >= cap) {
                 std::lock_guard<std::mutex> lk2(lcv_mtx_);
                 if (has_pkt) sess_.gpu_pkt_q_.push_front(std::move(pkt));
@@ -355,7 +335,6 @@ bool HybridThreadedDecoder::FeedStep() {
     return true;
 }
 
-
 bool HybridThreadedDecoder::UploadStep() {
     if (!out_cuda_) return false;
     // ── H2D 批量上载（重设计，替代每帧 sync）──
@@ -367,7 +346,7 @@ bool HybridThreadedDecoder::UploadStep() {
     // 宿主 memcpy(i+1) 重叠），批末一次 sync 统一收割。
     // 语义与逐帧同步完全一致：帧只在 H2D 完成后进 sess_.cpu_ready_、顺序 =
     // 提交顺序；marker/池尽/CPU 断流等所有提前退出路径先冲刷批再处理
-    //（此前事件环方案的 marker/EOF 语义腐坏在这里不存在 —— 冲刷在
+    // （此前事件环方案的 marker/EOF 语义腐坏在这里不存在 —— 冲刷在
     // UploadStep 栈内同步完成，无跨调用在途状态）。
     // ── 积攒窗（2026-09-20 H2D 聚合轮）──
     // 批次化上线后实测批均仍只有 ~2.4 帧：CPU 臂断流（cpu-empty）即
@@ -381,7 +360,7 @@ bool HybridThreadedDecoder::UploadStep() {
     static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
     // 批大小消融旋钮（一次性读 env；仅上载线程读写 up_batch_，无锁）。
     static const int batch_env = [] {
-        const char *e = getenv("DECORD_HYBRID_UPLOAD_BATCH");
+        const char* e = getenv("DECORD_HYBRID_UPLOAD_BATCH");
         return e ? atoi(e) : 0;
     }();
     if (batch_env > 0) {
@@ -394,7 +373,7 @@ bool HybridThreadedDecoder::UploadStep() {
     // = cpu 路径水平），无收益可兑现。默认关；机制保留供「暴露复现的
     // 机器状态」下复评（引擎侧启动轮 §10 的归因未获干预实验支持）。
     static const int wait_us = [] {
-        const char *e = getenv("DECORD_HYBRID_UPLOAD_WAIT_US");
+        const char* e = getenv("DECORD_HYBRID_UPLOAD_WAIT_US");
         return e ? atoi(e) : 0;
     }();
     runtime::NDArray bufs[kUploadBatch];
@@ -430,14 +409,12 @@ bool HybridThreadedDecoder::UploadStep() {
             // marker 在队列尾，最长 250µs 后即被此重试取到并立即冲刷，
             // 尾部无额外等待）。
             if (nf > 0 && wait_us > 0) {
-                const auto waited =
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now() - batch_t0)
-                                .count();
+                const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - batch_t0)
+                                        .count();
                 if (waited < wait_us) {
-                    buf = runtime::NDArray();   // 等待期不占池槽
-                    std::this_thread::sleep_for(
-                            std::chrono::microseconds(250));
+                    buf = runtime::NDArray();  // 等待期不占池槽
+                    std::this_thread::sleep_for(std::chrono::microseconds(250));
                     continue;
                 }
             }
@@ -454,34 +431,28 @@ bool HybridThreadedDecoder::UploadStep() {
             return true;
         }
         const int k = nf;
-        if (up_staging_[k] == nullptr
-                || up_stage_bytes_ != static_cast<std::size_t>(frame_bytes_)) {
+        if (up_staging_[k] == nullptr ||
+            up_stage_bytes_ != static_cast<std::size_t>(frame_bytes_)) {
             if (up_staging_[k] != nullptr) {
                 cudaFreeHost(up_staging_[k]);
                 up_staging_[k] = nullptr;
             }
-            if (cudaMallocHost(&up_staging_[k],
-                               static_cast<size_t>(frame_bytes_)) == cudaSuccess) {
+            if (cudaMallocHost(&up_staging_[k], static_cast<size_t>(frame_bytes_)) == cudaSuccess) {
                 up_stage_bytes_ = static_cast<std::size_t>(frame_bytes_);
             }
         }
-        const char *src = static_cast<const char *>
-            (const_cast<DLTensor *>(f.operator->())->data);
-        char *dst_dev = static_cast<char *>
-            (const_cast<DLTensor *>(buf.operator->())->data);
+        const char* src = static_cast<const char*>(const_cast<DLTensor*>(f.operator->())->data);
+        char* dst_dev = static_cast<char*>(const_cast<DLTensor*>(buf.operator->())->data);
         if (up_staging_[k] != nullptr) {
             // 槽 k 占用至批末 sync（H2D 源保活）；宿主帧 f 的 memcpy 在
             // 提交前同步完成，无需保活。
             std::memcpy(up_staging_[k], src, static_cast<size_t>(frame_bytes_));
-            cudaMemcpyAsync(dst_dev, up_staging_[k],
-                            static_cast<size_t>(frame_bytes_),
-                            cudaMemcpyHostToDevice,
-                            reinterpret_cast<cudaStream_t>(up_stream_));
+            cudaMemcpyAsync(dst_dev, up_staging_[k], static_cast<size_t>(frame_bytes_),
+                            cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(up_stream_));
         } else {
             // pinned 分配失败的兜底：pageable 直接异步（驱动 staging，
             // 慢但正确 —— 批末 sync 同样保证完成）
-            cudaMemcpyAsync(dst_dev, src, static_cast<size_t>(frame_bytes_),
-                            cudaMemcpyHostToDevice,
+            cudaMemcpyAsync(dst_dev, src, static_cast<size_t>(frame_bytes_), cudaMemcpyHostToDevice,
                             reinterpret_cast<cudaStream_t>(up_stream_));
         }
         buf.pts = f.pts;
@@ -492,9 +463,6 @@ bool HybridThreadedDecoder::UploadStep() {
     return true;
 }
 
-
-
-
 void HybridThreadedDecoder::GpuWorkerLoop() {
     static const bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
     while (lander_run_.load()) {
@@ -502,28 +470,30 @@ void HybridThreadedDecoder::GpuWorkerLoop() {
         try {
             did = LandStep();
             did = FeedStep() || did;
-        } catch (const std::exception &e) {
+        } catch (const std::exception& e) {
             TrapWorkerError("gpu-worker", e);
-            lcv_.notify_all();   // 唤醒消费者：Pop 处转 DECORDError
-            break;               // 退出线程（不再 rethrow=不再 terminate）
+            lcv_.notify_all();  // 唤醒消费者：Pop 处转 DECORDError
+            break;              // 退出线程（不再 rethrow=不再 terminate）
         }
-        if (dbg && did) fprintf(stderr, "[hybrid-w] did=%d ready=%zu cpuready=%zu pktq=%zu\n", (int)did, sess_.ready_.size(), sess_.cpu_ready_.size(), sess_.gpu_pkt_q_.size());
+        if (dbg && did)
+            fprintf(stderr, "[hybrid-w] did=%d ready=%zu cpuready=%zu pktq=%zu\n", (int)did,
+                    sess_.ready_.size(), sess_.cpu_ready_.size(), sess_.gpu_pkt_q_.size());
         if (!did) {
-            if (dbg) fprintf(stderr, "[hybrid-w] idle rdy=%zu crdy=%zu q=%zu",
-                             sess_.ready_.size(), sess_.cpu_ready_.size(), sess_.gpu_pkt_q_.size());
+            if (dbg)
+                fprintf(stderr, "[hybrid-w] idle rdy=%zu crdy=%zu q=%zu", sess_.ready_.size(),
+                        sess_.cpu_ready_.size(), sess_.gpu_pkt_q_.size());
             std::unique_lock<std::mutex> lk(lcv_mtx_);
             lcv_.wait_for(lk, std::chrono::milliseconds(1));
         }
     }
 }
 
-
 void HybridThreadedDecoder::UploaderLoop() {
     while (lander_run_.load()) {
         bool did = false;
         try {
             did = UploadStep();
-        } catch (const std::exception &e) {
+        } catch (const std::exception& e) {
             TrapWorkerError("uploader", e);
             lcv_.notify_all();
             break;
@@ -534,6 +504,5 @@ void HybridThreadedDecoder::UploaderLoop() {
         }
     }
 }
-
 
 }  // namespace decord

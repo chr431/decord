@@ -1,0 +1,14 @@
+# fork 侧 C++ 风格（2026-10-11 测试/工具清扫轮定案）。
+# 基线 = 上游 dmlc 的 Google 系惯例实测形态：attach 括号、命名沿用
+# 上游（类/方法 PascalCase、成员尾下划线、常量 UPPER_CASE、自由函数
+# camelCase）；缩进 4 空格（上游实测 4 空格为主）。ColumnLimit 100。
+# SortIncludes 关：避免无意义的 include 重排污染 diff 与 blame。
+# 适用范围 = fork 新增文件白名单（src/video/hybrid/**、
+# hybrid_threaded_decoder.h、frame_trace.h）——上游遗留文件不动，
+# 保 blame；CI dry-run 只查白名单（.github/workflows/ccpp.yml）。
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 100
+SortIncludes: false
+DerivePointerAlignment: false
+PointerAlignment: Left

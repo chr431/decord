@@ -40,19 +40,27 @@ namespace tr2probe {
 std::mutex mtx;
 std::vector<std::string> log;
 std::atomic<long long> t0_us{-1};
-bool on() { static const bool v = getenv("DECORD_HYBRID_TRACE2") != nullptr; return v; }
+bool on() {
+    static const bool v = getenv("DECORD_HYBRID_TRACE2") != nullptr;
+    return v;
+}
 long long now_us() {
     auto d = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+                 std::chrono::steady_clock::now().time_since_epoch())
+                 .count();
     long long t0 = t0_us.load(std::memory_order_relaxed);
-    if (t0 < 0) { t0_us.compare_exchange_strong(t0, d); t0 = t0_us.load(); }
+    if (t0 < 0) {
+        t0_us.compare_exchange_strong(t0, d);
+        t0 = t0_us.load();
+    }
     return d - t0;
 }
-void add(const char *fmt, ...) {
+void add(const char* fmt, ...) {
     if (!on()) return;
     char buf[192];
     int n = snprintf(buf, sizeof(buf), "[%lld] ", now_us());
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     vsnprintf(buf + n, sizeof(buf) - n - 1, fmt, ap);
     va_end(ap);
     std::lock_guard<std::mutex> lk(mtx);
@@ -60,7 +68,7 @@ void add(const char *fmt, ...) {
 }
 void dump() {
     std::lock_guard<std::mutex> lk(mtx);
-    for (auto &s : log) fprintf(stderr, "%s", s.c_str());
+    for (auto& s : log) fprintf(stderr, "%s", s.c_str());
     fflush(stderr);
     log.clear();
 }
@@ -92,7 +100,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
         Side s = Side(-1);
         ffmpeg::AVPacketPtr pkt;
         bool is_key = false;
-        ffmpeg::AVPacketPtr kick_pkt;   // 即发 kick 的克隆包（扫描时备好）
+        ffmpeg::AVPacketPtr kick_pkt;  // 即发 kick 的克隆包（扫描时备好）
         bool clone_debt = false;
         Side debt_dst = SIDE_CPU;
         std::vector<std::pair<Side, ffmpeg::AVPacketPtr>> kicks_to_send;
@@ -101,11 +109,10 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             // 1. 跳过已供完的 GOP。⚠️ 开放 GOP（未关闭）即使瞬时供完也
             // 不能越过——后续还有包到达，越过=该 GOP 剩余包永远无人供。
             while (sess_.feed_gop_idx_ < static_cast<int64_t>(sess_.gops_.size())) {
-                const GopRec &g = sess_.gops_[sess_.feed_gop_idx_];
+                const GopRec& g = sess_.gops_[sess_.feed_gop_idx_];
                 if (!g.closed) break;
                 if (g.fed_upto < g.pkt_end) break;
-                if (g.straggler_idx
-                        < static_cast<int64_t>(g.stragglers.size())) {
+                if (g.straggler_idx < static_cast<int64_t>(g.stragglers.size())) {
                     break;
                 }
                 ++sess_.feed_gop_idx_;
@@ -122,29 +129,29 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             bool held_unassigned = false;  // 熟前挂起break置位：flush须抑制
             bool earlier_pending[2] = {false, false};
             if (sess_.feed_gop_idx_ < static_cast<int64_t>(sess_.gops_.size())) {
-                const GopRec &gc = sess_.gops_[sess_.feed_gop_idx_];
+                const GopRec& gc = sess_.gops_[sess_.feed_gop_idx_];
                 if (gc.side != Side(-1)) {
                     const int64_t ae = gc.closed ? gc.pkt_end : sess_.cache_seq_;
-                    const bool partial = gc.fed_upto < ae
-                        || (gc.closed && gc.straggler_idx
-                                       < static_cast<int64_t>(gc.stragglers.size()));
+                    const bool partial =
+                        gc.fed_upto < ae ||
+                        (gc.closed &&
+                         gc.straggler_idx < static_cast<int64_t>(gc.stragglers.size()));
                     if (partial) earlier_pending[(int)gc.side] = true;
                 }
             }
-            for (int64_t k = sess_.feed_gop_idx_;
-                 k < static_cast<int64_t>(sess_.gops_.size()); ++k) {
-                GopRec &g = sess_.gops_[k];
+            for (int64_t k = sess_.feed_gop_idx_; k < static_cast<int64_t>(sess_.gops_.size());
+                 ++k) {
+                GopRec& g = sess_.gops_[k];
                 const int64_t avail_end = g.closed ? g.pkt_end : sess_.cache_seq_;
-                const bool has_pkt = g.fed_upto < avail_end
-                    || (g.closed && g.straggler_idx
-                                    < static_cast<int64_t>(g.stragglers.size()));
-                if (k > sess_.feed_gop_idx_ && g.side != Side(-1)
-                        && earlier_pending[(int)g.side]) {
-                    continue;   // 同侧序约束（只约束游标之后的 GOP——
-                                // 游标自身是最早，永不被自己的阻断跳过）
+                const bool has_pkt =
+                    g.fed_upto < avail_end ||
+                    (g.closed && g.straggler_idx < static_cast<int64_t>(g.stragglers.size()));
+                if (k > sess_.feed_gop_idx_ && g.side != Side(-1) && earlier_pending[(int)g.side]) {
+                    continue;  // 同侧序约束（只约束游标之后的 GOP——
+                               // 游标自身是最早，永不被自己的阻断跳过）
                 }
                 if (g.side == Side(-1)) {
-                    if (!has_pkt) continue;   // 未开 GOP 无包不分配
+                    if (!has_pkt) continue;  // 未开 GOP 无包不分配
                     // 硬窗界（区间版，2026-10-08 重做）：GOP 起始帧号 ≥ 窗
                     // 上界 → 窗外，不再派工（扫描终止；已派 GOP 的供给与
                     // kick 注入不受影响）。起始 GOP（含 seek 锚点前缀
@@ -172,26 +179,20 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                     // 强制分配头部 GOP。双空走 PickFeedSide（gop0 GPU
                     // 起步 / gop1 CPU 采样语义不变，FORCE_SIDE 亦经它
                     // 生效）。
-                    const bool force_this =
-                        force_head && k == sess_.feed_gop_idx_;
+                    const bool force_this = force_head && k == sess_.feed_gop_idx_;
                     if (force_this) {
                         const bool ci = sess_.side_pending_[SIDE_CPU] == 0;
                         const bool gi = sess_.side_pending_[SIDE_GPU] == 0;
-                        g.side = (ci && gi) ? PickFeedSide()
-                                               : (ci ? SIDE_CPU : SIDE_GPU);
-                    } else if (cpu_.ProductionRate() <= 0.0
-                            || gpu_rate_landed_.load(
-                                   std::memory_order_relaxed) <= 0.0) {
-                        const bool cpu_idle =
-                            sess_.side_pending_[SIDE_CPU] == 0;
-                        const bool gpu_idle =
-                            sess_.side_pending_[SIDE_GPU] == 0;
+                        g.side = (ci && gi) ? PickFeedSide() : (ci ? SIDE_CPU : SIDE_GPU);
+                    } else if (cpu_.ProductionRate() <= 0.0 ||
+                               gpu_rate_landed_.load(std::memory_order_relaxed) <= 0.0) {
+                        const bool cpu_idle = sess_.side_pending_[SIDE_CPU] == 0;
+                        const bool gpu_idle = sess_.side_pending_[SIDE_GPU] == 0;
                         if (!cpu_idle && !gpu_idle) {
                             held_unassigned = true;
                             break;
                         }
-                        if (ForcedSide() != Side(-1)
-                                || (cpu_idle && gpu_idle)) {
+                        if (ForcedSide() != Side(-1) || (cpu_idle && gpu_idle)) {
                             g.side = PickFeedSide();
                         } else {
                             g.side = cpu_idle ? SIDE_CPU : SIDE_GPU;
@@ -199,7 +200,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                     } else {
                         g.side = PickFeedSide();
                     }
-                    for (Chunk &c : sess_.emit_queue_) {
+                    for (Chunk& c : sess_.emit_queue_) {
                         if (c.id == g.id) {
                             c.side = g.side;
                             if (c.expected > 0 && !g.counted) {
@@ -210,8 +211,8 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         }
                     }
                     ++sess_.chunks_assigned_[g.side];
-                    if (g.side != sess_.last_fed_side_ && sess_.last_fed_side_ != Side(-1)
-                            && IsIdrLikeCodec()) {
+                    if (g.side != sess_.last_fed_side_ && sess_.last_fed_side_ != Side(-1) &&
+                        IsIdrLikeCodec()) {
                         // 换侧 kick：克隆本 GOP 首包（此刻必在缓存，未供）
                         // ⚠️ kick 一律挂起、由泵在流序位置注入（分配时
                         // 即发/游标触发都会在前瞻供料下落到离场侧队列尾
@@ -222,14 +223,14 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         ffmpeg::AVPacketPtr kp = CloneCachePacket(g.pkt_begin);
                         if (kp && sess_.pending_kicks_.size() < 8) {
                             tr2probe::add("[tr2] KICK-create dst=%d pts=%lld gop=%lld\n",
-                                            (int)sess_.last_fed_side_,
-                                            (long long)kp->pts, (long long)(k - 1));
-                            sess_.pending_kicks_.push_back(PendingKick{
-                                std::move(kp), sess_.last_fed_side_, k - 1});
+                                          (int)sess_.last_fed_side_, (long long)kp->pts,
+                                          (long long)(k - 1));
+                            sess_.pending_kicks_.push_back(
+                                PendingKick{std::move(kp), sess_.last_fed_side_, k - 1});
                         }
                     }
                     sess_.last_fed_side_ = g.side;
-                if (earlier_pending[(int)g.side]) continue;
+                    if (earlier_pending[(int)g.side]) continue;
                 }
                 if (!has_pkt) continue;
                 // 容量门（2026-09-28 av1 死锁轮修订）：EOF 排空原本完全
@@ -243,14 +244,14 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                 // 不中断）。速率成熟的健康快解路径（hevc/h264 stream
                 // 相位）行为不变。
                 {
-                    const bool side_unmatured = (g.side == SIDE_CPU)
-                        ? cpu_.ProductionRate() <= 0.0
-                        : gpu_rate_landed_.load(
-                              std::memory_order_relaxed) <= 0.0;
+                    const bool side_unmatured =
+                        (g.side == SIDE_CPU)
+                            ? cpu_.ProductionRate() <= 0.0
+                            : gpu_rate_landed_.load(std::memory_order_relaxed) <= 0.0;
                     if (!sess_.eof_cache_ || side_unmatured) {
                         const int64_t cap = (g.side == SIDE_CPU)
-                            ? static_cast<int64_t>(queue_frames_)
-                            : static_cast<int64_t>(ready_cap_frames_);
+                                                ? static_cast<int64_t>(queue_frames_)
+                                                : static_cast<int64_t>(ready_cap_frames_);
                         if (sess_.side_pending_[g.side] >= cap) {
                             earlier_pending[(int)g.side] = true;
                             continue;
@@ -271,8 +272,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                 // GOP 的起点 ≥ hi ⟺ 已见过窗外 GOP = 边界 GOP 已闭合。
                 bool window_closed = false;
                 if (window_hi_ > window_lo_ && !sess_.gops_.empty()) {
-                    const int64_t bs =
-                        FrameIndexOfPts(sess_.gops_.back().start_pts);
+                    const int64_t bs = FrameIndexOfPts(sess_.gops_.back().start_pts);
                     window_closed = bs >= 0 && bs >= window_hi_;
                 }
                 // 排空前确认：所有已派 GOP 已喂完（主区间+迟到包）。
@@ -282,7 +282,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                 // 容量门由消费推进自然解除（头部 chunk 即被消费），
                 // 下一轮泵送继续喂完后再排空。
                 bool all_assigned_fed = true;
-                for (const GopRec &g3 : sess_.gops_) {
+                for (const GopRec& g3 : sess_.gops_) {
                     if (g3.side == Side(-1)) continue;
                     // C-57 根治配套（2026-09-28 发布轮）：已派**未闭合**
                     // 的 GOP ≠ 已喂完——此前 avail_end 取 sess_.cache_seq_ 使
@@ -296,10 +296,8 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         all_assigned_fed = false;
                         break;
                     }
-                    if (g3.fed_upto < g3.pkt_end
-                            || g3.straggler_idx
-                                   < static_cast<int64_t>(
-                                       g3.stragglers.size())) {
+                    if (g3.fed_upto < g3.pkt_end ||
+                        g3.straggler_idx < static_cast<int64_t>(g3.stragglers.size())) {
                         all_assigned_fed = false;
                         break;
                     }
@@ -307,8 +305,8 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                 // 窗界关断不必等游标到表尾（窗外 GOP 永不派，游标
                 // 停在窗缘）——NVDEC 的 DPB 扣留尾帧必须靠 flush 释放，
                 // 否则消费者等不到窗口末帧（首轮实测挂死即此）。
-                if ((sess_.eof_cache_ || window_closed) && all_assigned_fed
-                        && !held_unassigned && !sess_.arm_flush_sent_) {
+                if ((sess_.eof_cache_ || window_closed) && all_assigned_fed && !held_unassigned &&
+                    !sess_.arm_flush_sent_) {
                     sess_.arm_flush_sent_ = true;
                     // 排空语义分家（重做）：真 EOF 与窗缘不再共用一个
                     // 标志——Pop 转发 marker 时按 eof_cache_ 铸造载荷
@@ -326,8 +324,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         // 少交付（2026-09-19 test6_h264 w12000 实测
                         // EOF-retry 上限报错的根因）。
                         int64_t last_assigned_gop = -1;
-                        for (auto rit = sess_.gops_.rbegin();
-                             rit != sess_.gops_.rend(); ++rit) {
+                        for (auto rit = sess_.gops_.rbegin(); rit != sess_.gops_.rend(); ++rit) {
                             if (rit->side != Side(-1)) {
                                 last_assigned_gop = rit->id;
                                 break;
@@ -336,11 +333,11 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         for (auto it = sess_.pending_kicks_.begin();
                              it != sess_.pending_kicks_.end();) {
                             if (it->after_gop >= last_assigned_gop) {
-                                tr2probe::add("[tr2] KICK-windrop dst=%d after=%lld pts=%lld last_assigned=%lld\n",
-                                                (int)it->dst,
-                                                (long long)it->after_gop,
-                                                (long long)it->pkt->pts,
-                                                (long long)last_assigned_gop);
+                                tr2probe::add(
+                                    "[tr2] KICK-windrop dst=%d after=%lld pts=%lld "
+                                    "last_assigned=%lld\n",
+                                    (int)it->dst, (long long)it->after_gop, (long long)it->pkt->pts,
+                                    (long long)last_assigned_gop);
                                 it = sess_.pending_kicks_.erase(it);
                             } else {
                                 ++it;
@@ -350,7 +347,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                 }
                 break;
             }
-            GopRec &g = sess_.gops_[gi];
+            GopRec& g = sess_.gops_[gi];
             s = g.side;
             // 取一个包（主区间优先，随后迟到包）
             const int64_t avail_end = g.closed ? g.pkt_end : sess_.cache_seq_;
@@ -367,21 +364,19 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             // kick 泵注入：本包是 dst 侧在 after_gop 之后的首个被供
             // GOP 主区间首包 → kick 先发（记账锁内、推包锁外）。位置 =
             // K-1 末包之后、后续 GOP 之前——与 main 的流内 kick 等价。
-            if (g.fed_upto == g.pkt_begin + 1) {   // 刚取的是主区间首包
+            if (g.fed_upto == g.pkt_begin + 1) {  // 刚取的是主区间首包
                 static const bool koff = [] {
-                    const char *e = getenv("DECORD_HYBRID_KICK_OFF");
+                    const char* e = getenv("DECORD_HYBRID_KICK_OFF");
                     return e != nullptr && atoi(e) > 0;
                 }();
                 if (!koff) {
                     for (auto it = sess_.pending_kicks_.begin();
-                         it != sess_.pending_kicks_.end(); ) {
-                        tr2probe::add("[tr2] KICK-eval dst=%d after=%lld pts=%lld | s=%d g=%lld%s\n",
-                                        (int)it->dst,
-                                        (long long)it->after_gop,
-                                        (long long)it->pkt->pts,
-                                        (int)s, (long long)g.id,
-                                        (it->dst == s && g.id > it->after_gop)
-                                            ? " MATCH" : "");
+                         it != sess_.pending_kicks_.end();) {
+                        tr2probe::add(
+                            "[tr2] KICK-eval dst=%d after=%lld pts=%lld | s=%d g=%lld%s\n",
+                            (int)it->dst, (long long)it->after_gop, (long long)it->pkt->pts, (int)s,
+                            (long long)g.id,
+                            (it->dst == s && g.id > it->after_gop) ? " MATCH" : "");
                         if (it->dst == s && g.id > it->after_gop) {
                             ++sess_.side_pending_[s];
                             kicks_[s].fetch_add(1, std::memory_order_relaxed);
@@ -413,14 +408,14 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                 }
             }
         }  // ~lock
-        if (!pkt) break;   // 防御（不应发生）
+        if (!pkt) break;  // 防御（不应发生）
         static const bool kick_off = [] {
-            const char *e = getenv("DECORD_HYBRID_KICK_OFF");
+            const char* e = getenv("DECORD_HYBRID_KICK_OFF");
             return e != nullptr && atoi(e) > 0;
         }();
-        for (auto &ks : kicks_to_send) {
-            tr2probe::add("[tr2] KICK-inject dst=%d pts=%lld\n",
-                          (int)ks.first, (long long)ks.second->pts);
+        for (auto& ks : kicks_to_send) {
+            tr2probe::add("[tr2] KICK-inject dst=%d pts=%lld\n", (int)ks.first,
+                          (long long)ks.second->pts);
             if (ks.first == SIDE_CPU) {
                 cpu_.Push(std::move(ks.second), runtime::NDArray());
             } else {
@@ -430,9 +425,9 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             }
         }
         if (clone_debt) {
-            AVPacket *dup = av_packet_clone(pkt.get());
+            AVPacket* dup = av_packet_clone(pkt.get());
             CHECK(dup != nullptr) << "av_packet_clone failed";
-            ffmpeg::AVPacketPtr dup_ptr(dup, [](AVPacket *p) { av_packet_free(&p); });
+            ffmpeg::AVPacketPtr dup_ptr(dup, [](AVPacket* p) { av_packet_free(&p); });
             if (debt_dst == SIDE_CPU) {
                 cpu_.Push(std::move(dup_ptr), runtime::NDArray());
             } else {
@@ -454,9 +449,9 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
         {
             std::lock_guard<std::mutex> lk(mtx_);
             int64_t front = INT64_MAX;
-            for (int64_t k = sess_.feed_gop_idx_;
-                 k < static_cast<int64_t>(sess_.gops_.size()); ++k) {
-                const GopRec &g2 = sess_.gops_[k];
+            for (int64_t k = sess_.feed_gop_idx_; k < static_cast<int64_t>(sess_.gops_.size());
+                 ++k) {
+                const GopRec& g2 = sess_.gops_[k];
                 const int64_t avail_end2 = g2.closed ? g2.pkt_end : sess_.cache_seq_;
                 if (g2.fed_upto < avail_end2) {
                     front = g2.fed_upto;
@@ -478,11 +473,9 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
         if (send_flush) {
             sess_.eof_flush_out_ = true;
             // EOF 兜底：未注入的 kick 全发（IDR 重置冲刷离场侧尾帧）
-            for (auto it = sess_.pending_kicks_.begin();
-                 it != sess_.pending_kicks_.end(); ) {
-                tr2probe::add("[tr2] KICK-backstop dst=%d pts=%lld after_gop=%lld\n",
-                                (int)it->dst, (long long)it->pkt->pts,
-                                (long long)it->after_gop);
+            for (auto it = sess_.pending_kicks_.begin(); it != sess_.pending_kicks_.end();) {
+                tr2probe::add("[tr2] KICK-backstop dst=%d pts=%lld after_gop=%lld\n", (int)it->dst,
+                              (long long)it->pkt->pts, (long long)it->after_gop);
                 ++sess_.side_pending_[it->dst];
                 kicks_[it->dst].fetch_add(1, std::memory_order_relaxed);
                 eof_kicks.emplace_back(it->dst, std::move(it->pkt));
@@ -490,7 +483,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             }
         }
     }
-    for (auto &ks : eof_kicks) {
+    for (auto& ks : eof_kicks) {
         if (ks.first == SIDE_CPU) {
             cpu_.Push(std::move(ks.second), runtime::NDArray());
         } else {
@@ -511,13 +504,12 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
     }
 }
 
-
 void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) {
     // 包缓存版（层0/1）：Push 只入缓存 + GOP 记账，供料泵在分配时点
     // 派工（见 PumpFeed）。VideoReader 对 hybrid 一律推 NDArray()（与
     // CPU 分支一致）；GPU 侧输出缓冲由工作线程从有界池 Acquire。
     if (!pkt) {
-        {   // EOF：关闭当前 GOP，泵排空后由 PumpFeed 发臂排空标记
+        {  // EOF：关闭当前 GOP，泵排空后由 PumpFeed 发臂排空标记
             std::lock_guard<std::mutex> lk(mtx_);
             if (sess_.routing_active_ && !sess_.gops_.empty() && !sess_.gops_.back().closed) {
                 CloseGopLocked();
@@ -532,10 +524,10 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
         std::lock_guard<std::mutex> lk(mtx_);
         if (!sess_.routing_active_) {
             sess_.routing_active_ = true;
-            stats_t0_us_.store(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count(),
-                std::memory_order_relaxed);
+            stats_t0_us_.store(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count(),
+                               std::memory_order_relaxed);
         }
         if (is_key) {
             if (!sess_.gops_.empty() && !sess_.gops_.back().closed) {
@@ -554,18 +546,19 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
         if (!is_key && sess_.gops_.size() >= 2) {
             const int64_t cur_start = sess_.gops_.back().start_pts;
             if (pkt->pts < cur_start) {
-                GopRec *own = nullptr;
+                GopRec* own = nullptr;
                 if (IsIdrLikeCodec()) {
-                    for (auto it = sess_.gops_.rbegin() + 1;
-                         it != sess_.gops_.rend(); ++it) {
-                        if (pkt->pts >= it->start_pts) { own = &*it; break; }
+                    for (auto it = sess_.gops_.rbegin() + 1; it != sess_.gops_.rend(); ++it) {
+                        if (pkt->pts >= it->start_pts) {
+                            own = &*it;
+                            break;
+                        }
                     }
                 } else {
-                    own = &sess_.gops_[sess_.gops_.size() - 2];   // 前一 GOP
+                    own = &sess_.gops_[sess_.gops_.size() - 2];  // 前一 GOP
                 }
                 if (own) {
-                    if (own->fed_upto >= (own->closed ? own->pkt_end
-                                                      : sess_.cache_seq_)) {
+                    if (own->fed_upto >= (own->closed ? own->pkt_end : sess_.cache_seq_)) {
                         late_feeds_.fetch_add(1, std::memory_order_relaxed);
                         const Side s2 = own->side;
                         if (s2 != Side(-1)) {
@@ -598,15 +591,14 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
     PumpFeed();
 }
 
-
 void HybridThreadedDecoder::OpenGopLocked(int64_t pts) {
     // 打开 GOP：交付 chunk（side 待分配）+ 缓存记账记录。仅 Push 线程
-    //（持 mtx_）调用。
+    // （持 mtx_）调用。
     GopRec g;
     g.id = sess_.gop_seq_;
     g.pkt_begin = sess_.cache_seq_;
     g.pkt_end = sess_.cache_seq_;
-    g.fed_upto = sess_.cache_seq_;   // 绝对序列语义：初始=区间起点
+    g.fed_upto = sess_.cache_seq_;  // 绝对序列语义：初始=区间起点
     g.start_pts = pts;
     sess_.gops_.push_back(std::move(g));
     Chunk c{Side(-1), sess_.gop_seq_, pts, INT64_MAX, 0, 0};
@@ -614,13 +606,12 @@ void HybridThreadedDecoder::OpenGopLocked(int64_t pts) {
     ++sess_.gop_seq_;
 }
 
-
 void HybridThreadedDecoder::CloseGopLocked() {
     // 关闭当前 GOP（end_pts 已由调用方写入 chunk）。expected 从 kf 索引
     // 取；分配时累计进 sess_.assigned_frames_（counted 防双计）。
     if (sess_.gops_.empty() || sess_.emit_queue_.empty()) return;
-    GopRec &g = sess_.gops_.back();
-    const Chunk &last = sess_.emit_queue_.back();
+    GopRec& g = sess_.gops_.back();
+    const Chunk& last = sess_.emit_queue_.back();
     const int64_t end_pts = last.end_pts;
     g.closed = true;
     g.pkt_end = sess_.cache_seq_;
@@ -630,7 +621,11 @@ void HybridThreadedDecoder::CloseGopLocked() {
     }
     if (exp > 0) est_chunk_frames_ = exp;
     for (auto it = sess_.emit_queue_.rbegin(); it != sess_.emit_queue_.rend(); ++it) {
-        if (it->id == g.id) { it->expected = exp; it->end_pts = end_pts; break; }
+        if (it->id == g.id) {
+            it->expected = exp;
+            it->end_pts = end_pts;
+            break;
+        }
     }
     if (exp > 0 && g.side != Side(-1) && !g.counted) {
         sess_.assigned_frames_[g.side] += exp;
@@ -638,19 +633,16 @@ void HybridThreadedDecoder::CloseGopLocked() {
     }
 }
 
-
-bool HybridThreadedDecoder::IsMarker(const runtime::NDArray &f) {
+bool HybridThreadedDecoder::IsMarker(const runtime::NDArray& f) {
     if (!f.defined()) return false;
-    const DLTensor *t = f.operator->();
+    const DLTensor* t = f.operator->();
     return t != nullptr && t->dtype.code == kDLInt && t->dtype.bits == 64;
 }
 
-
-bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
+bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray* f) {
     // 取帧优先级：stash（越界暂存）→ 子解码器 / sess_.ready_ 队列
     if (sess_.has_stash_[s]) {
-        tr2probe::add("[tr2] STASH-consume s=%d f=%lld\n",
-                      (int)s, (long long)sess_.stash_[s].pts);
+        tr2probe::add("[tr2] STASH-consume s=%d f=%lld\n", (int)s, (long long)sess_.stash_[s].pts);
         *f = sess_.stash_[s];
         sess_.has_stash_[s] = false;
         return true;
@@ -672,7 +664,7 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
         // 消费者：QueueDepth()>0 ⇒ Pop 必然立即返回（生产者只入队，
         // 无 TOCTOU）；深度 0 ⇒ 返回 false 交上层重试/安全网处置——
         // 这也是头文件「消费者线程的 Pop 永不阻塞」设计承诺的落位
-        //（CPU 侧此前是唯一违例）。
+        // （CPU 侧此前是唯一违例）。
         if (cpu_.QueueDepth() == 0) return false;
         return cpu_.Pop(f);
     }
@@ -685,26 +677,24 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray *f) {
     return f->defined();
 }
 
-
-bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
+bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
     // ── HOL 时长累账（非打印，见 .h 注释）：上次调用停在队头阻塞、本
     // 调用入口之间的墙钟计入该侧；episode 保持开启直到发射成功或双侧
     // 全空。单消费者线程读写，无并发问题。──
     if (hol_prev_side_ >= 0) {
         const auto now_tp = std::chrono::steady_clock::now();
-        int64_t dt = std::chrono::duration_cast<std::chrono::microseconds>(
-                         now_tp - hol_tp_).count();
+        int64_t dt =
+            std::chrono::duration_cast<std::chrono::microseconds>(now_tp - hol_tp_).count();
         if (dt > 50000) dt = 50000;  // 夹掉消费间隙（GC/probe 收尾等）
         if (dt > 0) {
-            hol_us_[hol_prev_side_].fetch_add(
-                dt, std::memory_order_relaxed);
+            hol_us_[hol_prev_side_].fetch_add(dt, std::memory_order_relaxed);
         }
         hol_tp_ = now_tp;
     }
-        if (err_seen_.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> lk(err_mtx_);
-            throw dmlc::Error("hybrid worker failed: " + err_msg_);
-        }
+    if (err_seen_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(err_mtx_);
+        throw dmlc::Error("hybrid worker failed: " + err_msg_);
+    }
     while (true) {
         Chunk ch;
         {
@@ -724,9 +714,9 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 // return false 挡住 → 消费者静默自旋（pop-stall 取证
                 // 只覆盖已派 chunk，覆盖不到这里）。
                 std::lock_guard<std::mutex> lk(mtx_);
-                if (!sess_.emit_queue_.empty()
-                        && sess_.emit_queue_.front().start_pts == ch.start_pts
-                        && sess_.emit_queue_.front().side == Side(-1)) {
+                if (!sess_.emit_queue_.empty() &&
+                    sess_.emit_queue_.front().start_pts == ch.start_pts &&
+                    sess_.emit_queue_.front().side == Side(-1)) {
                     sess_.emit_queue_.pop_front();
                     continue;
                 }
@@ -737,9 +727,9 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             // 失败路径触达，健康路径零成本。
             {
                 const auto now_ = std::chrono::steady_clock::now();
-                bool due = std::chrono::duration_cast<
-                    std::chrono::milliseconds>(
-                        now_ - stall_last_tp_).count() >= 3000;
+                bool due =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now_ - stall_last_tp_)
+                        .count() >= 3000;
                 if (due && stall_delay_ms_ == 0) {
                     stall_print_tp_ = now_;
                     stall_delay_ms_ = 1000;
@@ -752,8 +742,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     fprintf(stderr,
                             "\n[pop-stall3] unassigned-head eq=%zu gops=%zu "
                             "pend=%d/%d infl=%lld fp=%d\n",
-                            eqn, gsz, (int)sess_.side_pending_[0],
-                            (int)sess_.side_pending_[1],
+                            eqn, gsz, (int)sess_.side_pending_[0], (int)sess_.side_pending_[1],
                             (long long)(sess_.side_pending_[0] + sess_.side_pending_[1]),
                             (int)sess_.eof_pushed_);
                     fflush(stderr);
@@ -771,17 +760,16 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         // expected 未补满 —— 重排流的跨侧切换残留（无 kick 的 AV1 混合
         // 路由）。接受缺失帧关闭 chunk（后续陈旧丢弃保序），避免无限等待。
         // 排空（EOF 或窗缘）已武装后不适用——交给下方 eof-starve 网
-        //（1s 时间门 + GPU 侧 pending==0 判别，鲁棒于池互锁长停）。
-        if (!(sess_.eof_pushed_ || sess_.range_end_pushed_)
-                && ch.expected > 0 && ch.emitted < ch.expected
-                && sess_.side_pending_[ch.side] == 0) {
+        // （1s 时间门 + GPU 侧 pending==0 判别，鲁棒于池互锁长停）。
+        if (!(sess_.eof_pushed_ || sess_.range_end_pushed_) && ch.expected > 0 &&
+            ch.emitted < ch.expected && sess_.side_pending_[ch.side] == 0) {
             bool close_it = false;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
-                if (sess_.emit_queue_.size() > 1
-                        && sess_.emit_queue_.front().start_pts == ch.start_pts
-                        && sess_.emit_queue_.front().emitted == ch.emitted
-                        && sess_.side_pending_[ch.side] == 0) {
+                if (sess_.emit_queue_.size() > 1 &&
+                    sess_.emit_queue_.front().start_pts == ch.start_pts &&
+                    sess_.emit_queue_.front().emitted == ch.emitted &&
+                    sess_.side_pending_[ch.side] == 0) {
                     sess_.emit_queue_.pop_front();
                     close_it = true;
                 }
@@ -789,8 +777,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             if (close_it) {
                 if (getenv("DECORD_HYBRID_DEBUG")) {
                     fprintf(stderr, "[hybrid] force-close chunk start=%lld emitted=%lld/%lld\n",
-                            (long long)ch.start_pts, (long long)ch.emitted,
-                            (long long)ch.expected);
+                            (long long)ch.start_pts, (long long)ch.emitted, (long long)ch.expected);
                 }
                 continue;
             }
@@ -810,72 +797,70 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 const auto now_ = std::chrono::steady_clock::now();
                 bool due = false;
                 if (stall_delay_ms_ == 0) {
-                    due = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              now_ - stall_last_tp_).count() >= 3000;
+                    due =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now_ - stall_last_tp_)
+                            .count() >= 3000;
                 } else {
-                    due = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              now_ - stall_print_tp_).count() >= stall_delay_ms_;
+                    due = std::chrono::duration_cast<std::chrono::milliseconds>(now_ -
+                                                                                stall_print_tp_)
+                              .count() >= stall_delay_ms_;
                 }
                 if (due) {
                     stall_print_tp_ = now_;
-                    stall_delay_ms_ = stall_delay_ms_
-                        ? std::min<int64_t>(stall_delay_ms_ * 2, 60000)
-                        : 1000;
+                    stall_delay_ms_ =
+                        stall_delay_ms_ ? std::min<int64_t>(stall_delay_ms_ * 2, 60000) : 1000;
                     // 连续取空诊断：头部 chunk 与两侧队列状态（D 类定位用）。
                     // 只嵌 rmtx_ 读队列长度；chunk/pend 字段按本文件既有
                     // 调试打印惯例无锁读取（仅诊断，不保证精确快照）。
                     {
-                    std::size_t crdy, rdy;
-                    {
-                        std::lock_guard<std::mutex> lk(rmtx_);
-                        crdy = sess_.cpu_ready_.size();
-                        rdy = sess_.ready_.size();
-                    }
-                    std::size_t qpk = 0;
-                    {
-                        std::lock_guard<std::mutex> lk2(lcv_mtx_);
-                        qpk = sess_.gpu_pkt_q_.size();
-                    }
-                    std::size_t eqn = 0; int stm = 0;
-                    {
-                        std::lock_guard<std::mutex> lk3(mtx_);
-                        eqn = sess_.emit_queue_.size();
-                        stm = (sess_.has_stash_[0] ? 1 : 0) | (sess_.has_stash_[1] ? 2 : 0);
-                    }
-                    int64_t cud_p = -1, cud_b = -1, cud_o = -1;
-                    if (gpu_) gpu_->DiagDepths(&cud_p, &cud_b, &cud_o);
-                    fprintf(stderr,
-                            "\n[pop-stall] side=%d crdy=%zu rdy=%zu "
-                            "head=(side%d,%lld,end=%lld,exp=%lld,em=%lld) "
-                            "pend=%d/%d\n"
-                            "[pop-stall2] cq=%lld cp=%lld qpk=%zu eq=%zu stm=%d "
-                            "gpf=%lld gpc=%lld upf=%lld upc=%lld "
-                            "np=%d si=%d pr=%d kick=%lld/%lld fb=%d:%d/%d"
-                            " infl=%lld cud=%lld/%lld/%lld\n",
-                            (int)s, crdy, rdy,
-                            (int)ch.side, (long long)ch.start_pts,
-                            (long long)ch.end_pts, (long long)ch.expected,
-                            (long long)ch.emitted, (int)sess_.side_pending_[0],
-                            (int)sess_.side_pending_[1],
-                            (long long)cpu_.QueueDepth(),
-                            (long long)cpu_.PendingDepth(),
-                            qpk, eqn, stm,
-                            (long long)gpu_pool_.DiagFree(),
-                            (long long)gpu_pool_.DiagCreated(),
-                            (long long)up_pool_.DiagFree(),
-                            (long long)up_pool_.DiagCreated(),
-                            (int)NeedsPackets(), (int)sess_.sched_initialized_,
-                            (int)sess_.eof_cache_,
-                            (long long)kicks_[0].load(),
-                            (long long)kicks_[1].load(),
-                            (int)sess_.kick_side_, sess_.kick_cloned_, sess_.kick_owed_,
-                            (long long)(sess_.side_pending_[0] + sess_.side_pending_[1]),
-                            cud_p, cud_b, cud_o);
+                        std::size_t crdy, rdy;
+                        {
+                            std::lock_guard<std::mutex> lk(rmtx_);
+                            crdy = sess_.cpu_ready_.size();
+                            rdy = sess_.ready_.size();
+                        }
+                        std::size_t qpk = 0;
+                        {
+                            std::lock_guard<std::mutex> lk2(lcv_mtx_);
+                            qpk = sess_.gpu_pkt_q_.size();
+                        }
+                        std::size_t eqn = 0;
+                        int stm = 0;
+                        {
+                            std::lock_guard<std::mutex> lk3(mtx_);
+                            eqn = sess_.emit_queue_.size();
+                            stm = (sess_.has_stash_[0] ? 1 : 0) | (sess_.has_stash_[1] ? 2 : 0);
+                        }
+                        int64_t cud_p = -1, cud_b = -1, cud_o = -1;
+                        if (gpu_) gpu_->DiagDepths(&cud_p, &cud_b, &cud_o);
+                        fprintf(stderr,
+                                "\n[pop-stall] side=%d crdy=%zu rdy=%zu "
+                                "head=(side%d,%lld,end=%lld,exp=%lld,em=%lld) "
+                                "pend=%d/%d\n"
+                                "[pop-stall2] cq=%lld cp=%lld qpk=%zu eq=%zu stm=%d "
+                                "gpf=%lld gpc=%lld upf=%lld upc=%lld "
+                                "np=%d si=%d pr=%d kick=%lld/%lld fb=%d:%d/%d"
+                                " infl=%lld cud=%lld/%lld/%lld\n",
+                                (int)s, crdy, rdy, (int)ch.side, (long long)ch.start_pts,
+                                (long long)ch.end_pts, (long long)ch.expected,
+                                (long long)ch.emitted, (int)sess_.side_pending_[0],
+                                (int)sess_.side_pending_[1], (long long)cpu_.QueueDepth(),
+                                (long long)cpu_.PendingDepth(), qpk, eqn, stm,
+                                (long long)gpu_pool_.DiagFree(), (long long)gpu_pool_.DiagCreated(),
+                                (long long)up_pool_.DiagFree(), (long long)up_pool_.DiagCreated(),
+                                (int)NeedsPackets(), (int)sess_.sched_initialized_,
+                                (int)sess_.eof_cache_, (long long)kicks_[0].load(),
+                                (long long)kicks_[1].load(), (int)sess_.kick_side_,
+                                sess_.kick_cloned_, sess_.kick_owed_,
+                                (long long)(sess_.side_pending_[0] + sess_.side_pending_[1]), cud_p,
+                                cud_b, cud_o);
                     }
                 }
             }
-            if (dbg) fprintf(stderr, "[hybrid-p] empty side=%d emitted_total=%lld\n", (int)s, (long long)sess_.emitted_total_);
-            {   // HOL 判定：head 侧空但**对侧有存货** = 保序队头阻塞（对侧
+            if (dbg)
+                fprintf(stderr, "[hybrid-p] empty side=%d emitted_total=%lld\n", (int)s,
+                        (long long)sess_.emitted_total_);
+            {  // HOL 判定：head 侧空但**对侧有存货** = 保序队头阻塞（对侧
                 // 帧已产出却被排在后面的 chunk 卡住）；双侧全空 = 真·生产
                 // 不足，不计 HOL。
                 int64_t other = 0;
@@ -896,15 +881,14 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                         // 穿透轮：episode 入口的对侧存货分布（log2 桶×24）
                         int hb = 0;
                         for (int64_t v = other; v > 1; v >>= 1) ++hb;
-                        hol_hist_[s][hb < 23 ? hb : 23].fetch_add(
-                            1, std::memory_order_relaxed);
+                        hol_hist_[s][hb < 23 ? hb : 23].fetch_add(1, std::memory_order_relaxed);
                         hol_prev_side_ = static_cast<int>(s);
                         hol_tp_ = std::chrono::steady_clock::now();
                     }
                     int64_t mx = hol_strand_max_[s].load(std::memory_order_relaxed);
-                    while (other > mx
-                           && !hol_strand_max_[s].compare_exchange_weak(
-                               mx, other, std::memory_order_relaxed)) {}
+                    while (other > mx && !hol_strand_max_[s].compare_exchange_weak(
+                                             mx, other, std::memory_order_relaxed)) {
+                    }
                 } else {
                     hol_prev_side_ = -1;
                 }
@@ -932,33 +916,29 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             // 影响（任何产出都会走下面的重置）。
             // 重做注（2026-10-08）：窗缘排空（range_end_pushed_）同入此
             // 网——窗界 flush 后 marker 顺序竞态的失配形态与 EOF 同构。
-            if ((sess_.eof_pushed_ || sess_.range_end_pushed_)
-                    && !sess_.emit_queue_.empty()
-                    && (s == SIDE_CPU || sess_.side_pending_[s] == 0)) {
+            if ((sess_.eof_pushed_ || sess_.range_end_pushed_) && !sess_.emit_queue_.empty() &&
+                (s == SIDE_CPU || sess_.side_pending_[s] == 0)) {
                 const auto now_tp = std::chrono::steady_clock::now();
                 if (!eof_starve_on_) {
                     eof_starve_on_ = true;
                     eof_starve_tp_ = now_tp;
-                } else if (std::chrono::duration_cast<
-                        std::chrono::milliseconds>(
-                        now_tp - eof_starve_tp_).count() >= 1000) {
+                } else if (std::chrono::duration_cast<std::chrono::milliseconds>(now_tp -
+                                                                                 eof_starve_tp_)
+                               .count() >= 1000) {
                     bool closed = false;
                     {
                         std::lock_guard<std::mutex> lk(mtx_);
-                        if (!sess_.emit_queue_.empty()
-                                && sess_.emit_queue_.front().id == ch.id) {
+                        if (!sess_.emit_queue_.empty() && sess_.emit_queue_.front().id == ch.id) {
                             sess_.emit_queue_.pop_front();
                             closed = true;
                         }
                     }
                     if (closed) {
-                        force_eof_close_.fetch_add(1,
-                            std::memory_order_relaxed);
+                        force_eof_close_.fetch_add(1, std::memory_order_relaxed);
                         fprintf(stderr,
                                 "[hybrid] eof-starve force-close chunk id=%lld"
                                 " side=%d emitted=%lld/%lld\n",
-                                (long long)ch.id, (int)ch.side,
-                                (long long)ch.emitted,
+                                (long long)ch.id, (int)ch.side, (long long)ch.emitted,
                                 (long long)ch.expected);
                         fflush(stderr);
                         eof_starve_on_ = false;
@@ -977,16 +957,14 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             // 解码臂死锁。
             if (s == SIDE_GPU && gpu_) {
                 const auto now_g = std::chrono::steady_clock::now();
-                const int64_t fg_now = frames_out_[1].load(
-                    std::memory_order_relaxed);
+                const int64_t fg_now = frames_out_[1].load(std::memory_order_relaxed);
                 int64_t cp_ = -1, cb_ = -1, co_ = -1;
                 gpu_->DiagDepths(&cp_, &cb_, &co_);
                 const bool frozen_sig = cp_ > 0 && co_ == 0;
                 if (frozen_sig && gpu_stall_fg_ == fg_now) {
-                    if (std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now_g - gpu_stall_tp_).count() >= 3000) {
-                        gpu_arm_stall_.fetch_add(1,
-                            std::memory_order_relaxed);
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now_g - gpu_stall_tp_)
+                            .count() >= 3000) {
+                        gpu_arm_stall_.fetch_add(1, std::memory_order_relaxed);
                         arm_stalled_.store(true, std::memory_order_release);
                         fprintf(stderr,
                                 "[hybrid] GPU arm stalled: CU decode worker "
@@ -1001,18 +979,17 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     gpu_stall_fg_ = fg_now;
                 }
             }
-            PumpFeed(true);   // 同 A4：空取=头部饥饿，强制泵推进
+            PumpFeed(true);  // 同 A4：空取=头部饥饿，强制泵推进
             return false;
         }
         // PopSide 成功 = 有进展（marker/陈旧丢弃/越界暂存/发射同此之后）：
-        eof_starve_on_ = false;   // EOF 尾恢复网的空窗计时清零
+        eof_starve_on_ = false;  // EOF 尾恢复网的空窗计时清零
         // stall 报警状态在此清零（见上方 stall 取证注释）。
         stall_last_tp_ = std::chrono::steady_clock::now();
         stall_delay_ms_ = 0;
         if (IsMarker(f)) {
             // 子解码器排空（排空已武装后出现）。
-            if (s == SIDE_CPU
-                    && (sess_.eof_pushed_ || sess_.range_end_pushed_)) {
+            if (s == SIDE_CPU && (sess_.eof_pushed_ || sess_.range_end_pushed_)) {
                 // 全局排空转发（重做，2026-10-08）：子解码器 marker 是
                 // **侧语义**（载荷恒 0），全局语义（真 EOF / 硬窗缘）由
                 // 本合并层按 eof_cache_ 铸造新载荷——reader 的 kInt64
@@ -1021,35 +998,31 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                 // C-57 一族缺陷的构造性根源）。清空合并队列后转发；
                 // 后续 marker 继续透传。
                 const bool is_eof = sess_.eof_cache_;
-                tr2probe::add("[tr2] MARKER-forward ch=%lld s%d em=%lld/%lld"
-                              " eq=%zu kind=%s\n",
-                              (long long)ch.id, (int)ch.side,
-                              (long long)ch.emitted, (long long)ch.expected,
-                              sess_.emit_queue_.size(),
-                              is_eof ? "EOF" : "WINDOW_END");
+                tr2probe::add(
+                    "[tr2] MARKER-forward ch=%lld s%d em=%lld/%lld"
+                    " eq=%zu kind=%s\n",
+                    (long long)ch.id, (int)ch.side, (long long)ch.emitted, (long long)ch.expected,
+                    sess_.emit_queue_.size(), is_eof ? "EOF" : "WINDOW_END");
                 std::lock_guard<std::mutex> lk(mtx_);
                 sess_.emit_queue_.pop_front();
                 sess_.emit_queue_.clear();
                 hol_prev_side_ = -1;
-                *frame = MakeDrainMarker(is_eof ? kDrainMarkerEOF
-                                                 : kDrainMarkerWindowEnd);
+                *frame = MakeDrainMarker(is_eof ? kDrainMarkerEOF : kDrainMarkerWindowEnd);
                 return true;
             }
             // GPU drain marker（或 CPU 侧未推流的 marker）：吞掉，
             // chunk 完成，继续下一 chunk
-            tr2probe::add("[tr2] MARKER-swallow ch=%lld s%d em=%lld/%lld\n",
-                             (long long)ch.id, (int)ch.side,
-                             (long long)ch.emitted, (long long)ch.expected);
+            tr2probe::add("[tr2] MARKER-swallow ch=%lld s%d em=%lld/%lld\n", (long long)ch.id,
+                          (int)ch.side, (long long)ch.emitted, (long long)ch.expected);
             std::lock_guard<std::mutex> lk(mtx_);
             sess_.emit_queue_.pop_front();
             continue;
         }
         if (f.pts < ch.start_pts) {
             tr2probe::add("[tr2] STALE ch=%lld s%d [%lld,%lld) f=%lld em=%lld/%lld\n",
-                             (long long)ch.id, (int)ch.side,
-                             (long long)ch.start_pts, (long long)ch.end_pts,
-                             (long long)f.pts, (long long)ch.emitted,
-                             (long long)ch.expected);
+                          (long long)ch.id, (int)ch.side, (long long)ch.start_pts,
+                          (long long)ch.end_pts, (long long)f.pts, (long long)ch.emitted,
+                          (long long)ch.expected);
             // 陈旧帧（kick 边界帧在 expected 补齐后残留等）：丢弃
             // 取证硬化（2026-09-28 夜间轮）：陈旧排放活锁假设——每次
             // Pop 内部丢一帧（PopSide 成功复位停滞计时器）后取空返回
@@ -1063,11 +1036,11 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     fprintf(stderr,
                             "\n[stale-drain] n=%lld head=(side%d,%lld,%lld) "
                             "pend=%d/%d em=%lld/%lld eq=%zu fp=%d\n",
-                            (long long)stale_in_call, (int)ch.side,
-                            (long long)ch.start_pts, (long long)ch.end_pts,
-                            (int)sess_.side_pending_[0], (int)sess_.side_pending_[1],
-                            (long long)ch.emitted, (long long)ch.expected,
-                            sess_.emit_queue_.size(), (int)sess_.eof_pushed_);
+                            (long long)stale_in_call, (int)ch.side, (long long)ch.start_pts,
+                            (long long)ch.end_pts, (int)sess_.side_pending_[0],
+                            (int)sess_.side_pending_[1], (long long)ch.emitted,
+                            (long long)ch.expected, sess_.emit_queue_.size(),
+                            (int)sess_.eof_pushed_);
                     fflush(stderr);
                 }
             }
@@ -1081,10 +1054,9 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             // 迟到帧继续从该侧产出、正常发射计数；expected 补满时在
             // 发射路径关闭 chunk。
             tr2probe::add("[tr2] STASH ch=%lld s%d [%lld,%lld) f=%lld em=%lld/%lld\n",
-                             (long long)ch.id, (int)ch.side,
-                             (long long)ch.start_pts, (long long)ch.end_pts,
-                             (long long)f.pts, (long long)ch.emitted,
-                             (long long)ch.expected);
+                          (long long)ch.id, (int)ch.side, (long long)ch.start_pts,
+                          (long long)ch.end_pts, (long long)f.pts, (long long)ch.emitted,
+                          (long long)ch.expected);
             std::lock_guard<std::mutex> lk(mtx_);
             CHECK(!sess_.has_stash_[s]) << "stash overflow: side " << s;
             sess_.stash_[s] = f;
@@ -1095,17 +1067,18 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (!sess_.emit_queue_.empty()) {
-                Chunk &front = sess_.emit_queue_.front();
+                Chunk& front = sess_.emit_queue_.front();
                 ++front.emitted;
                 tr2probe::add("[tr2] EMIT ch=%lld s%d [%lld,%lld) f=%lld em=%lld/%lld%s\n",
-                                 (long long)ch.id, (int)ch.side,
-                                 (long long)ch.start_pts, (long long)ch.end_pts,
-                                 (long long)f.pts, (long long)front.emitted,
-                                 (long long)front.expected,
-                                 (front.expected > 0 && front.emitted >= front.expected
-                                  && front.end_pts != INT64_MAX) ? " CLOSE" : "");
-                if (front.expected > 0 && front.emitted >= front.expected
-                        && front.end_pts != INT64_MAX) {
+                              (long long)ch.id, (int)ch.side, (long long)ch.start_pts,
+                              (long long)ch.end_pts, (long long)f.pts, (long long)front.emitted,
+                              (long long)front.expected,
+                              (front.expected > 0 && front.emitted >= front.expected &&
+                               front.end_pts != INT64_MAX)
+                                  ? " CLOSE"
+                                  : "");
+                if (front.expected > 0 && front.emitted >= front.expected &&
+                    front.end_pts != INT64_MAX) {
                     // 补满 expected 且非末 chunk：关闭。stash 里的越界帧
                     // 轮到该侧下一 chunk 时先出（pts 落在其区间或陈旧丢弃）
                     sess_.emit_queue_.pop_front();
@@ -1130,12 +1103,12 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
                     int64_t c = frames_out_[0].load(), g = frames_out_[1].load();
                     fprintf(stderr,
                             "\n[emit-tl] t=%.2f total=%lld c=%lld(+%lld) g=%lld(+%lld) rate=%.0f",
-                            std::chrono::duration<double>(
-                                now.time_since_epoch()).count(),
-                            (long long)tl_total, (long long)c, (long long)(c - tl_c),
-                            (long long)g, (long long)(g - tl_g),
-                            dt > 0 ? 256.0 / dt : 0.0);
-                    tl_tp = now; tl_c = c; tl_g = g;
+                            std::chrono::duration<double>(now.time_since_epoch()).count(),
+                            (long long)tl_total, (long long)c, (long long)(c - tl_c), (long long)g,
+                            (long long)(g - tl_g), dt > 0 ? 256.0 / dt : 0.0);
+                    tl_tp = now;
+                    tl_c = c;
+                    tl_g = g;
                 }
             }
         }
@@ -1154,9 +1127,9 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
     // 同款一次性时间门控（stall_last_tp_ 由任何 PopSide 成功复位）。
     if (!PopSide(SIDE_CPU, frame)) {
         const auto now_ = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(
-                now_ - stall_last_tp_).count() >= 3000
-                && stall_delay_ms_ == 0) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now_ - stall_last_tp_).count() >=
+                3000 &&
+            stall_delay_ms_ == 0) {
             stall_print_tp_ = now_;
             stall_delay_ms_ = 1000;
             std::size_t crdy = 0, rdy = 0;
@@ -1168,21 +1141,16 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray *frame) {
             fprintf(stderr,
                     "\n[pop-stall4] empty-queue fallthrough crdy=%zu rdy=%zu "
                     "cq=%lld cp=%lld fp=%d ef=%d/%d\n",
-                    crdy, rdy, (long long)cpu_.QueueDepth(),
-                    (long long)cpu_.PendingDepth(),
-                    (int)sess_.eof_pushed_, (int)sess_.arm_flush_sent_,
-                    (int)sess_.eof_flush_out_);
+                    crdy, rdy, (long long)cpu_.QueueDepth(), (long long)cpu_.PendingDepth(),
+                    (int)sess_.eof_pushed_, (int)sess_.arm_flush_sent_, (int)sess_.eof_flush_out_);
             fflush(stderr);
         }
         return false;
     }
-    if (IsMarker(*frame)
-            && (sess_.eof_pushed_ || sess_.range_end_pushed_)) {
-        *frame = MakeDrainMarker(sess_.eof_cache_ ? kDrainMarkerEOF
-                                                  : kDrainMarkerWindowEnd);
+    if (IsMarker(*frame) && (sess_.eof_pushed_ || sess_.range_end_pushed_)) {
+        *frame = MakeDrainMarker(sess_.eof_cache_ ? kDrainMarkerEOF : kDrainMarkerWindowEnd);
     }
     return true;
 }
-
 
 }  // namespace decord

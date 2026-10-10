@@ -74,23 +74,20 @@ namespace decord {
  *  - expected 帧数由 VideoReader 的关键帧索引提供（SetKeyframeRanks）。
  */
 
-
 namespace {
 /*! 调度粘性：同侧最少连续分配的 chunk 数（块状分配，防流水线冷启动） */
 #if defined(_WIN32)
-std::vector<unsigned long> SnapshotThreads();   // 定义见亲和分区节
+std::vector<unsigned long> SnapshotThreads();  // 定义见亲和分区节
 bool SetThreadAffinity(unsigned long tid, uintptr_t mask);
 #endif
 }  // namespace
-
 
 /*! 工作线程异常统一收口（2026-09-19 崩溃类修复；2026-09-20 改 per-instance
  *  成员——原进程级全局槽在多 reader 并存时任一 reader 的 worker 异常会
  *  污染所有 hybrid reader 的 Pop，引擎池 _POOL_MAX_TOTAL=16 下不可接受）：
  *  记录原消息（Pop 处转 DECORDError）+ 打 stderr 一份（即使 Pop 未被
  *  再调用也能留诊断）。 */
-void HybridThreadedDecoder::TrapWorkerError(const char *who,
-                                            const std::exception &e) {
+void HybridThreadedDecoder::TrapWorkerError(const char* who, const std::exception& e) {
     {
         std::lock_guard<std::mutex> lk(err_mtx_);
         if (!err_seen_.load()) {
@@ -102,10 +99,8 @@ void HybridThreadedDecoder::TrapWorkerError(const char *who,
     fflush(stderr);
 }
 
-HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
-                                             AVCodecParameters *codecpar,
-                                             const AVInputFormat *iformat,
-                                             bool output_cuda)
+HybridThreadedDecoder::HybridThreadedDecoder(int device_id, AVCodecParameters* codecpar,
+                                             const AVInputFormat* iformat, bool output_cuda)
     : cpu_(), device_id_(device_id), out_cuda_(output_cuda) {
     // 包缓存字节预算（供料期派工的 demux 领先界；最小 64MB）。
     // kick_guard_ 默认 0 = 只发单个 IDR kick、不做债务克隆——旧反馈式
@@ -114,13 +109,13 @@ HybridThreadedDecoder::HybridThreadedDecoder(int device_id,
     // 活锁，实测 hevc 12000 帧挂死）。离场侧 DPB 尾帧由其下一次自身
     // GOP 的 IDR 自然冲刷；>0 可恢复克隆护栏（酷刑流复测用）。
     kick_guard_ = 0;
-    if (const char *e = getenv("DECORD_HYBRID_KICK_BURST")) {
+    if (const char* e = getenv("DECORD_HYBRID_KICK_BURST")) {
         kick_guard_ = atoi(e);
     }
     // 遥测穿透轮：份额轨迹默认关（首 1024 个派工决策，ring 4KB——
     // 诊断时开，A/B 热路径零成本）
     trace_on_ = getenv("DECORD_HYBRID_TRACE") != nullptr;
-    if (const char *e = getenv("DECORD_HYBRID_PKT_CACHE_MB")) {
+    if (const char* e = getenv("DECORD_HYBRID_PKT_CACHE_MB")) {
         const long long v = atoll(e);
         if (v > 0) cache_budget_ = static_cast<size_t>(v) << 20;
     }
@@ -155,9 +150,9 @@ void PinnedHostFramePool::Reset(std::size_t max_cap, std::size_t frame_bytes,
     shape_ = std::move(shape);
 }
 
-bool PinnedHostFramePool::Acquire(runtime::NDArray *out) {
+bool PinnedHostFramePool::Acquire(runtime::NDArray* out) {
     if (disabled_ || max_cap_ == 0 || bytes_ == 0) return false;
-    void *p = nullptr;
+    void* p = nullptr;
     bool need_alloc = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -184,21 +179,20 @@ bool PinnedHostFramePool::Acquire(runtime::NDArray *out) {
         }
     }
     if (p == nullptr) return false;
-    Holder *h = new Holder{shared_from_this(), p, bytes_};
-    *out = runtime::NDArray::FromRecycled(p, shape_, kUInt8,
-                                          DLDevice{kDLCPU, 0},
-                                          &ReturnDeleter, h);
+    Holder* h = new Holder{shared_from_this(), p, bytes_};
+    *out =
+        runtime::NDArray::FromRecycled(p, shape_, kUInt8, DLDevice{kDLCPU, 0}, &ReturnDeleter, h);
     return true;
 }
 
-void PinnedHostFramePool::ReturnDeleter(runtime::NDArray::Container *self) {
-    auto *h = static_cast<Holder *>(self->manager_ctx);
+void PinnedHostFramePool::ReturnDeleter(runtime::NDArray::Container* self) {
+    auto* h = static_cast<Holder*>(self->manager_ctx);
     h->pool->Return(h->data, h->bytes);
     delete h;
     delete self;
 }
 
-void PinnedHostFramePool::Return(void *data, std::size_t bytes) {
+void PinnedHostFramePool::Return(void* data, std::size_t bytes) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (!disabled_ && bytes == bytes_ && free_.size() < max_cap_) {
         free_.push_back(data);
@@ -207,8 +201,8 @@ void PinnedHostFramePool::Return(void *data, std::size_t bytes) {
     }
 }
 
-void HybridGpuBufferPool::Reset(
-        std::size_t cap, std::vector<int64_t> shape, DLDataType dtype, DLDevice dev) {
+void HybridGpuBufferPool::Reset(std::size_t cap, std::vector<int64_t> shape, DLDataType dtype,
+                                DLDevice dev) {
     std::lock_guard<std::mutex> lk(mtx_);
     // 旧形状的缓冲直接解除池关联（析构走通用释放路径）
     while (!free_.empty()) {
@@ -248,7 +242,7 @@ void HybridGpuBufferPool::Stop() {
     cv_.notify_all();
 }
 
-bool HybridGpuBufferPool::Acquire(runtime::NDArray *out) {
+bool HybridGpuBufferPool::Acquire(runtime::NDArray* out) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (!free_.empty()) {
         *out = free_.front();
@@ -272,17 +266,17 @@ bool HybridGpuBufferPool::Acquire(runtime::NDArray *out) {
     return false;
 }
 
-void HybridGpuBufferPool::Deleter(runtime::NDArray::Container *ptr) {
+void HybridGpuBufferPool::Deleter(runtime::NDArray::Container* ptr) {
     if (!ptr) return;
     if (ptr->manager_ctx == nullptr) {
         if (ptr->dl_tensor.data != nullptr) {
-            runtime::DeviceAPI::Get(ptr->dl_tensor.device)->FreeDataSpace(
-                ptr->dl_tensor.device, ptr->dl_tensor.data);
+            runtime::DeviceAPI::Get(ptr->dl_tensor.device)
+                ->FreeDataSpace(ptr->dl_tensor.device, ptr->dl_tensor.data);
         }
         delete ptr;
         return;
     }
-    auto *pool = static_cast<HybridGpuBufferPool *>(ptr->manager_ctx);
+    auto* pool = static_cast<HybridGpuBufferPool*>(ptr->manager_ctx);
     {
         std::lock_guard<std::mutex> lk(pool->mtx_);
         if (pool->free_.size() + 1 > pool->cap_) {
@@ -297,16 +291,14 @@ void HybridGpuBufferPool::Deleter(runtime::NDArray::Container *ptr) {
         }
     }
     if (ptr->dl_tensor.data != nullptr) {
-        runtime::DeviceAPI::Get(ptr->dl_tensor.device)->FreeDataSpace(
-            ptr->dl_tensor.device, ptr->dl_tensor.data);
+        runtime::DeviceAPI::Get(ptr->dl_tensor.device)
+            ->FreeDataSpace(ptr->dl_tensor.device, ptr->dl_tensor.data);
     }
     delete ptr;
 }
 
-
-void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
-                                             int height, int rotation,
-                                             int output_format) {
+void HybridThreadedDecoder::SetCodecContext(AVCodecContext* dec_ctx, int width, int height,
+                                            int rotation, int output_format) {
     width_ = width;
     height_ = height;
     rotation_ = rotation;
@@ -339,9 +331,9 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
         // GPU 子解码器需要自己的 AVCodecContext（CUThreadedDecoder 的
         // SetCodecContext 同样接管所有权）。用 bsf 转换后的副本参数
         // （extradata 已是 annexb，cuvid parser 需要）单独 open。
-        const AVCodec *codec = avcodec_find_decoder(gpu_codecpar_->codec_id);
+        const AVCodec* codec = avcodec_find_decoder(gpu_codecpar_->codec_id);
         CHECK(codec != nullptr) << "avcodec_find_decoder failed for hybrid GPU side";
-        AVCodecContext *gctx = avcodec_alloc_context3(codec);
+        AVCodecContext* gctx = avcodec_alloc_context3(codec);
         CHECK(gctx != nullptr) << "avcodec_alloc_context3 failed";
         CHECK_GE(avcodec_parameters_to_context(gctx, gpu_codecpar_.get()), 0)
             << "avcodec_parameters_to_context failed (hybrid GPU side)";
@@ -351,9 +343,7 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
             << "avcodec_open2 failed (hybrid GPU side)";
         gpu_->SetCodecContext(gctx, width, height, rotation, output_format);
         // GPU 输出缓冲池（预算已在函数开头 ComputeBudgets 就位）
-        gpu_pool_.Reset(gpu_pool_frames_,
-                        gpu_frame_shape_, kUInt8,
-                        DLDevice{kDLCUDA, device_id_});
+        gpu_pool_.Reset(gpu_pool_frames_, gpu_frame_shape_, kUInt8, DLDevice{kDLCUDA, device_id_});
         // 事件驱动：子解码器产出 / 池回收 → 即时唤醒工作线程
         gpu_->SetOnOutput([this](bool marker) {
             if (!marker) GpuFrameProduced();
@@ -370,10 +360,10 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
         } else {
             // pinned 主机帧池（D2H 直达最终帧）：池深 = ready 预算 +
             // 在途/余量 —— pinned 只是替换 ready 帧原有的 pageable 分配
-            //（内存总量不变，非分页锁定）。cudaHostAlloc 失败自动禁用
+            // （内存总量不变，非分页锁定）。cudaHostAlloc 失败自动禁用
             // 回退暂存路径；DECORD_HYBRID_PINNED_POOL=0 显式关闭。
             static const bool pinned_on = [] {
-                const char *e = getenv("DECORD_HYBRID_PINNED_POOL");
+                const char* e = getenv("DECORD_HYBRID_PINNED_POOL");
                 return e == nullptr || atoi(e) != 0;
             }();
             if (pinned_on) {
@@ -381,31 +371,27 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext *dec_ctx, int width,
                     pinned_pool_ = std::make_shared<PinnedHostFramePool>();
                 }
                 pinned_pool_->Reset(
-                    static_cast<std::size_t>(ready_cap_frames_)
-                        + kD2HRingSlots + 16,
+                    static_cast<std::size_t>(ready_cap_frames_) + kD2HRingSlots + 16,
                     static_cast<std::size_t>(frame_bytes_), gpu_frame_shape_);
             }
         }
     }
 }
 
-
 void HybridThreadedDecoder::SetKeyframeRanks(std::vector<int64_t> pts_list,
-                                              std::vector<int64_t> rank_list,
-                                              int64_t frame_count) {
+                                             std::vector<int64_t> rank_list, int64_t frame_count) {
     // VideoReader 在关键帧索引就绪后调用：chunk expected = rank 差。
     std::lock_guard<std::mutex> lk(mtx_);
     kf_pts_ = std::move(pts_list);
     kf_rank_ = std::move(rank_list);
     frame_count_ = frame_count;
     // pts/每帧 线性估计（CFR 下精确；VFR 为均值近似，调度启发式可接受）
-    if (kf_pts_.size() >= 2 && kf_rank_.back() > kf_rank_.front()
-            && kf_pts_.back() > kf_pts_.front()) {
-        pts_per_frame_ = static_cast<double>(kf_pts_.back() - kf_pts_.front())
-            / static_cast<double>(kf_rank_.back() - kf_rank_.front());
+    if (kf_pts_.size() >= 2 && kf_rank_.back() > kf_rank_.front() &&
+        kf_pts_.back() > kf_pts_.front()) {
+        pts_per_frame_ = static_cast<double>(kf_pts_.back() - kf_pts_.front()) /
+                         static_cast<double>(kf_rank_.back() - kf_rank_.front());
     }
 }
-
 
 void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
     // CPU 侧 filter 图支持热切换；GPU 侧输出池尺寸固定（与 VideoReader
@@ -415,9 +401,9 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
     if (gpu_) gpu_->SetRoi(x1, y1, x2, y2);
     int w = x2 - x1, h = y2 - y1;
     if (w > 0 && h > 0) {
-        if (frames_out_[0].load() != 0 || frames_out_[1].load() != 0
-                || !sess_.emit_queue_.empty() || !sess_.gpu_pkt_q_.empty()
-                || !sess_.ready_.empty() || !sess_.cpu_ready_.empty()) {
+        if (frames_out_[0].load() != 0 || frames_out_[1].load() != 0 ||
+            !sess_.emit_queue_.empty() || !sess_.gpu_pkt_q_.empty() || !sess_.ready_.empty() ||
+            !sess_.cpu_ready_.empty()) {
             LOG(FATAL) << "hybrid SetRoi must be called before any decode "
                        << "(frames cpu=" << frames_out_[0].load()
                        << " gpu=" << frames_out_[1].load() << ")";
@@ -437,8 +423,7 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
         // 退化近交替（av1 损耗 29.5%）。ROI 帧 5.4KB × 8192 ≈ 44MB。
         {
             auto clampi = [](double v, int lo, int hi) {
-                return (int)std::max<double>(double(lo),
-                                             std::min<double>(v, double(hi)));
+                return (int)std::max<double>(double(lo), std::min<double>(v, double(hi)));
             };
             const double fb_roi = (double)frame_bytes_;
             if (out_cuda_ && fb_roi > 0) {
@@ -448,14 +433,10 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
                 // 实测 up_nobuf=44888 = 上载池耗尽退避）。字节权威：帽=
                 // max(旧帽, 字节帽/帧字节)，字节帽 gpu=512MB/up=256MB
                 // （queue RAM 512MB）——内存有界性不变，小帧帧数放开。
-                const int hi_gpu = std::max(8192, (int)(512.0 * 1048576
-                                                       / fb_roi));
-                const int hi_up = std::max(4096, (int)(256.0 * 1048576
-                                                      / fb_roi));
-                gpu_pool_frames_ = clampi(vram_budget_ * 0.65 / fb_roi,
-                                          96, hi_gpu);
-                up_pool_frames_ = clampi(vram_budget_ * 0.35 / fb_roi,
-                                         48, hi_up);
+                const int hi_gpu = std::max(8192, (int)(512.0 * 1048576 / fb_roi));
+                const int hi_up = std::max(4096, (int)(256.0 * 1048576 / fb_roi));
+                gpu_pool_frames_ = clampi(vram_budget_ * 0.65 / fb_roi, 96, hi_gpu);
+                up_pool_frames_ = clampi(vram_budget_ * 0.35 / fb_roi, 48, hi_up);
                 ready_cap_frames_ = gpu_pool_frames_ + up_pool_frames_ + 64;
                 // CPU 臂银行（2026-09-13 缺口分解）：ComputeBudgets 的
                 // queue_frames_ 按**全帧**字节算出 1536 帧帽（4.8GB RAM 时代
@@ -465,43 +446,36 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
                 // 重算：ROI 帧按 RAM 预算放开到 4096；解码线程背压解耦到
                 // raw 队列并按全帧字节预算（768MB）封顶 —— 全帧内存风险
                 // 由 raw 帽独立承担，ROI 银行不再被合并计价错杀。
-                const int hi_q = std::max(4096, (int)(512.0 * 1048576
-                                                     / fb_roi));
+                const int hi_q = std::max(4096, (int)(512.0 * 1048576 / fb_roi));
                 queue_frames_ = clampi(ram_budget_ * 0.45 / fb_roi, 96, hi_q);
                 cpu_.SetQueueDepth(queue_frames_);
-                const int64_t raw_bytes = static_cast<int64_t>(width_) > 0
-                    && static_cast<int64_t>(height_) > 0
+                const int64_t raw_bytes =
+                    static_cast<int64_t>(width_) > 0 && static_cast<int64_t>(height_) > 0
                         ? static_cast<int64_t>(width_) * height_ * 3 / 2
                         : 3 * 1024 * 1024;
-                cpu_.SetRawQueueFrames(clampi(
-                    768.0 * 1024 * 1024 / static_cast<double>(raw_bytes),
-                    128, 4096));
+                cpu_.SetRawQueueFrames(
+                    clampi(768.0 * 1024 * 1024 / static_cast<double>(raw_bytes), 128, 4096));
             }
         }
-        gpu_pool_.Reset(gpu_pool_frames_,
-                        gpu_frame_shape_, kUInt8,
-                        DLDevice{kDLCUDA, device_id_});
+        gpu_pool_.Reset(gpu_pool_frames_, gpu_frame_shape_, kUInt8, DLDevice{kDLCUDA, device_id_});
         if (out_cuda_) {
             up_pool_.Reset(up_pool_frames_, gpu_frame_shape_, kUInt8,
                            DLDevice{kDLCUDA, device_id_});
         } else if (pinned_pool_) {
             // ROI 重建：帧尺寸已变，池按新尺寸重建（在途旧块归还时
             // 按尺寸直接释放）
-            pinned_pool_->Reset(
-                static_cast<std::size_t>(ready_cap_frames_)
-                    + kD2HRingSlots + 16,
-                static_cast<std::size_t>(frame_bytes_), gpu_frame_shape_);
+            pinned_pool_->Reset(static_cast<std::size_t>(ready_cap_frames_) + kD2HRingSlots + 16,
+                                static_cast<std::size_t>(frame_bytes_), gpu_frame_shape_);
         }
     }
 }
 
-
 void HybridThreadedDecoder::Start() {
     if (getenv("DECORD_HYBRID_FLIGHT")) {
-        FILE *lf = fopen("decord_hybrid_flight.log", "a");
+        FILE* lf = fopen("decord_hybrid_flight.log", "a");
         if (lf) {
-            fprintf(lf, "# start lander_run=%d flight_run=%d\n",
-                    (int)lander_run_.load(), (int)flight_run_.load());
+            fprintf(lf, "# start lander_run=%d flight_run=%d\n", (int)lander_run_.load(),
+                    (int)flight_run_.load());
             fclose(lf);
         }
     }
@@ -521,13 +495,10 @@ void HybridThreadedDecoder::Start() {
                 if (auto ep = std::current_exception()) {
                     try {
                         std::rethrow_exception(ep);
-                    } catch (const std::exception &e) {
-                        fprintf(stderr,
-                                "[decord] TERMINATE: uncaught exception: %s\n",
-                                e.what());
+                    } catch (const std::exception& e) {
+                        fprintf(stderr, "[decord] TERMINATE: uncaught exception: %s\n", e.what());
                     } catch (...) {
-                        fprintf(stderr,
-                                "[decord] TERMINATE: unknown exception\n");
+                        fprintf(stderr, "[decord] TERMINATE: unknown exception\n");
                     }
                 } else {
                     fprintf(stderr, "[decord] TERMINATE called\n");
@@ -545,8 +516,7 @@ void HybridThreadedDecoder::Start() {
                 // 的 H2D 会与消费侧已提交未执行的拷贝读-写竞态（实测
                 // CPU chunk 边界帧偶发内容差）。与 CU 解码器 stream_
                 // 同为 blocking，两流间无互斥，NVDEC 不被上载阻塞。
-                cudaStreamCreateWithFlags(
-                    reinterpret_cast<cudaStream_t *>(&up_stream_), 0);
+                cudaStreamCreateWithFlags(reinterpret_cast<cudaStream_t*>(&up_stream_), 0);
             }
             std::thread u(&HybridThreadedDecoder::UploaderLoop, this);
             uploader_ = std::move(u);
@@ -564,16 +534,15 @@ void HybridThreadedDecoder::Start() {
         // 差分本轮新增线程：lander/uploader → service；其余新增（cpu_
         // 解码 worker / filter worker）→ decode。此前直接把存量+新增
         // 全归 service，把 cpu_ worker 也钉去服务核 → CPU 臂饿死。
-        const unsigned long lander_tid = lander_.joinable()
-            ? GetThreadId(lander_.native_handle()) : 0;
-        const unsigned long uploader_tid = uploader_.joinable()
-            ? GetThreadId(uploader_.native_handle()) : 0;
+        const unsigned long lander_tid =
+            lander_.joinable() ? GetThreadId(lander_.native_handle()) : 0;
+        const unsigned long uploader_tid =
+            uploader_.joinable() ? GetThreadId(uploader_.native_handle()) : 0;
         auto after = SnapshotThreads();
         std::sort(after.begin(), after.end());
         std::sort(pre_tids.begin(), pre_tids.end());
         std::vector<unsigned long> added;
-        std::set_difference(after.begin(), after.end(),
-                            pre_tids.begin(), pre_tids.end(),
+        std::set_difference(after.begin(), after.end(), pre_tids.begin(), pre_tids.end(),
                             std::back_inserter(added));
         for (DWORD tid : added) {
             if (tid == lander_tid || tid == uploader_tid) {
@@ -584,23 +553,25 @@ void HybridThreadedDecoder::Start() {
                 }
             }
         }
-        PinRemainingToService();   // 存量（python/TRT/引擎）
+        PinRemainingToService();  // 存量（python/TRT/引擎）
     }
 #endif
 }
 
-
 void HybridThreadedDecoder::StopGpuWorker() {
     bool dbg = getenv("DECORD_HYBRID_DEBUG") != nullptr;
     if (getenv("DECORD_HYBRID_FLIGHT")) {
-        FILE *lf = fopen("decord_hybrid_flight.log", "a");
-        if (lf) { fprintf(lf, "# gpu-worker-stop\n"); fclose(lf); }
+        FILE* lf = fopen("decord_hybrid_flight.log", "a");
+        if (lf) {
+            fprintf(lf, "# gpu-worker-stop\n");
+            fclose(lf);
+        }
     }
     lander_run_.store(false);
     lcv_.notify_all();
     gpu_pool_.Stop();  // 唤醒阻塞在 Acquire 的工作线程
     up_pool_.Stop();
-    flight_run_.store(false);   // 记录器先停（10ms 步进退出，先于 join）
+    flight_run_.store(false);  // 记录器先停（10ms 步进退出，先于 join）
     if (flight_th_.joinable()) {
         flight_th_.join();
     }
@@ -618,7 +589,7 @@ void HybridThreadedDecoder::StopGpuWorker() {
         cudaStreamDestroy(reinterpret_cast<cudaStream_t>(up_stream_));
         up_stream_ = nullptr;
     }
-    for (auto &slot : up_staging_) {
+    for (auto& slot : up_staging_) {
         if (slot != nullptr) {
             cudaFreeHost(slot);
             slot = nullptr;
@@ -629,14 +600,14 @@ void HybridThreadedDecoder::StopGpuWorker() {
         cudaStreamDestroy(reinterpret_cast<cudaStream_t>(d2h_stream_));
         d2h_stream_ = nullptr;
     }
-    for (auto &slot : d2h_staging_) {
+    for (auto& slot : d2h_staging_) {
         if (slot != nullptr) {
             cudaFreeHost(slot);
             slot = nullptr;
         }
     }
     d2h_bytes_ = 0;
-    for (auto &ev : d2h_ev_) {
+    for (auto& ev : d2h_ev_) {
         if (ev != nullptr) {
             cudaEventDestroy(reinterpret_cast<cudaEvent_t>(ev));
             ev = nullptr;
@@ -645,7 +616,6 @@ void HybridThreadedDecoder::StopGpuWorker() {
     if (dbg) fprintf(stderr, "[hybrid-d] worker joined\n");
 }
 
-
 void HybridThreadedDecoder::SetDecodeWindowRange(int64_t lo, int64_t hi) {
     // 与 NeedsPackets/PumpFeed 同线程（消费线程），无竞态。跨会话存活：
     // reader 每次 seek 落锚重推（RefreshWindowRange），无累积。
@@ -653,7 +623,6 @@ void HybridThreadedDecoder::SetDecodeWindowRange(int64_t lo, int64_t hi) {
     window_lo_ = lo;
     window_hi_ = hi;
 }
-
 
 bool HybridThreadedDecoder::HasPartialSupplyLocked() const {
     // 游标 GOP 已派侧且未供完 → 边界 GOP 仍需 demux 供包（硬窗的解码
@@ -668,14 +637,11 @@ bool HybridThreadedDecoder::HasPartialSupplyLocked() const {
     // ② 已闭合未喂完（fed_upto < pkt_end）。
     // ③ 已闭合且迟到包未尽。
     if (sess_.feed_gop_idx_ >= static_cast<int64_t>(sess_.gops_.size())) return false;
-    const GopRec &g = sess_.gops_[sess_.feed_gop_idx_];
-    if (g.side == Side(-1)) return false;   // 未派侧 = 窗外，不供
-    if (!g.closed) return true;             // ①已派未闭合：须读到闭合
-    return g.fed_upto < g.pkt_end
-        || g.straggler_idx
-               < static_cast<int64_t>(g.stragglers.size());
+    const GopRec& g = sess_.gops_[sess_.feed_gop_idx_];
+    if (g.side == Side(-1)) return false;  // 未派侧 = 窗外，不供
+    if (!g.closed) return true;            // ①已派未闭合：须读到闭合
+    return g.fed_upto < g.pkt_end || g.straggler_idx < static_cast<int64_t>(g.stragglers.size());
 }
-
 
 std::string HybridThreadedDecoder::HybridStatsProbe() {
     // 与 Stop() 的 stderr 汇总同源，另补 HOL 直方图与份额轨迹（穿透轮新增）。
@@ -684,11 +650,11 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     // 负责解析。字符串拼装只在快照时刻发生一次（µs 级），不在热路径。
     char buf[64];
     std::string out;
-    auto kv = [&](const char *k, long long v) {
+    auto kv = [&](const char* k, long long v) {
         snprintf(buf, sizeof(buf), "%s=%lld;", k, v);
         out += buf;
     };
-    auto kvf = [&](const char *k, double v) {
+    auto kvf = [&](const char* k, double v) {
         snprintf(buf, sizeof(buf), "%s=%.3f;", k, v);
         out += buf;
     };
@@ -713,8 +679,7 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     // 兼容旧键（未设窗 = -1）。
     kv("window_lo", window_hi_ > window_lo_ ? window_lo_ : -1);
     kv("window_hi", window_hi_ > window_lo_ ? window_hi_ : -1);
-    kv("window_frames", window_hi_ > window_lo_ ? window_hi_ - window_lo_
-                                                 : -1);
+    kv("window_frames", window_hi_ > window_lo_ ? window_hi_ - window_lo_ : -1);
     kv("assigned_total", sess_.assigned_frames_[0] + sess_.assigned_frames_[1]);
     kv("hol_us_c", hol_us_[0].load());
     kv("hol_ev_c", hol_ev_[0].load());
@@ -743,9 +708,9 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
         kv("up_frames", fr);
         kvf("up_avg_batch", fn > 0 ? (double)fr / (double)fn : 0.0);
         kv("up_nobuf", up_nobuf_.load());
-    kv("pool_frames", (long long)gpu_pool_frames_);
-    kv("up_pool_frames", (long long)up_pool_frames_);
-    kv("queue_frames", (long long)queue_frames_);
+        kv("pool_frames", (long long)gpu_pool_frames_);
+        kv("up_pool_frames", (long long)up_pool_frames_);
+        kv("queue_frames", (long long)queue_frames_);
         kv("up_cempty", up_cempty_.load());
     }
     // 份额轨迹（仅 DECORD_HYBRID_TRACE=1 且有样本时；扁平 csv 四元组）
@@ -753,9 +718,8 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     if (trace_on_ && tn > 0) {
         out += "trace=";
         for (size_t i = 0; i < tn; ++i) {
-            snprintf(buf, sizeof(buf), "%s%.0f,%.0f,%.1f,%.1f", i ? ";" : "",
-                     trace_ring_[i * 4], trace_ring_[i * 4 + 1],
-                     trace_ring_[i * 4 + 2], trace_ring_[i * 4 + 3]);
+            snprintf(buf, sizeof(buf), "%s%.0f,%.0f,%.1f,%.1f", i ? ";" : "", trace_ring_[i * 4],
+                     trace_ring_[i * 4 + 1], trace_ring_[i * 4 + 2], trace_ring_[i * 4 + 3]);
             out += buf;
         }
         // trace 用 ';' 分隔四元组、',' 分隔字段（与 kv 的 ';' 终结符冲突：
@@ -764,9 +728,8 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     return out;
 }
 
-
 void HybridThreadedDecoder::Stop() {
-    HybridThreadedTrace2Dump();   // TR2 取证：close 时一次性 dump（无 TRACE2 则空操作）
+    HybridThreadedTrace2Dump();  // TR2 取证：close 时一次性 dump（无 TRACE2 则空操作）
     if (getenv("DECORD_HYBRID_DEBUG")) {
         fprintf(stderr, "[hybrid] chunks cpu=%d gpu=%d frames cpu=%lld gpu=%lld\n",
                 sess_.chunks_assigned_[0], sess_.chunks_assigned_[1],
@@ -780,28 +743,25 @@ void HybridThreadedDecoder::Stop() {
         fprintf(stderr,
                 "\n[hybrid-stats] mode=%s frames c=%lld g=%lld chunks c=%d g=%d"
                 " kicks c=%lld g=%lld clones=%lld\n",
-                out_cuda_ ? "gpu-out" : "cpu-out",
-                (long long)frames_out_[0].load(), (long long)frames_out_[1].load(),
-                sess_.chunks_assigned_[0], sess_.chunks_assigned_[1],
-                (long long)kicks_[0].load(), (long long)kicks_[1].load(),
+                out_cuda_ ? "gpu-out" : "cpu-out", (long long)frames_out_[0].load(),
+                (long long)frames_out_[1].load(), sess_.chunks_assigned_[0],
+                sess_.chunks_assigned_[1], (long long)kicks_[0].load(), (long long)kicks_[1].load(),
                 (long long)fb_clones_.load());
-        fprintf(stderr,
-                "[hybrid-stats] disp gops c=%d g=%d cache_peak=%zuMB late=%lld strag=%lld rc_now=%.0f"
-                " rg_now=%.0f assigned c=%lld g=%lld\n",
-                sess_.chunks_assigned_[0], sess_.chunks_assigned_[1],
-                cache_peak_bytes_ >> 20,
-                (long long)late_feeds_.load(std::memory_order_relaxed),
-                (long long)strag_total_.load(std::memory_order_relaxed),
-                cpu_.ProductionRate(),
-                gpu_rate_landed_.load(std::memory_order_relaxed),
-                (long long)sess_.assigned_frames_[0], (long long)sess_.assigned_frames_[1]);
+        fprintf(
+            stderr,
+            "[hybrid-stats] disp gops c=%d g=%d cache_peak=%zuMB late=%lld strag=%lld rc_now=%.0f"
+            " rg_now=%.0f assigned c=%lld g=%lld\n",
+            sess_.chunks_assigned_[0], sess_.chunks_assigned_[1], cache_peak_bytes_ >> 20,
+            (long long)late_feeds_.load(std::memory_order_relaxed),
+            (long long)strag_total_.load(std::memory_order_relaxed), cpu_.ProductionRate(),
+            gpu_rate_landed_.load(std::memory_order_relaxed), (long long)sess_.assigned_frames_[0],
+            (long long)sess_.assigned_frames_[1]);
         fprintf(stderr,
                 "[hybrid-stats] hol cpu-head us=%lld ev=%lld strandmax=%lld"
                 " | gpu-head us=%lld ev=%lld strandmax=%lld\n",
                 (long long)hol_us_[0].load(), (long long)hol_ev_[0].load(),
-                (long long)hol_strand_max_[0].load(),
-                (long long)hol_us_[1].load(), (long long)hol_ev_[1].load(),
-                (long long)hol_strand_max_[1].load());
+                (long long)hol_strand_max_[0].load(), (long long)hol_us_[1].load(),
+                (long long)hol_ev_[1].load(), (long long)hol_strand_max_[1].load());
         // 忙时分解（2026-09-12 可见性）：cpu_us/gpu_us = 两臂各自实际
         // 解码墙钟（CPU=worker 取包→解码完成；GPU=cuvidDecodePicture
         // 提交时长）。与 frames c/g 联合得每臂有效解码速率（busy fps）；
@@ -810,8 +770,7 @@ void HybridThreadedDecoder::Stop() {
         fprintf(stderr,
                 "[hybrid-stats] busy cpu_us=%lld pkts=%lld"
                 " | gpu_us=%lld pics=%lld\n",
-                (long long)cpu_.DecodeBusyUs(),
-                (long long)cpu_.DecodeBusyPkts(),
+                (long long)cpu_.DecodeBusyUs(), (long long)cpu_.DecodeBusyPkts(),
                 (long long)(gpu_ ? gpu_->DecodeBusyUs() : 0),
                 (long long)(gpu_ ? gpu_->DecodeBusyPics() : 0));
         if (out_cuda_) {
@@ -820,14 +779,13 @@ void HybridThreadedDecoder::Stop() {
             fprintf(stderr,
                     "[hybrid-stats] upload flushes=%lld frames=%lld avg_batch=%.2f"
                     " nobuf=%lld cpuempty=%lld\n",
-                    fn, fr, fn > 0 ? (double)fr / (double)fn : 0.0,
-                    (long long)up_nobuf_.load(), (long long)up_cempty_.load());
+                    fn, fr, fn > 0 ? (double)fr / (double)fn : 0.0, (long long)up_nobuf_.load(),
+                    (long long)up_cempty_.load());
         }
     }
     cpu_.Stop();
     if (gpu_) gpu_->Stop();
 }
-
 
 void HybridThreadedDecoder::Clear() {
     StopGpuWorker();
@@ -835,7 +793,6 @@ void HybridThreadedDecoder::Clear() {
     if (gpu_) gpu_->Clear();
     ResetRouting();
 }
-
 
 void HybridThreadedDecoder::ResetRouting() {
     // 会话重置（窗口架构重做，2026-10-08）：整体重建 SessionState，
@@ -856,7 +813,6 @@ void HybridThreadedDecoder::ResetRouting() {
     // kf 索引保留：Seek 后复用帧数表
 }
 
-
 #if defined(_WIN32)
 #include <tlhelp32.h>
 namespace {
@@ -864,7 +820,8 @@ std::vector<unsigned long> SnapshotThreads() {
     std::vector<unsigned long> out;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) return out;
-    THREADENTRY32 te{}; te.dwSize = sizeof(te);
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
     DWORD pid = GetCurrentProcessId();
     if (Thread32First(snap, &te)) {
         do {
@@ -877,8 +834,7 @@ std::vector<unsigned long> SnapshotThreads() {
     return out;
 }
 bool SetThreadAffinity(DWORD tid, uintptr_t mask) {
-    HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
-                          FALSE, tid);
+    HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, tid);
     if (!h) return false;
     BOOL ok = SetThreadAffinityMask(h, static_cast<DWORD_PTR>(mask));
     CloseHandle(h);
@@ -892,32 +848,29 @@ void HybridThreadedDecoder::InitAffinityMasks() {
     // env：DECORD_HYBRID_DECODE_CORES=物理核数（0/未设=关；-1=默认
     // total-3）。仅在单 processor group（逻辑核 ≤64）平台生效。
     int want = 0;
-    if (const char *e = getenv("DECORD_HYBRID_DECODE_CORES")) want = atoi(e);
-    if (want == 0) return;   // 未设/0 = 关（引擎在 TRT 路径显式开）
+    if (const char* e = getenv("DECORD_HYBRID_DECODE_CORES")) want = atoi(e);
+    if (want == 0) return;    // 未设/0 = 关（引擎在 TRT 路径显式开）
     if (want < 0) want = -1;  // -1 = 默认 total-3 分区
     DWORD need = 0;
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &need)
-            && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &need) &&
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
         return;
     }
     std::vector<char> buf(need);
     if (!GetLogicalProcessorInformationEx(
             RelationProcessorCore,
-            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()),
-            &need)) {
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &need)) {
         return;
     }
-    std::vector<uintptr_t> core_masks;   // 每物理核的 SMT 掩码
+    std::vector<uintptr_t> core_masks;  // 每物理核的 SMT 掩码
     size_t off = 0;
     while (off < need) {
-        auto *pi = reinterpret_cast<
-            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
+        auto* pi = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
         if (pi->Relationship == RelationProcessorCore) {
             uintptr_t m = 0;
             for (WORD g = 0; g < pi->Processor.GroupCount; ++g) {
                 if (pi->Processor.GroupMask[g].Group == 0) {
-                    m |= static_cast<uintptr_t>(
-                        pi->Processor.GroupMask[g].Mask);
+                    m |= static_cast<uintptr_t>(pi->Processor.GroupMask[g].Mask);
                 }
             }
             if (m) core_masks.push_back(m);
@@ -928,22 +881,24 @@ void HybridThreadedDecoder::InitAffinityMasks() {
     const int total = static_cast<int>(core_masks.size());
     int ndec = want > 0 ? want : (total - 3);
     if (ndec < 2) ndec = 2;
-    if (ndec > total - 1) ndec = total - 1;   // service 至少 1 物理核
+    if (ndec > total - 1) ndec = total - 1;  // service 至少 1 物理核
     uintptr_t dm = 0, sm = 0;
     for (int i = 0; i < total; ++i) {
-        if (i < ndec) dm |= core_masks[i]; else sm |= core_masks[i];
+        if (i < ndec)
+            dm |= core_masks[i];
+        else
+            sm |= core_masks[i];
     }
     if (!dm || !sm) return;
     decode_mask_ = dm;
     service_mask_ = sm;
     affinity_on_ = true;
     if (getenv("DECORD_HYBRID_DEBUG")) {
-        fprintf(stderr, "[hybrid-affinity] phys=%d decode=%llu service=%llu\n",
-                total, (unsigned long long)dm, (unsigned long long)sm);
+        fprintf(stderr, "[hybrid-affinity] phys=%d decode=%llu service=%llu\n", total,
+                (unsigned long long)dm, (unsigned long long)sm);
     }
 #endif
 }
-
 
 bool HybridThreadedDecoder::Drained() const {
     {
@@ -964,12 +919,10 @@ bool HybridThreadedDecoder::Drained() const {
     return true;
 }
 
-
 void HybridThreadedDecoder::SuggestDiscardPTS(std::vector<int64_t> dts) {
     cpu_.SuggestDiscardPTS(dts);
     if (gpu_) gpu_->SuggestDiscardPTS(dts);
 }
-
 
 void HybridThreadedDecoder::ClearDiscardPTS() {
     cpu_.ClearDiscardPTS();
@@ -982,8 +935,7 @@ void HybridThreadedDecoder::PinFfmpegThreads() {
     auto after = SnapshotThreads();
     std::sort(after.begin(), after.end());
     std::vector<unsigned long> added;
-    std::set_difference(after.begin(), after.end(),
-                        aff_baseline_.begin(), aff_baseline_.end(),
+    std::set_difference(after.begin(), after.end(), aff_baseline_.begin(), aff_baseline_.end(),
                         std::back_inserter(added));
     int pinned = 0;
     for (DWORD tid : added) {
@@ -993,8 +945,7 @@ void HybridThreadedDecoder::PinFfmpegThreads() {
         }
     }
     if (getenv("DECORD_HYBRID_DEBUG")) {
-        fprintf(stderr, "[hybrid-affinity] pinned %d ffmpeg threads to decode set\n",
-                pinned);
+        fprintf(stderr, "[hybrid-affinity] pinned %d ffmpeg threads to decode set\n", pinned);
     }
 #endif
 }
@@ -1006,8 +957,7 @@ void HybridThreadedDecoder::PinRemainingToService() {
     auto all = SnapshotThreads();
     std::sort(all.begin(), all.end());
     std::vector<unsigned long> others;
-    std::set_difference(all.begin(), all.end(),
-                        decode_tids_.begin(), decode_tids_.end(),
+    std::set_difference(all.begin(), all.end(), decode_tids_.begin(), decode_tids_.end(),
                         std::back_inserter(others));
     int pinned = 0;
     for (DWORD tid : others) {
@@ -1018,6 +968,5 @@ void HybridThreadedDecoder::PinRemainingToService() {
     }
 #endif
 }
-
 
 }  // namespace decord

@@ -57,28 +57,26 @@ void HybridThreadedTrace2Dump();
  *  3.1MB 分配器churn）。池尽 = LandStep 背压（回退旧路径无需）。
  *  块由 deleter 归还复用；尺寸不匹配（ROI 重建）的旧块直接释放。
  */
-class PinnedHostFramePool
-        : public std::enable_shared_from_this<PinnedHostFramePool> {
-  public:
-    void Reset(std::size_t max_cap, std::size_t frame_bytes,
-               std::vector<int64_t> shape);
-    bool Acquire(runtime::NDArray *out);   ///< 非阻塞；false = 池尽/禁用
+class PinnedHostFramePool : public std::enable_shared_from_this<PinnedHostFramePool> {
+   public:
+    void Reset(std::size_t max_cap, std::size_t frame_bytes, std::vector<int64_t> shape);
+    bool Acquire(runtime::NDArray* out);  ///< 非阻塞；false = 池尽/禁用
     bool Enabled() const { return max_cap_ > 0 && !disabled_; }
     std::size_t frame_bytes() const { return bytes_; }
     void MarkDisabled() { disabled_ = true; }
 
-  private:
+   private:
     struct Holder {
         std::shared_ptr<PinnedHostFramePool> pool;
-        void *data;
+        void* data;
         std::size_t bytes;
     };
-    static void ReturnDeleter(runtime::NDArray::Container *self);
-    void Return(void *data, std::size_t bytes);
+    static void ReturnDeleter(runtime::NDArray::Container* self);
+    void Return(void* data, std::size_t bytes);
     std::mutex mtx_;
-    std::deque<void *> free_;
+    std::deque<void*> free_;
     std::size_t created_ = 0;
-    std::size_t cap_ = 0;       ///< 当前允许的已建块数（耗尽翻倍）
+    std::size_t cap_ = 0;  ///< 当前允许的已建块数（耗尽翻倍）
     std::size_t max_cap_ = 0;
     std::size_t bytes_ = 0;
     bool disabled_ = false;
@@ -93,14 +91,13 @@ class PinnedHostFramePool
  *  friendship），回收时唤醒等待者。
  */
 class HybridGpuBufferPool {
-  public:
-    void Reset(std::size_t cap, std::vector<int64_t> shape,
-               DLDataType dtype, DLDevice dev);
+   public:
+    void Reset(std::size_t cap, std::vector<int64_t> shape, DLDataType dtype, DLDevice dev);
     ~HybridGpuBufferPool();
     void Start();
     void Stop();
     /*! \brief 尝试取一块缓冲；池空且已建满时返回 false（不阻塞） */
-    bool Acquire(runtime::NDArray *out);
+    bool Acquire(runtime::NDArray* out);
     /*! \brief 缓冲回收回调（Deleter 触发）：混合解码器用它即时唤醒
      *  喂包/上载线程（池耗尽时的重试延迟从 1ms 轮询降为即时）。 */
     void SetOnRelease(std::function<void()> cb) { on_release_ = std::move(cb); }
@@ -119,9 +116,9 @@ class HybridGpuBufferPool {
      *  互斥即可与消费侧在途拷贝保序（否则二者互相排队，上载被消费
      *  拷贝序列化，实测 hevc 上载链掉到 ~700fps）。 */
     /*! \brief Acquire 拿到缓冲后调用：等待其上次消费拷贝完成 */
-    static void Deleter(runtime::NDArray::Container *ptr);
+    static void Deleter(runtime::NDArray::Container* ptr);
 
-  private:
+   private:
     std::mutex mtx_;
     std::condition_variable cv_;
     std::deque<runtime::NDArray> free_;
@@ -140,7 +137,7 @@ class CUThreadedDecoder;
 }  // namespace cuda
 
 class HybridThreadedDecoder : public ThreadedDecoderInterface {
-  public:
+   public:
     /*!
      * \brief 构造混合解码器（GPU 侧立即初始化 NVDEC 子解码器）。
      * \param device_id CUDA 设备号
@@ -152,14 +149,12 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      */
     /* output_cuda: true = hybrid_gpu —— 输出帧驻留显存（GPU chunk
      * 零拷贝、CPU chunk H2D 上载）；false = 输出统一落 CPU。 */
-    HybridThreadedDecoder(int device_id,
-                          AVCodecParameters *codecpar,
-                          const AVInputFormat *iformat,
+    HybridThreadedDecoder(int device_id, AVCodecParameters* codecpar, const AVInputFormat* iformat,
                           bool output_cuda = false);
     ~HybridThreadedDecoder() override;
 
-    void SetCodecContext(AVCodecContext *dec_ctx, int width = -1, int height = -1,
-                         int rotation = 0, int output_format = 0) override;
+    void SetCodecContext(AVCodecContext* dec_ctx, int width = -1, int height = -1, int rotation = 0,
+                         int output_format = 0) override;
     void SetRoi(int x1, int y1, int x2, int y2) override;
     void Start() override;
     void Stop() override;
@@ -178,7 +173,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool HasPartialSupplyLocked() const;
     void Clear() override;
     void Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) override;
-    bool Pop(runtime::NDArray *frame) override;
+    bool Pop(runtime::NDArray* frame) override;
     bool Drained() const override;
     void SuggestDiscardPTS(std::vector<int64_t> dts) override;
     void ClearDiscardPTS() override;
@@ -186,20 +181,19 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief 供 VideoReader 在关键帧索引就绪后注入 (pts, rank) 表与
      *  总帧数 —— chunk 的 expected 帧数 = 相邻关键帧 rank 之差，
      *  是合并逻辑 "补满才关 chunk" 的基准。 */
-    void SetKeyframeRanks(std::vector<int64_t> pts_list,
-                          std::vector<int64_t> rank_list,
+    void SetKeyframeRanks(std::vector<int64_t> pts_list, std::vector<int64_t> rank_list,
                           int64_t frame_count);
 
-  private:
+   private:
     enum Side : int { SIDE_CPU = 0, SIDE_GPU = 1 };
 
     struct Chunk {
         Side side;
-        int64_t id;              ///< 绝对 GOP 序号（与 GopRec.id 对齐）
-        int64_t start_pts;   ///< chunk 首帧（关键帧）pts
-        int64_t end_pts;     ///< 下一关键帧 pts；最后一个 chunk 为 INT64_MAX
-        int64_t expected;    ///< 该 chunk 应发射的帧数（kf rank 差；0=未知）
-        int64_t emitted;     ///< 已发射帧数
+        int64_t id;         ///< 绝对 GOP 序号（与 GopRec.id 对齐）
+        int64_t start_pts;  ///< chunk 首帧（关键帧）pts
+        int64_t end_pts;    ///< 下一关键帧 pts；最后一个 chunk 为 INT64_MAX
+        int64_t expected;   ///< 该 chunk 应发射的帧数（kf rank 差；0=未知）
+        int64_t emitted;    ///< 已发射帧数
     };
 
     /*! \brief 重置路由/合并状态（Seek/Clear 时调用；保留速率 EWMA 与 kf 索引） */
@@ -219,9 +213,9 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief 该 codec 的关键帧是否 IDR 型（决定可否用 kick 冲刷/混合路由） */
     bool IsIdrLikeCodec() const;
     /*! \brief 取一帧（stash 优先 → CPU 子解码器 / GPU sess_.ready_ 队列） */
-    bool PopSide(Side s, runtime::NDArray *f);
+    bool PopSide(Side s, runtime::NDArray* f);
     /*! \brief GPU 帧搬到主机内存（布局两侧逐字节一致，整块 D2H） */
-    static runtime::NDArray ToHost(const runtime::NDArray &gpu_frame);
+    static runtime::NDArray ToHost(const runtime::NDArray& gpu_frame);
     /*! \brief 落地线程主循环：只做 LandStep（NVDEC 收帧 → D2H → sess_.ready_） */
     void GpuWorkerLoop();
     /*! \brief 落地一步：sess_.ready_ 有余量才 gpu_->Pop → D2H → sess_.ready_。
@@ -241,7 +235,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief 上载专用非阻塞 CUDA 流。同步 H2D 若走 legacy 默认流，
      *  会与 CU 解码器 stream_（blocking 流）互斥 —— 每次上载都整体暂停
      *  NVDEC/转换管线（实测 hevc hybrid_gpu 被压到 0.75x）。 */
-    void *up_stream_ = nullptr;
+    void* up_stream_ = nullptr;
     /*! \brief 上载批大小：≤up_batch_ 帧逐帧 pinned+async 提交，批末一次
      *  cudaStreamSynchronize 统一收割（摊销同步开销；宿主 memcpy 与
      *  H2D 在批内重叠）。运行期默认 8，`DECORD_HYBRID_UPLOAD_BATCH`
@@ -268,22 +262,22 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief pinned 暂存槽（每批帧各一槽，仅上载线程访问）：pageable
      *  H2D 走驱动内 staging（WDDM 下 ~1.2ms/帧），pinned H2D ~0.4ms。
      *  批内帧的槽到批末 sync 前都保持占用（H2D 源数据保活）。 */
-    void *up_staging_[kUploadBatch] = {};
+    void* up_staging_[kUploadBatch] = {};
     std::size_t up_stage_bytes_ = 0;
     /*! \brief D2H 异步中转环（仅 CPU-out 模式，工作线程访问）：GPU 帧
      *  cudaMemcpyAsync 到 pinned 槽，滞后 kD2HRingSlots 帧收割（事件
      *  已远，零等待）+ memcpy 到宿主 NDArray 入 sess_.ready_。此前同步 D2H
      *  串行在 LandStep（每帧 ~0.5-1ms），GPU 侧落地被压到 ~1200fps。 */
     static constexpr int kD2HRingSlots = 8;
-    void *d2h_staging_[kD2HRingSlots] = {};
-    void *d2h_ev_[kD2HRingSlots] = {};          ///< cudaEvent_t
+    void* d2h_staging_[kD2HRingSlots] = {};
+    void* d2h_ev_[kD2HRingSlots] = {};          ///< cudaEvent_t
     runtime::NDArray d2h_host_[kD2HRingSlots];  ///< 目标宿主帧（保活）
     runtime::NDArray d2h_gpu_[kD2HRingSlots];   ///< 源 GPU 帧（事件前不回池）
     bool d2h_valid_[kD2HRingSlots] = {};
     bool d2h_pooled_[kD2HRingSlots] = {};  ///< host 帧来自 pinned 池（收割零拷贝）
     int64_t d2h_seq_ = 0;
     std::size_t d2h_bytes_ = 0;
-    void *d2h_stream_ = nullptr;   ///< D2H 专用非阻塞流（与 NVDEC 流并行）
+    void* d2h_stream_ = nullptr;  ///< D2H 专用非阻塞流（与 NVDEC 流并行）
     /*! \brief pinned 主机帧池（CPU-out）：D2H 直达最终帧，消除暂存
      *  memcpy + 每帧 Empty 分配。池深随 ready 预算（自适应上限），
      *  池尽 = 背压；cudaHostAlloc 失败自动降级回暂存路径。 */
@@ -298,13 +292,13 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief 停滞飞行记录器线程体（hybrid/recorder.cc，取证用） */
     void FlightRecorderLoop();
     /*! rief 终态取证：VideoReader FATAL 前调用（接口默认空实现） */
-    void DumpState(const char *tag) const override;
+    void DumpState(const char* tag) const override;
     bool ArmStalled() const override;
     void ClearArmStall() override;
     /*! \brief 停止并回收 GPU 工作线程（Stop/Clear 共用） */
     void StopGpuWorker();
     /*! \brief kInt64 drain marker 判定（与 NextFrameImpl 的判据一致） */
-    static bool IsMarker(const runtime::NDArray &f);
+    static bool IsMarker(const runtime::NDArray& f);
     /*! \brief GPU 输出缓冲池形状（与 VideoReader::FrameShape 同语义） */
     std::vector<int64_t> GpuFrameShape() const;
     /* 输出形状（fmt: 0=RGB24, 1=GRAY8, 2=YUV420 packed 2D）：
@@ -320,9 +314,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     /*! \brief demux 领先深度建议。包缓存设计下 demux 领先由**字节预算**
      *  （cache_budget_）在 NeedsPackets 门控，此建议不再承载调度语义，
      *  恒返回稳态深度。 */
-    int SuggestPrefetchDepth() const override {
-        return prefetch_frames_;
-    }
+    int SuggestPrefetchDepth() const override { return prefetch_frames_; }
     /*! 重试推包门控（包缓存版）：demux 继续读 = 缓存未超预算；另有
      *  **饥饿逃生门**——缓存超预算但某侧银行未满时仍放行（读到的包
      *  会立刻被供料泵分给饥饿侧、缓存回落），否则会出现"缓存满且两侧
@@ -332,8 +324,8 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  demux），路由状态无竞态。 */
     bool NeedsPackets() const override {
         if (sess_.eof_cache_) return false;
-        if (sess_.kick_side_ != Side(-1)
-                && sess_.side_pending_[sess_.kick_side_] - sess_.kick_cloned_ > 0) {
+        if (sess_.kick_side_ != Side(-1) &&
+            sess_.side_pending_[sess_.kick_side_] - sess_.kick_cloned_ > 0) {
             return true;
         }
         // 硬窗界（区间版，2026-10-08 重做）：窗缘已知（已见起始帧号 ≥
@@ -350,8 +342,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
         if (sess_.cache_bytes_ < cache_budget_) return true;
         const int64_t cpu_cap = static_cast<int64_t>(queue_frames_);
         const int64_t gpu_cap = static_cast<int64_t>(ready_cap_frames_);
-        return sess_.side_pending_[SIDE_CPU] < cpu_cap
-            || sess_.side_pending_[SIDE_GPU] < gpu_cap;
+        return sess_.side_pending_[SIDE_CPU] < cpu_cap || sess_.side_pending_[SIDE_GPU] < gpu_cap;
     }
 
     /*! \brief GPU 输出缓冲池（有界，阻塞 Acquire）。声明在 gpu_ 之前：
@@ -480,23 +471,23 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     // 侧分配整个 GOP——分配永远发生在两侧速率成熟之后，窗口妥协消失。
     // 交付端（sess_.emit_queue_/expected/kick/陈旧丢弃）零改动。
     struct GopRec {
-        int64_t id;              ///< 绝对 GOP 序号（与 sess_.emit_queue_ Chunk.id 对齐）
-        int64_t start_pts;       ///< GOP 首帧（关键帧）pts（迟到包归属用）
-        int64_t pkt_begin;       ///< cache 序列区间 [begin, end)
-        int64_t pkt_end;         ///< 关闭时 = sess_.cache_seq_（主区间终点）
-        int64_t fed_upto = 0;    ///< 主区间已供到的绝对序列
-        int64_t straggler_idx = 0;  ///< stragglers 已供下标
+        int64_t id;                         ///< 绝对 GOP 序号（与 sess_.emit_queue_ Chunk.id 对齐）
+        int64_t start_pts;                  ///< GOP 首帧（关键帧）pts（迟到包归属用）
+        int64_t pkt_begin;                  ///< cache 序列区间 [begin, end)
+        int64_t pkt_end;                    ///< 关闭时 = sess_.cache_seq_（主区间终点）
+        int64_t fed_upto = 0;               ///< 主区间已供到的绝对序列
+        int64_t straggler_idx = 0;          ///< stragglers 已供下标
         Side side = static_cast<Side>(-1);  ///< 分配侧（-1 = 未分配）
-        bool closed = false;     ///< 下一关键帧已到 / EOF
-        bool counted = false;    ///< expected 已累计进 sess_.assigned_frames_
+        bool closed = false;                ///< 下一关键帧已到 / EOF
+        bool counted = false;               ///< expected 已累计进 sess_.assigned_frames_
         std::vector<ffmpeg::AVPacketPtr> stragglers;  ///< 关闭后迟到的非 key 包
     };
-    size_t cache_peak_bytes_ = 0;  ///< 峰值（stats；跨会话累计）
-    size_t cache_budget_ = 512u << 20;  ///< 默认 512MB（构造期读 env）
-    void PumpFeed(bool force_head = false);               ///< 供料泵（仅 Push 调用线程=demux 执行）
+    size_t cache_peak_bytes_ = 0;            ///< 峰值（stats；跨会话累计）
+    size_t cache_budget_ = 512u << 20;       ///< 默认 512MB（构造期读 env）
+    void PumpFeed(bool force_head = false);  ///< 供料泵（仅 Push 调用线程=demux 执行）
     // ── 层2/3 亲和分区（env 门控，默认关）────────────────────────────
     // 两组掩码：decode（ffmpeg 帧线程，物理核×N 的 SMT 对）与 service
-    //（喂料/落地/上载/消费/OCR 宿主线程）。动机：混跑干扰税实测 CPU 臂
+    // （喂料/落地/上载/消费/OCR 宿主线程）。动机：混跑干扰税实测 CPU 臂
     // busy-rate −15~17%（32T 与服务线程抢 SMT/LLC，线程档扫描证明加/
     // 减线程无解，需空间分区）。DECORD_HYBRID_DECODE_CORES=N（物理核数，
     // 0=关）；存量线程在 Start() 时归 service（除已被钉为 decode 的）。
@@ -506,8 +497,8 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     uintptr_t decode_mask_ = 0;
     uintptr_t service_mask_ = 0;
     bool affinity_on_ = false;
-    std::vector<unsigned long> decode_tids_;  ///< 已钉 decode 的线程 id
-    std::vector<unsigned long> aff_baseline_; ///< avcodec_open2 前的线程快照
+    std::vector<unsigned long> decode_tids_;   ///< 已钉 decode 的线程 id
+    std::vector<unsigned long> aff_baseline_;  ///< avcodec_open2 前的线程快照
     /*! \brief 从缓存克隆一个包（供 kick 用；越界/已回收返回空） */
     ffmpeg::AVPacketPtr CloneCachePacket(int64_t seq);
     /*! \brief 延迟 kick：换侧时离场侧当前 GOP 未供完 → 克隆包挂起，
@@ -516,7 +507,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     struct PendingKick {
         ffmpeg::AVPacketPtr pkt;
         Side dst;
-        int64_t after_gop;   ///< 该 GOP 供完（游标越过）才发送
+        int64_t after_gop;  ///< 该 GOP 供完（游标越过）才发送
     };
     /*! ══════════════════════════════════════════════════════════════
      *  \brief 会话状态（窗口架构重做，2026-10-08）
@@ -540,37 +531,37 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  与既有嵌套一致）。 */
     struct SessionState {
         // ── 路由/派工（demux 单线程）──
-        bool routing_active_ = false;   ///< 已见到首包
-        Side last_fed_side_ = Side(-1); ///< 供料侧（kick 判定用；Side(-1)=尚无）
-        bool sched_initialized_ = false;///< 双侧速率首次就绪后已重置 alloc
-        int64_t gop_seq_ = 0;           ///< 下一 GOP 的绝对 id
-        int kick_owed_ = 0;             ///< 切换时刻债务快照（诊断用）
-        int kick_cloned_ = 0;           ///< 本次切换已克隆包数
-        Side kick_side_ = Side(-1);     ///< 债务侧；Side(-1) = 未武装
+        bool routing_active_ = false;     ///< 已见到首包
+        Side last_fed_side_ = Side(-1);   ///< 供料侧（kick 判定用；Side(-1)=尚无）
+        bool sched_initialized_ = false;  ///< 双侧速率首次就绪后已重置 alloc
+        int64_t gop_seq_ = 0;             ///< 下一 GOP 的绝对 id
+        int kick_owed_ = 0;               ///< 切换时刻债务快照（诊断用）
+        int kick_cloned_ = 0;             ///< 本次切换已克隆包数
+        Side kick_side_ = Side(-1);       ///< 债务侧；Side(-1) = 未武装
         std::vector<PendingKick> pending_kicks_;
         // ── 包缓存 + GOP 记账（demux 写 / 泵消费，同线程）──
         std::deque<ffmpeg::AVPacketPtr> pkt_cache_;  ///< 压缩包缓存
-        int64_t cache_seq_ = 0;        ///< 下一包的绝对序列号
-        int64_t cache_base_seq_ = 0;   ///< pkt_cache_.front() 的绝对序列号
-        size_t cache_bytes_ = 0;       ///< 在缓压缩字节（NeedsPackets 预算用）
-        std::vector<GopRec> gops_;     ///< 全部 GOP 的缓存记账
-        int64_t feed_gop_idx_ = 0;     ///< 下一个未供 GOP 的 gops_ 下标
-        bool eof_cache_ = false;       ///< demux EOF 已入缓
-        bool arm_flush_sent_ = false;  ///< 排空标记已武装（幂等）
+        int64_t cache_seq_ = 0;                      ///< 下一包的绝对序列号
+        int64_t cache_base_seq_ = 0;                 ///< pkt_cache_.front() 的绝对序列号
+        size_t cache_bytes_ = 0;                     ///< 在缓压缩字节（NeedsPackets 预算用）
+        std::vector<GopRec> gops_;                   ///< 全部 GOP 的缓存记账
+        int64_t feed_gop_idx_ = 0;                   ///< 下一个未供 GOP 的 gops_ 下标
+        bool eof_cache_ = false;                     ///< demux EOF 已入缓
+        bool arm_flush_sent_ = false;                ///< 排空标记已武装（幂等）
         int chunks_assigned_[2] = {0, 0};
         int64_t assigned_frames_[2] = {0, 0};  ///< 各侧分账帧数（份额 governor 用）
         // ── 合并/发射（mtx_）──
-        std::deque<Chunk> emit_queue_;      ///< 按分配顺序待发射的 chunk
-        runtime::NDArray stash_[2];         ///< 各侧越界帧暂存（kick 产物等）
+        std::deque<Chunk> emit_queue_;  ///< 按分配顺序待发射的 chunk
+        runtime::NDArray stash_[2];     ///< 各侧越界帧暂存（kick 产物等）
         bool has_stash_[2] = {false, false};
-        bool eof_pushed_ = false;        ///< **真 EOF** 排空已武装（重做：窗缘不再复用此标志）
-        bool range_end_pushed_ = false;  ///< 硬窗缘排空已武装（重做新增）
-        int64_t emitted_total_ = 0;      ///< 全局已发射帧数（消费位置）
+        bool eof_pushed_ = false;           ///< **真 EOF** 排空已武装（重做：窗缘不再复用此标志）
+        bool range_end_pushed_ = false;     ///< 硬窗缘排空已武装（重做新增）
+        int64_t emitted_total_ = 0;         ///< 全局已发射帧数（消费位置）
         int64_t side_pending_[2] = {0, 0};  ///< 各侧已路由未发射帧数（包粒度精确）
-        bool eof_flush_out_ = false;     ///< 臂排空标记已实际发出（锁外发送）
+        bool eof_flush_out_ = false;        ///< 臂排空标记已实际发出（锁外发送）
         // ── GPU 喂料（lcv_mtx_；demux 写 / lander 读）──
         std::deque<ffmpeg::AVPacketPtr> gpu_pkt_q_;  ///< 待喂 GPU 包（Push 永不阻塞的关键）
-        int gpu_flush_left_ = 0;  ///< EOF flush 剩余数（工作线程按池余量推进）
+        int gpu_flush_left_ = 0;                     ///< EOF flush 剩余数（工作线程按池余量推进）
         // ── 落地/上载队列（rmtx_；lander/uploader 写 / 消费者读）──
         std::deque<runtime::NDArray> ready_;      ///< 已落地待发射宿主帧（含 GPU drain marker）
         std::deque<runtime::NDArray> cpu_ready_;  ///< GPU 驻留模式：已上载显存帧
@@ -585,15 +576,15 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  sess_.emit_queue_.back().end_pts 取终点，expected 写回 chunk）。 */
     void OpenGopLocked(int64_t pts);
     void CloseGopLocked();
-    int64_t est_chunk_frames_ = 0;       ///< chunk 帧数估计（份额累计用；跨会话）
+    int64_t est_chunk_frames_ = 0;  ///< chunk 帧数估计（份额累计用；跨会话）
 
     std::vector<int64_t> gpu_frame_shape_;
     // ── 硬件自适应预算（SetCodecContext 计算；全部有界）──
-    int gpu_pool_frames_ = 128;    ///< GPU 解码池深（显存，按空闲量自适应）
-    int up_pool_frames_ = 96;      ///< 上载池深（显存，GPU 驻留模式）
-    int queue_frames_ = 384;       ///< CPU 存货队列深（RAM）
-    int ready_cap_frames_ = 341;   ///< sess_.ready_ 帧数上限（RAM/显存口径合一）
-    int prefetch_frames_ = 384;    ///< demux 领先深度建议（包）
+    int gpu_pool_frames_ = 128;   ///< GPU 解码池深（显存，按空闲量自适应）
+    int up_pool_frames_ = 96;     ///< 上载池深（显存，GPU 驻留模式）
+    int queue_frames_ = 384;      ///< CPU 存货队列深（RAM）
+    int ready_cap_frames_ = 341;  ///< sess_.ready_ 帧数上限（RAM/显存口径合一）
+    int prefetch_frames_ = 384;   ///< demux 领先深度建议（包）
 
     std::atomic<int64_t> frames_out_[2]{};
     // ── 非打印测量（2026-09-12，§7.2 先量后做）──────────────────────
@@ -616,15 +607,16 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     // ——正常供帧间隙毫秒级就能凑满任意连败数（实测 2000 连败健康路径每秒
     // 多次触发）。旧 STATS 门控版在挂死时打 64 万行 stderr。
     std::chrono::steady_clock::time_point stall_last_tp_{
-        std::chrono::steady_clock::now()};                    ///< 最近进展时刻（构造起算，防启动误报）
+        std::chrono::steady_clock::now()};  ///< 最近进展时刻（构造起算，防启动误报）
     std::chrono::steady_clock::time_point stall_print_tp_{};  ///< 最近报警时刻
-    int64_t stall_delay_ms_ = 0;  ///< 0 = 未在报警状态
-    std::atomic<int64_t> up_flush_n_{0}, up_flush_f_{0};  ///< UploadStep 批次数 / 批内帧数
-    std::atomic<int64_t> up_nobuf_{0}, up_cempty_{0};     ///< 池尽 / CPU 断流提前冲刷
-    std::atomic<int64_t> kicks_[2]{};                     ///< 各侧收到的 kick 冲刷包数
+    int64_t stall_delay_ms_ = 0;                              ///< 0 = 未在报警状态
+    std::atomic<int64_t> up_flush_n_{0}, up_flush_f_{0};      ///< UploadStep 批次数 / 批内帧数
+    std::atomic<int64_t> up_nobuf_{0}, up_cempty_{0};         ///< 池尽 / CPU 断流提前冲刷
+    std::atomic<int64_t> kicks_[2]{};                         ///< 各侧收到的 kick 冲刷包数
     std::atomic<int64_t> fb_clones_{};
     std::atomic<int64_t> late_feeds_{0};  ///< 迟到包直供次数（GOP 已供完后到达）
-    std::atomic<int64_t> strag_total_{0};  ///< 迟到包挂 straggler 列表总次数                    ///< 反馈式清偿累计克隆包数
+    std::atomic<int64_t> strag_total_{
+        0};  ///< 迟到包挂 straggler 列表总次数                    ///< 反馈式清偿累计克隆包数
     // ── EOF 尾恢复网（2026-09-27 停滞修复；仅消费者线程读写时基）──────
     // marker 顺序竞态（侧排空 marker 在 sess_.eof_pushed_ 置位前被「吞掉」
     // 分支误食）→ chunk 会计与实际产出永久失配 → 队头侧零产出。1s 空窗
@@ -643,8 +635,8 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     // 命中：即使消费端大拷贝拖慢落地，ord 会非零波动、fg 缓增。
     std::chrono::steady_clock::time_point gpu_stall_tp_{};
     int64_t gpu_stall_fg_ = -1;
-    std::atomic<int64_t> gpu_arm_stall_{0};   ///< 冻结检测触发次数（stats）
-    std::atomic<bool> arm_stalled_{false};    ///< 冻结标志（VideoReader 自愈用）
+    std::atomic<int64_t> gpu_arm_stall_{0};  ///< 冻结检测触发次数（stats）
+    std::atomic<bool> arm_stalled_{false};   ///< 冻结标志（VideoReader 自愈用）
     // ── 遥测直通（2026-09-17 引擎穿透轮）──────────────────────────
     // HOL episode 入口的对侧存货分布（log2 桶 ×24，per-episode 一次
     // 数组写，默认累计——成本≈零）：sum/max 之外补形状，"连续中等
@@ -666,10 +658,10 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     // 跨会话存活（会话白名单），seek 落锚即重推、无累积。
     // 与 NeedsPackets/PumpFeed 同线程（消费线程）读写，无锁。
     int64_t window_lo_ = 0;
-    int64_t window_hi_ = -1;   ///< hi ≤ lo = 未设窗（初始 0 > -1 成立）
+    int64_t window_hi_ = -1;  ///< hi ≤ lo = 未设窗（初始 0 > -1 成立）
     /*! kf 索引查 pts 的呈现序帧号（GOP 判交门用）；索引缺失返回 -1 */
     int64_t FrameIndexOfPts(int64_t pts) const;
-    std::atomic<int64_t> stats_t0_us_{0};                 ///< Push 首包时刻（steady epoch µs）
+    std::atomic<int64_t> stats_t0_us_{0};  ///< Push 首包时刻（steady epoch µs）
     // 工作线程异常槽（per-instance，2026-09-20）：原为进程级全局槽
     // （g_hybrid_err_*），多 reader 并存时任一 reader 的 worker 异常会
     // 污染所有 hybrid reader 的 Pop——引擎池 16 reader 并存下不可接受。
@@ -679,7 +671,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
 
     /*! 工作线程异常统一收口：记录本实例消息（Pop 处转 DECORDError）
      *  + 打 stderr 一份（即使 Pop 未被再调用也能留诊断）。 */
-    void TrapWorkerError(const char *who, const std::exception &e);
+    void TrapWorkerError(const char* who, const std::exception& e);
 };
 
 }  // namespace decord

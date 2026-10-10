@@ -48,20 +48,27 @@ void HybridThreadedDecoder::ComputeBudgets() {
         // hevc/h264 已饱和不受影响)。仍按空闲量自适应，留 35% 余量。
         vram_budget_ = static_cast<double>(free_b) * 0.65;
 #if defined(_WIN32)
-    { MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
-      if (GlobalMemoryStatusEx(&ms)) ram_budget = static_cast<double>(ms.ullAvailPhys) * 0.45; }
+    {
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) ram_budget = static_cast<double>(ms.ullAvailPhys) * 0.45;
+    }
 #else
-    { long pages = sysconf(_SC_AVPHYS_PAGES); long ps = sysconf(_SC_PAGE_SIZE);
-      if (pages > 0 && ps > 0) ram_budget = static_cast<double>(pages) * ps * 0.45; }
+    {
+        long pages = sysconf(_SC_AVPHYS_PAGES);
+        long ps = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && ps > 0) ram_budget = static_cast<double>(pages) * ps * 0.45;
+    }
 #endif
     ram_budget_ = ram_budget;
-    if (const char *e = getenv("DECORD_HYBRID_VRAM_BUDGET_MB"))
+    if (const char* e = getenv("DECORD_HYBRID_VRAM_BUDGET_MB"))
         if (atof(e) > 0) vram_budget_ = atof(e) * 1024 * 1024;
-    if (const char *e = getenv("DECORD_HYBRID_RAM_BUDGET_MB"))
+    if (const char* e = getenv("DECORD_HYBRID_RAM_BUDGET_MB"))
         if (atof(e) > 0) ram_budget = atof(e) * 1024 * 1024;
     const double fb = frame_bytes_ > 0 ? static_cast<double>(frame_bytes_) : 3.1e6;
     auto clampi = [](double v, int lo, int hi) {
-        return static_cast<int>(std::max<double>(lo, std::min<double>(v, hi))); };
+        return static_cast<int>(std::max<double>(lo, std::min<double>(v, hi)));
+    };
     if (out_cuda_) {
         gpu_pool_frames_ = clampi(vram_budget_ * 0.65 / fb, 96, 1536);
         up_pool_frames_ = clampi(vram_budget_ * 0.35 / fb, 48, 768);
@@ -83,23 +90,23 @@ void HybridThreadedDecoder::ComputeBudgets() {
     // 帽 3072→8192（2026-10-10 ROI 预算轮）：池帽字节权威化后，领先
     // 窗须能覆盖两路存货（注释见上）；包驻留 ~17KB/帧 → 8192×17KB
     // ≈139MB，仍在 pkt_cache 512MB 内。
-    prefetch_frames_ = clampi(queue_frames_ + ready_cap_frames_ + 128,
-                              192, 8192);
+    prefetch_frames_ = clampi(queue_frames_ + ready_cap_frames_ + 128, 192, 8192);
     // AV1 384 领先钳制已删除（2026-09-10 预路由改造）：深 demux 领先
     // 是预路由设计的前提（GPU 侧要能持续拿到未来 chunk 的包）。原钳制
     // 防的跨侧交界竞态由既有 expected 对齐 + kick/陈旧丢弃兜底承担，
     // 并以全片逐位比对（引擎 _probe_hybrid_bitwise）作发布门禁。
     // 诊断/实验直控（绕过公式与 AV1 钳制）
-    if (const char *e = getenv("DECORD_HYBRID_PREFETCH"))
+    if (const char* e = getenv("DECORD_HYBRID_PREFETCH"))
         if (atoi(e) > 0) prefetch_frames_ = atoi(e);
 
     if (getenv("DECORD_HYBRID_DEBUG")) {
-        fprintf(stderr, "[hybrid-budget] vram=%.0fMB ram=%.0fMB pool=%d up=%d queue=%d ready=%d prefetch=%d\n",
-                vram_budget_ / 1048576.0, ram_budget / 1048576.0,
-                gpu_pool_frames_, up_pool_frames_, queue_frames_,
-                ready_cap_frames_, prefetch_frames_); }
+        fprintf(
+            stderr,
+            "[hybrid-budget] vram=%.0fMB ram=%.0fMB pool=%d up=%d queue=%d ready=%d prefetch=%d\n",
+            vram_budget_ / 1048576.0, ram_budget / 1048576.0, gpu_pool_frames_, up_pool_frames_,
+            queue_frames_, ready_cap_frames_, prefetch_frames_);
+    }
 }
-
 
 int64_t HybridThreadedDecoder::FrameIndexOfPts(int64_t pts) const {
     // kf 索引查 pts 的呈现序帧号（窗口架构重做 2026-10-08）：GOP 判交门
@@ -114,9 +121,7 @@ int64_t HybridThreadedDecoder::FrameIndexOfPts(int64_t pts) const {
     return kf_rank_[it - kf_pts_.begin()];
 }
 
-
-int64_t HybridThreadedDecoder::ExpectedFrames(int64_t start_pts,
-                                               int64_t end_pts) const {
+int64_t HybridThreadedDecoder::ExpectedFrames(int64_t start_pts, int64_t end_pts) const {
     // 在 kf 索引中查 [start,end) 的帧数 = rank(end_kf) - rank(start_kf)；
     // 末 chunk（end == INT64_MAX）= frame_count - rank(last_kf)。
     if (kf_pts_.empty()) return 0;  // 无索引：退化为 marker/EOF 收尾
@@ -131,7 +136,6 @@ int64_t HybridThreadedDecoder::ExpectedFrames(int64_t start_pts,
     return kf_rank_[it2 - kf_pts_.begin()] - r0;
 }
 
-
 std::vector<int64_t> HybridThreadedDecoder::FrameShapeFor(int fmt, int h, int w) {
     // 与 VideoReader::FrameShape 同语义：yuv420 → (h+ceil(h/2), w) 的 2D；
     // gray → (h, w)；rgb → (h, w, 3)
@@ -143,11 +147,9 @@ std::vector<int64_t> HybridThreadedDecoder::FrameShapeFor(int fmt, int h, int w)
     return {h, w, c};
 }
 
-
 std::vector<int64_t> HybridThreadedDecoder::GpuFrameShape() const {
     return FrameShapeFor(output_format_, height_, width_);
 }
-
 
 std::size_t HybridThreadedDecoder::ReadyCap() const {
     if (ready_cap_frames_ > 0) return static_cast<std::size_t>(ready_cap_frames_);
@@ -165,20 +167,18 @@ std::size_t HybridThreadedDecoder::ReadyCap() const {
         44, static_cast<std::size_t>(budget / static_cast<std::size_t>(frame_bytes_)));
 }
 
-
 bool HybridThreadedDecoder::IsIdrLikeCodec() const {
     // H.264/HEVC 的关键帧即 IDR/CRA：kick 包可安全重置参考状态并冲刷
     // 重排帧，且输出帧 pts == 包 pts（stash 陈旧丢弃闭环成立）。
     return codec_id_ == AV_CODEC_ID_H264 || codec_id_ == AV_CODEC_ID_HEVC;
 }
 
-
 HybridThreadedDecoder::Side HybridThreadedDecoder::ForcedSide() const {
     // DECORD_HYBRID_FORCE_SIDE=cpu|gpu：诊断/实验用的单侧强制路由。
     // 非 IDR-like 编码（AV1 等）下 force=cpu 退化为 GPU：chunk 边界不落在
     // IDR 上时纯 CPU 分片无法按序交付（保持旧行为，只是挪到这里统一表达）。
     static const Side want = [] {
-        const char *e = getenv("DECORD_HYBRID_FORCE_SIDE");
+        const char* e = getenv("DECORD_HYBRID_FORCE_SIDE");
         if (!e) return Side(-1);
         return (strcmp(e, "gpu") == 0) ? SIDE_GPU : SIDE_CPU;
     }();
@@ -186,7 +186,6 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::ForcedSide() const {
     if (want == SIDE_CPU) return IsIdrLikeCodec() ? SIDE_CPU : SIDE_GPU;
     return Side(-1);
 }
-
 
 HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
     // 供水式贪心（分配时点，速率=当下 sustained/EWMA 读数）：
@@ -207,15 +206,14 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
     // ⚠️ 2026-09-19 冻结前修正：本开关此前**只存在于注释**（代码里没有
     // getenv），照注释设 env 会静默无效、让人误判"混跑不可关"。现补实。
     static const bool av1_cpu_off = [] {
-        const char *e = getenv("DECORD_HYBRID_AV1_CPU");
+        const char* e = getenv("DECORD_HYBRID_AV1_CPU");
         return e != nullptr && atoi(e) == 0;
     }();
     if (av1_cpu_off && !IsIdrLikeCodec()) {
-        return SIDE_GPU;   // 消融：AV1 纯 GPU（复评对照臂）
+        return SIDE_GPU;  // 消融：AV1 纯 GPU（复评对照臂）
     }
     if (sess_.eof_cache_ && sess_.gop_seq_ - sess_.feed_gop_idx_ <= 10) {
-        return sess_.side_pending_[SIDE_CPU] <= sess_.side_pending_[SIDE_GPU]
-                   ? SIDE_CPU : SIDE_GPU;
+        return sess_.side_pending_[SIDE_CPU] <= sess_.side_pending_[SIDE_GPU] ? SIDE_CPU : SIDE_GPU;
     }
     if (sess_.chunks_assigned_[SIDE_CPU] == 0) {
         return sess_.chunks_assigned_[SIDE_GPU] >= 1 ? SIDE_CPU : SIDE_GPU;
@@ -230,22 +228,18 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
     {
         int64_t gop_est = est_chunk_frames_;
         if (gop_est <= 0 && kf_pts_.size() > 1 && frame_count_ > 0) {
-            gop_est = std::max<int64_t>(
-                frame_count_ / static_cast<int64_t>(kf_pts_.size() - 1), 1);
+            gop_est = std::max<int64_t>(frame_count_ / static_cast<int64_t>(kf_pts_.size() - 1), 1);
         }
         int64_t window_remaining = INT64_MAX;
         if (window_hi_ > window_lo_ && gop_est > 0) {
-            for (size_t wi = static_cast<size_t>(
-                     std::max<int64_t>(sess_.feed_gop_idx_, 0));
+            for (size_t wi = static_cast<size_t>(std::max<int64_t>(sess_.feed_gop_idx_, 0));
                  wi < sess_.gops_.size(); ++wi) {
                 if (sess_.gops_[wi].side != Side(-1)) continue;
-                const int64_t ws =
-                    FrameIndexOfPts(sess_.gops_[wi].start_pts);
+                const int64_t ws = FrameIndexOfPts(sess_.gops_[wi].start_pts);
                 // kf 缺失（ws<0）：判交不可能，尾规则退化为不触发
-                //（与派工门同退化路径——宁按无窗调度）。
+                // （与派工门同退化路径——宁按无窗调度）。
                 if (ws >= 0) {
-                    window_remaining =
-                        std::max<int64_t>(window_hi_ - ws, 0);
+                    window_remaining = std::max<int64_t>(window_hi_ - ws, 0);
                 }
                 break;
             }
@@ -258,14 +252,12 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
             // 已解码存货（CPU=filter 队列深，GPU=sess_.ready_/sess_.cpu_ready_），
             // 谁先腾手给谁；速率未熟退回供水比例（下方 water-fill）。
             const double r_c = cpu_.ProductionRate();
-            const double r_g = gpu_rate_landed_.load(
-                std::memory_order_relaxed);
+            const double r_g = gpu_rate_landed_.load(std::memory_order_relaxed);
             if (r_c > 0.0 && r_g > 0.0) {
                 std::size_t gpu_inv = 0;
                 {
                     std::lock_guard<std::mutex> lk(rmtx_);
-                    gpu_inv = sess_.ready_.size()
-                        + (out_cuda_ ? sess_.cpu_ready_.size() : 0);
+                    gpu_inv = sess_.ready_.size() + (out_cuda_ ? sess_.cpu_ready_.size() : 0);
                 }
                 // 已解码存货另含 cuvid reorder 输出队列（LandStep 尚未
                 // 收割；co≤0 时诊断口径未启用，跳过）。宿主包队列与
@@ -274,49 +266,46 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
                 if (gpu_) {
                     int64_t cp = 0, cb = 0, co = 0;
                     gpu_->DiagDepths(&cp, &cb, &co);
-                    (void)cp; (void)cb;
+                    (void)cp;
+                    (void)cb;
                     if (co > 0) gpu_inv += static_cast<std::size_t>(co);
                 }
-                const int64_t cpu_und = std::max<int64_t>(
-                    sess_.side_pending_[SIDE_CPU] - cpu_.QueueDepth(), 0);
+                const int64_t cpu_und =
+                    std::max<int64_t>(sess_.side_pending_[SIDE_CPU] - cpu_.QueueDepth(), 0);
                 const int64_t gpu_und = std::max<int64_t>(
-                    sess_.side_pending_[SIDE_GPU]
-                        - static_cast<int64_t>(gpu_inv), 0);
-                return (static_cast<double>(cpu_und) / r_c
-                        <= static_cast<double>(gpu_und) / r_g)
-                           ? SIDE_CPU : SIDE_GPU;
+                    sess_.side_pending_[SIDE_GPU] - static_cast<int64_t>(gpu_inv), 0);
+                return (static_cast<double>(cpu_und) / r_c <= static_cast<double>(gpu_und) / r_g)
+                           ? SIDE_CPU
+                           : SIDE_GPU;
             }
         }
     }
     const double rc = cpu_.ProductionRate();
     const double rg = gpu_rate_landed_.load(std::memory_order_relaxed);
     if (rc <= 0.0 || rg <= 0.0) {
-        return sess_.chunks_assigned_[SIDE_CPU] <= sess_.chunks_assigned_[SIDE_GPU]
-                   ? SIDE_CPU : SIDE_GPU;
+        return sess_.chunks_assigned_[SIDE_CPU] <= sess_.chunks_assigned_[SIDE_GPU] ? SIDE_CPU
+                                                                                    : SIDE_GPU;
     }
     if (!sess_.sched_initialized_) {
         // 首次双侧速率就绪：cpu-out 的库存帽按产率比分账（旧 inv-split
         // 语义不变；gpu-out 的 ready 由显存池决定不可动）
         sess_.sched_initialized_ = true;
         if (!out_cuda_) {
-            const int64_t total_inv =
-                static_cast<int64_t>(queue_frames_) + ready_cap_frames_;
+            const int64_t total_inv = static_cast<int64_t>(queue_frames_) + ready_cap_frames_;
             const double rr = rc / std::max(rc + rg, 1.0);
-            int64_t q = std::max<int64_t>(
-                static_cast<int64_t>(total_inv * rr), 96);
+            int64_t q = std::max<int64_t>(static_cast<int64_t>(total_inv * rr), 96);
             int64_t rd = std::max<int64_t>(total_inv - q, 96);
             queue_frames_ = static_cast<int>(q);
             ready_cap_frames_ = static_cast<int>(rd);
             cpu_.SetQueueDepth(queue_frames_);
             if (pinned_pool_ && !out_cuda_) {
-                pinned_pool_->Reset(
-                    static_cast<std::size_t>(rd) + kD2HRingSlots + 16,
-                    pinned_pool_->frame_bytes(), gpu_frame_shape_);
+                pinned_pool_->Reset(static_cast<std::size_t>(rd) + kD2HRingSlots + 16,
+                                    pinned_pool_->frame_bytes(), gpu_frame_shape_);
             }
         }
     }
     static const double fs_env = [] {
-        const char *e = getenv("DECORD_HYBRID_FORCE_SHARE");
+        const char* e = getenv("DECORD_HYBRID_FORCE_SHARE");
         if (!e) return -1.0;
         double v = atof(e);
         return (v > 0.0 && v < 1.0) ? v : -1.0;
@@ -329,9 +318,9 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
         const size_t ti = trace_n_.load(std::memory_order_relaxed);
         if (ti < 1024) {
             const int64_t t0 = stats_t0_us_.load(std::memory_order_relaxed);
-            const auto now_us = std::chrono::duration_cast<
-                std::chrono::microseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
             trace_ring_[ti * 4] = t0 > 0 ? (double)(now_us - t0) : 0.0;
             trace_ring_[ti * 4 + 1] = f * 10000.0;
             trace_ring_[ti * 4 + 2] = rc;
@@ -339,20 +328,20 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
             trace_n_.store(ti + 1, std::memory_order_relaxed);
         }
     }
-    return (static_cast<double>(sess_.assigned_frames_[SIDE_CPU]) * (1.0 - f)
-            <= static_cast<double>(sess_.assigned_frames_[SIDE_GPU]) * f)
-               ? SIDE_CPU : SIDE_GPU;
+    return (static_cast<double>(sess_.assigned_frames_[SIDE_CPU]) * (1.0 - f) <=
+            static_cast<double>(sess_.assigned_frames_[SIDE_GPU]) * f)
+               ? SIDE_CPU
+               : SIDE_GPU;
 }
 
 ffmpeg::AVPacketPtr HybridThreadedDecoder::CloneCachePacket(int64_t seq) {
     // 仅 Push/泵线程（持 mtx_ 的调用方）使用
     if (seq < sess_.cache_base_seq_ || seq >= sess_.cache_seq_) return nullptr;
-    const auto &src = sess_.pkt_cache_[seq - sess_.cache_base_seq_];
+    const auto& src = sess_.pkt_cache_[seq - sess_.cache_base_seq_];
     if (!src) return nullptr;
-    AVPacket *c = av_packet_clone(src.get());
+    AVPacket* c = av_packet_clone(src.get());
     if (!c) return nullptr;
-    return ffmpeg::AVPacketPtr(c, [](AVPacket *p) { av_packet_free(&p); });
+    return ffmpeg::AVPacketPtr(c, [](AVPacket* p) { av_packet_free(&p); });
 }
-
 
 }  // namespace decord
