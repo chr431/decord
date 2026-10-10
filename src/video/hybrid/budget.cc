@@ -80,8 +80,11 @@ void HybridThreadedDecoder::ComputeBudgets() {
     // 注意：深度本身不是混跑损耗的调节旋钮（hevc 1678/2600/3500/4800
     // 实测平坦）—— 决策质量由 NeedsPackets 的盲阶段节拍控制，见
     // SuggestPrefetchDepth/NeedsPackets 注释。
+    // 帽 3072→8192（2026-10-10 ROI 预算轮）：池帽字节权威化后，领先
+    // 窗须能覆盖两路存货（注释见上）；包驻留 ~17KB/帧 → 8192×17KB
+    // ≈139MB，仍在 pkt_cache 512MB 内。
     prefetch_frames_ = clampi(queue_frames_ + ready_cap_frames_ + 128,
-                              192, 3072);
+                              192, 8192);
     // AV1 384 领先钳制已删除（2026-09-10 预路由改造）：深 demux 领先
     // 是预路由设计的前提（GPU 侧要能持续拿到未来 chunk 的包）。原钳制
     // 防的跨侧交界竞态由既有 expected 对齐 + kick/陈旧丢弃兜底承担，
