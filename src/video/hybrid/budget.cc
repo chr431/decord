@@ -213,7 +213,7 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
     if (av1_cpu_off && !IsIdrLikeCodec()) {
         return SIDE_GPU;   // 消融：AV1 纯 GPU（复评对照臂）
     }
-    if (sess_.eof_cache_ && sess_.gop_seq_ - sess_.feed_gop_idx_ <= 4) {
+    if (sess_.eof_cache_ && sess_.gop_seq_ - sess_.feed_gop_idx_ <= 10) {
         return sess_.side_pending_[SIDE_CPU] <= sess_.side_pending_[SIDE_GPU]
                    ? SIDE_CPU : SIDE_GPU;
     }
@@ -250,7 +250,7 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
                 break;
             }
         }
-        if (window_remaining <= 4 * gop_est) {
+        if (window_remaining <= 10 * gop_est) {
             // ETA 口径（首版 least-pending 实测大回归 1.6-1.7s：
             // sess_.side_pending_ 含按序合并的等待发射帧——GPU 臂解码完成但
             // 排在 CPU chunk 后等发射时 pending 虚高，尾被系统性派给
