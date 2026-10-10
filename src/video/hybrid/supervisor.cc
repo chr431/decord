@@ -442,10 +442,20 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
             };
             const double fb_roi = (double)frame_bytes_;
             if (out_cuda_ && fb_roi > 0) {
+                // 帧数钳制按参考全帧（3.1MB）定价：ROI 帧 ~3.6KB 时
+                // 字节预算本允许 10^5 帧级，旧固定帽（8192/4096）在
+                // 顺序合并下成为 CPU 臂输出存货的人为天花板（h264 全片
+                // 实测 up_nobuf=44888 = 上载池耗尽退避）。字节权威：帽=
+                // max(旧帽, 字节帽/帧字节)，字节帽 gpu=512MB/up=256MB
+                // （queue RAM 512MB）——内存有界性不变，小帧帧数放开。
+                const int hi_gpu = std::max(8192, (int)(512.0 * 1048576
+                                                       / fb_roi));
+                const int hi_up = std::max(4096, (int)(256.0 * 1048576
+                                                      / fb_roi));
                 gpu_pool_frames_ = clampi(vram_budget_ * 0.65 / fb_roi,
-                                          96, 8192);
+                                          96, hi_gpu);
                 up_pool_frames_ = clampi(vram_budget_ * 0.35 / fb_roi,
-                                         48, 4096);
+                                         48, hi_up);
                 ready_cap_frames_ = gpu_pool_frames_ + up_pool_frames_ + 64;
                 // CPU 臂银行（2026-09-13 缺口分解）：ComputeBudgets 的
                 // queue_frames_ 按**全帧**字节算出 1536 帧帽（4.8GB RAM 时代
@@ -455,7 +465,9 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
                 // 重算：ROI 帧按 RAM 预算放开到 4096；解码线程背压解耦到
                 // raw 队列并按全帧字节预算（768MB）封顶 —— 全帧内存风险
                 // 由 raw 帽独立承担，ROI 银行不再被合并计价错杀。
-                queue_frames_ = clampi(ram_budget_ * 0.45 / fb_roi, 96, 4096);
+                const int hi_q = std::max(4096, (int)(512.0 * 1048576
+                                                     / fb_roi));
+                queue_frames_ = clampi(ram_budget_ * 0.45 / fb_roi, 96, hi_q);
                 cpu_.SetQueueDepth(queue_frames_);
                 const int64_t raw_bytes = static_cast<int64_t>(width_) > 0
                     && static_cast<int64_t>(height_) > 0
@@ -731,6 +743,9 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
         kv("up_frames", fr);
         kvf("up_avg_batch", fn > 0 ? (double)fr / (double)fn : 0.0);
         kv("up_nobuf", up_nobuf_.load());
+    kv("pool_frames", (long long)gpu_pool_frames_);
+    kv("up_pool_frames", (long long)up_pool_frames_);
+    kv("queue_frames", (long long)queue_frames_);
         kv("up_cempty", up_cempty_.load());
     }
     // 份额轨迹（仅 DECORD_HYBRID_TRACE=1 且有样本时；扁平 csv 四元组）
