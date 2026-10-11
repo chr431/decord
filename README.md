@@ -412,11 +412,12 @@ python tests/test_hybrid.py --n 600          # md5 + seek
 python tests/test_hybrid_lockstep.py 600     # 混跑字节级交错对照（位置参数）
 ```
 
-套件耗时与分级（2026-10-10 测试减负轮实测 @N=600，NVDEC 串行口径）：
-md5 15.4s / window 26.6s / stride 27.2s / formats 98.2s / stream 109.7s
-（lockstep+gpu ≈69s）。fork 日常迭代跑**核心三件**（md5+stride+window
-≈70s，覆盖位级等价/差步长/硬窗门禁）；合入前与发版跑全量七套件——
-NVDEC 会话争用下并行是隐藏 flake 源，套件间仍保持串行。
+套件耗时与分级（2026-10-11 传输重设计轮实测，NVDEC 串行口径）：
+**默认=核心五件 ≈151s**（md5 14s@N300 / stream ~35s@N600 / stride ~17s@N300 /
+lockstep 18s / window 62s——供给·seek·重试·窗口风险面）；`--full` 恢复
+七套件全 N（gpu+formats 的等价/格式面 + 2000 帧口径，≈7min；2026-10-10
+实测 @N=600：md5 15.4/window 26.6/stride 27.2/formats 98.2/stream 109.7）。
+NVDEC 会话争用下并行是隐藏 flake 源，套件间保持串行。
 
 ## 发布流程（维护者）
 

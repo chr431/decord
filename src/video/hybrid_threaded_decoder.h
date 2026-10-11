@@ -328,6 +328,20 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
         push_batch_ = false;
         PumpFeed();
     }
+    bool PumpRequested() const override { return pump_request_.load(std::memory_order_acquire); }
+    void ServicePumpRequest() override {
+        if (pump_request_.exchange(false, std::memory_order_acq_rel)) PumpFeed(true);
+    }
+    void TickPump() override { PumpFeed(false); }
+    void WaitFrame(int timeout_us) override {
+        // C-78c：谓词=落账≠消账（lost-wakeup 免疫——notify 先于等待
+        // 进入时，谓词仍为真立即返回；marker 吞掉后消账同步推进）。
+        std::unique_lock<std::mutex> lk(lcv_mtx_);
+        lcv_.wait_for(lk, std::chrono::microseconds(timeout_us), [&] {
+            return landed_.load(std::memory_order_acquire) !=
+                   consumed_.load(std::memory_order_acquire);
+        });
+    }
     bool NeedsPackets() const override {
         if (sess_.eof_cache_) return false;
         if (sess_.kick_side_ != Side(-1) &&
@@ -386,6 +400,9 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  hybrid_gpu 反而 0.71x 于纯 GPU）。 */
     std::thread uploader_;
     bool push_batch_ = false;  ///< C-77：批量推包区间内 Push 不逐包泵送（仅消费线程读写）
+    std::atomic<bool> pump_request_{false};  ///< C-78：消费线程 Pop 的 force-head 再驱动请求（供料线程服务）
+    std::atomic<int64_t> landed_{0};    ///< C-78c：帧/markers 落入消费可见队列的账（含 CPU 臂 on_output）
+    std::atomic<int64_t> consumed_{0};  ///< C-78c：PopSide 成功取走的账（含 marker 吞噬）
     std::atomic<bool> lander_run_{false};
     /*! \brief 停滞飞行记录器线程（DECORD_HYBRID_FLIGHT=1 启动，4Hz
      *  快照到 decord_hybrid_flight.log；消费者路径零接触，取证用） */

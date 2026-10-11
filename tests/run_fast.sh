@@ -15,14 +15,28 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-N=600
+N=300
 PARALLEL=0
+FULL=0
 for a in "$@"; do
   case "$a" in
     --parallel) PARALLEL=1 ;;
+    --full) FULL=1 ;;
     *) N="$a" ;;
   esac
 done
+# 2026-10-11 传输重设计轮减负：默认核心五套件（md5/stream/stride/
+# lockstep/window，供给·seek·重试·窗口风险面）+ 压 N（stream 600/
+# md5·stride 300）≈2.5min；--full 恢复七套件全 N（gpu/formats 的
+# 解码器等价·格式面 + 2000 帧口径，≈7min，发布级）。逐套件耗时
+# 实测：md5(n300) 14s / stream(n600) ~35s / stride(n300) ~17s /
+# lockstep 18s / window 62s。
+if [ $FULL -eq 1 ]; then N=600; fi
+if [ $FULL -eq 1 ]; then
+  export HYB_TEST_N_STREAM=2000
+else
+  export HYB_TEST_N_STREAM=600
+fi
 export HYB_TEST_N="$N"
 export DECORD_LIBRARY_PATH="${DECORD_LIBRARY_PATH:-D:/Repo/decord/build-dev}"
 TIMEOUT="${HYB_TEST_TIMEOUT:-900}"
@@ -64,9 +78,11 @@ if [ "$PARALLEL" -eq 1 ]; then
   wait $P2; [ $? -ne 0 ] && FAILS=$((FAILS+1))
   wait $P3; [ $? -ne 0 ] && FAILS=$((FAILS+1))
 else
-  echo "== run_fast: N=$N, serial =="
-  run_suite gpu     python tests/test_hybrid_gpu.py      || FAILS=$((FAILS+1))
-  run_suite formats python tests/test_hybrid_formats.py || FAILS=$((FAILS+1))
+  echo "== run_fast: N=$N core, stream_N=$HYB_TEST_N_STREAM (—full 恢复七套件), serial =="
+  if [ $FULL -eq 1 ]; then
+    run_suite gpu     python tests/test_hybrid_gpu.py      || FAILS=$((FAILS+1))
+    run_suite formats python tests/test_hybrid_formats.py || FAILS=$((FAILS+1))
+  fi
   run_lane_c || FAILS=$((FAILS+1))
 fi
 

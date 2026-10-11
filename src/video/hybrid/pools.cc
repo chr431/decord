@@ -127,14 +127,22 @@ bool HybridThreadedDecoder::LandStep() {
         // （发射顺序 = sess_.ready_ 顺序）。sess_.ready_ 满时容忍越界（软限，仅
         // EOF 尾部发生一次）。
         FlushD2H();
-        std::lock_guard<std::mutex> lk(rmtx_);
-        sess_.ready_.push_back(std::move(f));
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            sess_.ready_.push_back(std::move(f));
+        }
+        landed_.fetch_add(1, std::memory_order_release);
+        lcv_.notify_all();  // C-78c：帧落队（账+notify）
         return true;
     }
     if (out_cuda_) {
         // GPU 驻留模式：帧留在显存直通入队（零拷贝），随消费归还池
-        std::lock_guard<std::mutex> lk(rmtx_);
-        sess_.ready_.push_back(std::move(f));
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            sess_.ready_.push_back(std::move(f));
+        }
+        landed_.fetch_add(1, std::memory_order_release);
+        lcv_.notify_all();  // C-78c
         return true;
     }
     // 异步 D2H：提交到 pinned 中转环，滞后 kD2HRingSlots 帧收割
@@ -231,6 +239,8 @@ bool HybridThreadedDecoder::HarvestD2H(int k) {
             sess_.ready_.push_back(std::move(d2h_host_[k]));
         }
     }
+    landed_.fetch_add(1, std::memory_order_release);
+    lcv_.notify_all();  // C-78c
     d2h_pooled_[k] = false;
     d2h_host_[k] = runtime::NDArray();
     d2h_gpu_[k] = runtime::NDArray();  // 源回池
@@ -410,6 +420,8 @@ bool HybridThreadedDecoder::UploadStep() {
                 sess_.cpu_ready_.push_back(std::move(bufs[i]));  // pts 提交时已设
             }
         }
+        landed_.fetch_add(nf, std::memory_order_release);
+        lcv_.notify_all();  // C-78c：上载批落队（账+notify）
         if (dbg) fprintf(stderr, "[hybrid-u] flush %d", nf);
         nf = 0;
         did = true;
@@ -445,8 +457,12 @@ bool HybridThreadedDecoder::UploadStep() {
         if (IsMarker(f)) {
             // marker 保序：批内帧全部 H2D 完成后才入队 marker
             flush();
-            std::lock_guard<std::mutex> lk(rmtx_);
-            sess_.cpu_ready_.push_back(std::move(f));
+            {
+                std::lock_guard<std::mutex> lk(rmtx_);
+                sess_.cpu_ready_.push_back(std::move(f));
+            }
+            landed_.fetch_add(1, std::memory_order_release);
+            lcv_.notify_all();  // C-78c
             return true;
         }
         const int k = nf;

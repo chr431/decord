@@ -22,7 +22,7 @@ VIDS = [(r'D:\Videos\racelog_test\test.mp4', 'hevc'),
         (r'D:\Videos\racelog_test\test3.mp4', 'h264'),
         (r'D:\Videos\racelog_test\test6.mp4', 'av1')]
 ROI = (841, 994, 949, 1026)
-N = 2000
+N = int(os.environ.get('HYB_TEST_N_STREAM', '2000'))  # run_fast 减负：可下调
 STRIDE = 8
 
 

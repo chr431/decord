@@ -657,6 +657,7 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray* f) {
         tr2probe::add("[tr2] STASH-consume s=%d f=%lld\n", (int)s, (long long)sess_.stash_[s].pts);
         *f = sess_.stash_[s];
         sess_.has_stash_[s] = false;
+        consumed_.fetch_add(1, std::memory_order_release);  // C-78c 消账
         return true;
     }
     if (s == SIDE_CPU) {
@@ -666,6 +667,7 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray* f) {
             if (sess_.cpu_ready_.empty()) return false;
             *f = std::move(sess_.cpu_ready_.front());
             sess_.cpu_ready_.pop_front();
+            if (f->defined()) consumed_.fetch_add(1, std::memory_order_release);  // C-78c
             lcv_.notify_all();  // 槽位/预算释放：即时唤醒喂包/上载线程
             return f->defined();
         }
@@ -678,13 +680,18 @@ bool HybridThreadedDecoder::PopSide(Side s, runtime::NDArray* f) {
         // 这也是头文件「消费者线程的 Pop 永不阻塞」设计承诺的落位
         // （CPU 侧此前是唯一违例）。
         if (cpu_.QueueDepth() == 0) return false;
-        return cpu_.Pop(f);
+        if (cpu_.Pop(f)) {
+            consumed_.fetch_add(1, std::memory_order_release);  // C-78c（含 marker）
+            return true;
+        }
+        return false;
     }
     // GPU 帧：取工作线程已落地/直通的帧，非阻塞
     std::lock_guard<std::mutex> lk(rmtx_);
     if (sess_.ready_.empty()) return false;
     *f = std::move(sess_.ready_.front());
     sess_.ready_.pop_front();
+    if (f->defined()) consumed_.fetch_add(1, std::memory_order_release);  // C-78c（含 marker）
     lcv_.notify_all();  // 槽位/预算释放：即时唤醒喂包线程
     return f->defined();
 }
@@ -765,7 +772,9 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
             // force=true：头部已饿死仍不能分配 = 库存残帧互锁（两侧
             // pending 均非零但都不属于头部可发射序）——强制派工头部
             // GOP 解锁。仅此处使用；正常推进走 Push 路径的无参泵。
-            PumpFeed(true);
+            // C-78：改请求制——泵单线程不变量（仅供料线程跑 PumpFeed），
+            // 消费线程只登记请求，供料线程 ≤1ms 轮询服务。
+            pump_request_.store(true, std::memory_order_release);
             return false;
         }
         // force-close 安全网：该侧已路由的包全部出清（pending==0）但
@@ -991,7 +1000,9 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                     gpu_stall_fg_ = fg_now;
                 }
             }
-            PumpFeed(true);  // 同 A4：空取=头部饥饿，强制泵推进
+            // C-78：改请求制——泵单线程不变量（仅供料线程跑 PumpFeed），
+            // 消费线程只登记请求，供料线程 ≤1ms 轮询服务。
+            pump_request_.store(true, std::memory_order_release);
             return false;
         }
         // PopSide 成功 = 有进展（marker/陈旧丢弃/越界暂存/发射同此之后）：

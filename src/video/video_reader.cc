@@ -359,6 +359,9 @@ VideoReader::~VideoReader(){
     // （hybrid 的 CPU 输出帧是独立宿主分配，无此问题；统一提前释放无害。）
     cached_frame_ = NDArray();
     tmp_key_frame_ = NDArray();
+    // C-78：供料线程必须先于解码器析构停掉（线程内 decoder_->Push/
+    // 泵调用不得悬空）。
+    StopHybridPushThread();
     // Destroy the decoder before ndarray_pool_ (which is destroyed after
     // this body runs, as a member declared after decoder_).  Any output
     // buffers still queued in the decoder hold a manager_ctx pointing at
@@ -602,6 +605,9 @@ bool VideoReader::Seek(int64_t pos) {
 bool VideoReader::Seek(int64_t pos, bool force_backward) {
     if (!fmt_ctx_) return false;
     if (curr_frame_ == pos) return true;
+    // C-78：停泊供料线程——Clear（泵状态）与 av_seek_frame（fmt_ctx_）
+    // 与线程的 PushNextCore/泵互斥。
+    ParkHybridPushThread();
     decoder_->Clear();
     cached_frame_ = NDArray();
     eof_ = false;
@@ -636,6 +642,7 @@ bool VideoReader::Seek(int64_t pos, bool force_backward) {
         // GOP 判交门天然覆盖（门只看 GOP 起点 < hi），无预算算术。
         RefreshWindowRange(pos);
     }
+    ResumeHybridPushThread();
     return ret >= 0;
 }
 
@@ -775,7 +782,123 @@ bool VideoReader::SeekAccurate(int64_t pos) {
 }
 
 static const bool s_push_dbg = getenv("DECORD_SEEK_DEBUG") != nullptr;
+// ── C-78 供料线程（传输重设计轮）───────────────────────────────────
+// 动机（0.9.6 定性）：demux+泵在消费线程上是设计性串行——70MB 文件
+// ≈0.45s 全落首帧路径（tr2 实测 EMIT 间隔 113ms=每帧 384 包×0.3ms
+// 泵扫描），且消费节奏钳制供给。线程化后：demux/泵/解码/发射四线
+// 并行，消费线程只等帧。停泊握手保 seek/Clear 的 fmt_ctx_ 与泵状态
+// 独占；force-head 再驱动改请求制（泵单线程不变量）。
+bool VideoReader::HybridPushEnabled() {
+    static const bool on = [] {
+        const char* e = getenv("DECORD_HYBRID_PUSH_THREAD");
+        return !(e != nullptr && strcmp(e, "0") == 0);
+    }();
+    return on;
+}
+
+void VideoReader::HybridPushThreadMain() {
+    while (push_thread_run_.load(std::memory_order_acquire)) {
+        if (park_req_.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lk(park_mtx_);
+            thread_parked_.store(true, std::memory_order_release);
+            park_cv_.notify_all();
+            park_cv_.wait_for(lk, std::chrono::milliseconds(5), [&] {
+                return !park_req_.load(std::memory_order_acquire) ||
+                       !push_thread_run_.load(std::memory_order_acquire);
+            });
+            thread_parked_.store(false, std::memory_order_release);
+            continue;
+        }
+        bool did = false;
+        if (decoder_ && decoder_->PumpRequested()) {
+            decoder_->ServicePumpRequest();
+            did = true;
+        }
+        if (decoder_ && !eof_.load(std::memory_order_acquire) && decoder_->NeedsPackets()) {
+            decoder_->BeginPushBatch();
+            int since = 0;
+            while (!eof_.load(std::memory_order_acquire) && since < 512 &&
+                   push_thread_run_.load(std::memory_order_acquire) &&
+                   !park_req_.load(std::memory_order_acquire) && decoder_->NeedsPackets()) {
+                PushNextCore();
+                if (!eof_.load(std::memory_order_acquire)) ++pkts_pushed_;
+                if (++since >= 512) {
+                    decoder_->EndPushBatch();
+                    decoder_->BeginPushBatch();
+                    since = 0;
+                }
+            }
+            decoder_->EndPushBatch();
+            did = true;
+        }
+        if (!did) {
+            // C-78b：未排空期间的泵节拍——旧路径每次空 Pop 内联泵送
+            // （连续驱动）；纯请求制的轮询延迟叠加把吞吐塌到 ~550fps
+            // （fork 直读复现 552）。250µs 节拍 × O(gops) 扫描 ≈ 忽略
+            // 不计的单线程开销，泵单线程不变量不变。
+            if (decoder_ && !decoder_->Drained()) {
+                decoder_->TickPump();
+                std::this_thread::sleep_for(std::chrono::microseconds(250));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+}
+
+void VideoReader::EnsureHybridPushThread() {
+    if (!HybridPushEnabled() || !decoder_) return;
+    if (hybrid_self_feed_.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lk(push_start_mtx_);
+    if (hybrid_self_feed_.load(std::memory_order_acquire)) return;
+    push_thread_run_.store(true, std::memory_order_release);
+    hybrid_push_thread_ = std::thread(&VideoReader::HybridPushThreadMain, this);
+    hybrid_self_feed_.store(true, std::memory_order_release);
+}
+
+void VideoReader::StopHybridPushThread() {
+    if (!hybrid_self_feed_.exchange(false, std::memory_order_acq_rel)) return;
+    push_thread_run_.store(false, std::memory_order_release);
+    park_req_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(park_mtx_);
+        park_cv_.notify_all();
+    }
+    if (hybrid_push_thread_.joinable()) hybrid_push_thread_.join();
+}
+
+void VideoReader::ParkHybridPushThread() {
+    if (!hybrid_self_feed_.load(std::memory_order_acquire)) return;
+    if (park_depth_++ == 0) {
+        park_req_.store(true, std::memory_order_release);
+        while (!thread_parked_.load(std::memory_order_acquire) &&
+               push_thread_run_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void VideoReader::ResumeHybridPushThread() {
+    if (!hybrid_self_feed_.load(std::memory_order_acquire)) return;
+    if (--park_depth_ == 0) {
+        park_req_.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(park_mtx_);
+        park_cv_.notify_all();
+    }
+}
+
 void VideoReader::PushNext() {
+    // C-78（传输重设计轮）：hybrid 且供料线程在跑 → 消费线程不再推包
+    // （fmt_ctx_/泵的独占权在供料线程）。此处只确保线程活着——
+    // CheckKeyFrame/SkipFramesImpl/重锚等消费侧路径经此入口自举供给。
+    if (hybrid_self_feed_.load(std::memory_order_acquire)) {
+        EnsureHybridPushThread();
+        return;
+    }
+    PushNextCore();
+}
+
+void VideoReader::PushNextCore() {
     // 临时诊断（DECORD_SEEK_DEBUG=1）：谁的推包——调用栈无法直接打，
     // 打 curr/diff 供与 seek-dbg 行对齐判别（top-up vs retry-loop）
     if (s_push_dbg) fprintf(stderr, "[push] curr=%lld diff=%lld\n",
@@ -845,40 +968,27 @@ NDArray VideoReader::NextFrameImpl() {
                                : DECORD_PREFETCH_DEPTH_BASE;
     prefetch_depth = std::max(prefetch_depth, decoder_->SuggestPrefetchDepth());
     if (IsHybridType(static_cast<int>(ctx_.device_type))) {
-        // C-74（2026-10-11）：hybrid 顶饱门改 NeedsPackets（缓存字节预算
-        // + 硬窗缘 + 银行满逃生门，全部现成）。旧 pkts_pushed_-
-        // frames_popped_ 计账对 hybrid 永久虚高（侧丢弃/kick 克隆不核销，
-        // 下方 D3 注释自认），顶饱循环恒不触发——供给退化为重试循环的
-        // 每帧 1 包：demux 永远追不上发射，臂银行持续净消耗
-        // （h264 全片 cpk 5592→0 单调枯竭、cud 恒 21/28，CPU 臂实得
-        // 1890pkt/s vs 解码力 2333/s），臂解码供给被消费节奏钳制
-        // = 2657fps 自指上限的根源。改后 demux 独立冲刺到缓存预算，
-        // 臂银行由泵深供；DECORD_PREFETCH_DEPTH_HYBRID 保底仍生效
-        // （SuggestPrefetchDepth 取 max 的旧行为）。
-        // C-77（2026-10-11 校准重叠轮）：批量推包区间——Push 只入缓存，
-        // 区间末一次 PumpFeed。此前每包一次泵扫描（O(gops)+锁）×24K 包
-        // ≈0.4s 全部落在首帧路径（tr2 实测：消费线程每帧 115ms =
-        // 384 包 burst × ~0.3ms/包泵开销；EMIT 间隔 113ms 精确吻合）。
-        // 批量化后整文件 demux+单次泵 ≈0.45s 集中付清（demux 在消费
-        // 线程上的结构性串行，独立 demux 线程属传输重设计范围）。
-        // 每 kPumpQuantum 包泵一次：纯批末一次会把解码启动推迟到整个
-        // demux 之后（实测 next974 0.007→0.71s = 银行未预填）；纯逐包则
-        // 泵扫描 ×24K ≈0.4s。量子取 512 包 ≈ 数 GOP 的臂粮食，泵开销
-        // /512 且解码随 demux 并行启动。
-        decoder_->BeginPushBatch();
-        int since_pump = 0;
-        while (!eof_ && decoder_->NeedsPackets()) {
-            PushNext();
-            if (!eof_) {
-                ++pkts_pushed_;  // real packet; PushNext sets eof_ when it pushed the flush
+        // C-78（传输重设计轮）：供给线整体移交专用线程（demux+泵与消费
+        // 解耦；动机与 0.9.6 的结构定性见 HybridPushThreadMain 头注释：
+        // demux+泵在消费线程 ≈0.45s/70MB 全落首帧路径，且消费节奏钳制
+        // 供给）。消费线程从此不推包——CheckKeyFrame/SkipFrames/重锚
+        // 等路径的 PushNext 自动降级为线程自举入口（no-op+ensure）。
+        EnsureHybridPushThread();
+        if (!hybrid_self_feed_.load(std::memory_order_acquire)) {
+            // fallback（env 关线程）：C-77 顶饱（512 包量子泵）在消费线程
+            decoder_->BeginPushBatch();
+            int since_pump = 0;
+            while (!eof_ && since_pump < 512 && decoder_->NeedsPackets()) {
+                PushNextCore();
+                if (!eof_) ++pkts_pushed_;
+                if (++since_pump >= 512) {
+                    decoder_->EndPushBatch();
+                    decoder_->BeginPushBatch();
+                    since_pump = 0;
+                }
             }
-            if (++since_pump >= 512) {
-                decoder_->EndPushBatch();
-                decoder_->BeginPushBatch();
-                since_pump = 0;
-            }
+            decoder_->EndPushBatch();
         }
-        decoder_->EndPushBatch();
     } else {
         while (!eof_ && pkts_pushed_ - frames_popped_ < prefetch_depth - 1) {
             PushNext();
@@ -890,6 +1000,7 @@ NDArray VideoReader::NextFrameImpl() {
     bool ret = false;
     int rewind_offset = 0;
     int retry = 0;
+    auto retry_count_tp_ = std::chrono::steady_clock::now();
     int arm_heals = 1;   // 解码臂冻结自愈计数（1 起：首次检测即用第 1 次）
     while (!ret) {
         // 无条件 PushNext 的账目问题（D3 历史）由 decoder 侧精确在途
@@ -899,7 +1010,22 @@ NDArray VideoReader::NextFrameImpl() {
         // 消费轮询速度把 demux 拉到解码前面 10+ chunks，盲阶段路由
         // 决策全部跑在速率学习之前（hevc 混跑 1042 vs 纯 GPU 1836）。
         // 非 hybrid 解码器 NeedsPackets 恒真，行为不变。
-        if (decoder_->NeedsPackets()) {
+        if (IsHybridType(static_cast<int>(ctx_.device_type)) &&
+                   hybrid_self_feed_.load(std::memory_order_acquire)) {
+            // C-78：供料线程负责推包；消费通知驱动等帧（C-78c：帧落队
+            // notify 唤醒，1ms 兜底轮询——sleep 量化的坑由 notify 免除；
+            // 自旋方案已证与 lander/uploader 锁竞争损 stream 12%）。
+            // EOF 预算防抢跑由下方 retry 的墙钟节流计数承担。
+            // 短自旋覆盖 lost-wakeup 窗口（帧落在 Pop 失败与进入等待
+            // 之间时 notify 已过、谓词无快照可查），随后通知等待兜长停。
+            for (int i_ = 0; i_ < 4; ++i_) std::this_thread::yield();
+            decoder_->WaitFrame(1000);
+        } else if (IsHybridType(static_cast<int>(ctx_.device_type)) &&
+                   decoder_->NeedsPackets()) {
+            // fallback（DECORD_HYBRID_PUSH_THREAD=0）：旧行为——消费线程推包
+            PushNext();
+            if (!eof_) ++pkts_pushed_;  // prefetch accounting
+        } else if (decoder_->NeedsPackets()) {
             PushNext();
             // 与 top-up 同口径：EOF 后 PushNext 是空转，不计入
             if (!eof_) ++pkts_pushed_;  // prefetch accounting
@@ -1009,7 +1135,20 @@ NDArray VideoReader::NextFrameImpl() {
                   << " for example to allow more EOF retry attempts, exit...";
                 }
               }
-              retry++;
+              // C-78b：hybrid 的 retry 计数按墙钟节流（≥100µs 计一次）——
+              // yield 自旋迭代极快，纯计数会在 <3s 烧完 102400 预算、抢在
+              // CU 冻结检测器（3s）+ 自愈前误 FATAL（stream 套件实录）；
+              // 节流后预算 ≈ 10s ≥ 检测器窗口。非 hybrid 计数不变。
+              if (IsHybridType(static_cast<int>(ctx_.device_type))) {
+                  const auto now_tp_ = std::chrono::steady_clock::now();
+                  if (std::chrono::duration_cast<std::chrono::microseconds>(
+                          now_tp_ - retry_count_tp_).count() >= 100) {
+                      ++retry;
+                      retry_count_tp_ = now_tp_;
+                  }
+              } else {
+                  retry++;
+              }
               ret = false;
               if (eof_) {
                 // EOF reached but the decoder has not drained yet (the NVDEC

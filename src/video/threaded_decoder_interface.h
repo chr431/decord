@@ -8,6 +8,8 @@
 #define DECORD_VIDEO_THREADED_DECODER_INTERFACE_H_
 
 #include "ffmpeg/ffmpeg_common.h"
+#include <chrono>
+#include <thread>
 #include <vector>
 #include <decord/runtime/ndarray.h>
 
@@ -103,6 +105,23 @@ class ThreadedDecoderInterface {
          *  ≈0.4s）只在批末付一次。默认空实现（仅 hybrid 覆写）。 */
         virtual void BeginPushBatch() {}
         virtual void EndPushBatch() {}
+
+        /*! rief C-78 供料线程化：消费线程 Pop 的 force-head 再驱动改为
+         *  请求制（泵单线程不变量=仅供料线程跑 PumpFeed）。默认无泵。 */
+        virtual bool PumpRequested() const { return false; }
+        virtual void ServicePumpRequest() {}
+
+        /*! rief C-78b：泵节拍——供料线程在解码未排空期间周期调用
+         *  （替代旧"每次空 Pop 内联泵送"的连续驱动；请求制轮询延迟
+         *  会把吞吐塌到 ~550fps）。默认无泵。 */
+        virtual void TickPump() {}
+
+        /*! rief C-78c：消费等帧（通知驱动）——帧落队 notify 唤醒，
+         *  timeout 兜底轮询。默认退化为睡眠（仅 hybrid 覆写；非 hybrid
+         *  路径不调用）。 */
+        virtual void WaitFrame(int timeout_us) {
+            std::this_thread::sleep_for(std::chrono::microseconds(timeout_us));
+        }
         virtual void SuggestDiscardPTS(std::vector<int64_t> dts) = 0;
         virtual void ClearDiscardPTS() = 0;
         /*! hybrid 遥测快照（"k=v;k=v" 协议字符串；非 hybrid 实现返回空）。

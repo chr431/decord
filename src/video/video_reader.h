@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include <decord/base.h>
 #include <dmlc/concurrency.h>
@@ -188,7 +192,28 @@ class VideoReader : public VideoReaderInterface {
         // CPU filter 层实际裁剪矩形（yuv420p 上 FFmpeg crop 要求偶数宽高，
         // 奇数尺寸产全黑/崩溃 —— 此处按偶数扩充，CropRoi 顶部对齐精裁）
         int roi_fx1_ = 0, roi_fy1_ = 0, roi_fw_ = 0, roi_fh_ = 0;
-        bool eof_;  // end of file indicator
+        std::atomic<bool> eof_{false};  // C-78 起跨线程（供料线程写，消费线程读）
+        // ── C-78 供料线程（传输重设计轮）────────────────────────────
+        // demux+泵从消费线程解耦：专线程以 NeedsPackets 为门推包（含
+        // C-77 的 512 包量子泵）。消费线程的 PushNext 变 no-op（仅确保
+        // 线程在跑）；seek/Clear 经停泊握手与线程互斥（fmt_ctx_ 与泵
+        // 状态的独占）。DECORD_HYBRID_PUSH_THREAD=0 回退旧行为。
+        std::thread hybrid_push_thread_;
+        std::atomic<bool> hybrid_self_feed_{false};
+        std::atomic<bool> push_thread_run_{false};
+        std::atomic<bool> park_req_{false};
+        std::atomic<bool> thread_parked_{false};
+        int park_depth_ = 0;             // 仅消费线程（嵌套停泊）
+        std::mutex park_mtx_;
+        std::condition_variable park_cv_;
+        std::mutex push_start_mtx_;
+        void HybridPushThreadMain();
+        void EnsureHybridPushThread();
+        void StopHybridPushThread();
+        void ParkHybridPushThread();
+        void ResumeHybridPushThread();
+        void PushNextCore();             // 原 PushNext 主体（供料线程执行）
+        static bool HybridPushEnabled();  // DECORD_HYBRID_PUSH_THREAD != 0
         /*! \brief decoder queue in-flight depth accounting.  NextFrameImpl
          *  keeps pkts_pushed_ - frames_popped_ near kPrefetchDepth so the
          *  decoder threads / GPU surfaces stay busy instead of being

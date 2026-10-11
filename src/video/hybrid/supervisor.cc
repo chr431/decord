@@ -349,7 +349,10 @@ void HybridThreadedDecoder::SetCodecContext(AVCodecContext* dec_ctx, int width, 
             if (!marker) GpuFrameProduced();
             lcv_.notify_all();
         });
-        cpu_.SetOnOutput([this] { lcv_.notify_all(); });
+        cpu_.SetOnOutput([this] {
+            landed_.fetch_add(1, std::memory_order_release);  // C-78c：CPU 臂帧账
+            lcv_.notify_all();
+        });
         gpu_pool_.SetOnRelease([this] { lcv_.notify_all(); });
         up_pool_.SetOnRelease([this] { lcv_.notify_all(); });
         if (out_cuda_) {
