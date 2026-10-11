@@ -582,7 +582,11 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     // ── 硬件自适应预算（SetCodecContext 计算；全部有界）──
     int gpu_pool_frames_ = 128;   ///< GPU 解码池深（显存，按空闲量自适应）
     int up_pool_frames_ = 96;     ///< 上载池深（显存，GPU 驻留模式）
-    int queue_frames_ = 384;      ///< CPU 存货队列深（RAM）
+    int queue_frames_ = 1536;     ///< CPU 存货队列深（RAM）。C-70（2026-10-11）：
+    ///< 384 ≈ 1.3 GOP 的前视在按序合并下造成双臂串行（FORCE_SIDE 分臂
+    ///< 实测 cpu 2806/gpu 2745，均衡仅 2787 ≈ 串行和；每帧 ROI-gray
+    ///< ~3.4KB → 1536 帧 ≈ 5MB RAM，安全）。out_cuda_ 显存口径不受本值
+    ///< 影响（ready_cap_frames_ 走 kReadyMaxBytesGpu 预算）。
     int ready_cap_frames_ = 341;  ///< sess_.ready_ 帧数上限（RAM/显存口径合一）
     int prefetch_frames_ = 384;   ///< demux 领先深度建议（包）
 
