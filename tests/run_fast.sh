@@ -46,15 +46,18 @@ LOGDIR="${TMPDIR:-/tmp}/run_fast.$$"
 mkdir -p "$LOGDIR"
 
 run_suite() {  # run_suite <name> <cmd...>
+  # 2026-10-11：每套件计时（用户钦定——新增用例/套件变慢即现形）
   local name="$1"; shift
+  local t0; t0=$(date +%s)
   timeout "$TIMEOUT" "$@" > "$LOGDIR/$name.log" 2>&1
   local rc=$?
+  local dt=$(( $(date +%s) - t0 ))
   if [ $rc -eq 0 ]; then
-    echo "PASS $name"
+    echo "PASS $name (${dt}s)"
   elif [ $rc -eq 124 ]; then
-    echo "FAIL $name (timeout ${TIMEOUT}s) — $LOGDIR/$name.log"
+    echo "FAIL $name (timeout ${TIMEOUT}s, ran ${dt}s) — $LOGDIR/$name.log"
   else
-    echo "FAIL $name (exit $rc) — $LOGDIR/$name.log"
+    echo "FAIL $name (exit $rc, ${dt}s) — $LOGDIR/$name.log"
   fi
   return $rc
 }
