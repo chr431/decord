@@ -1022,9 +1022,12 @@ NDArray VideoReader::NextFrameImpl() {
             decoder_->WaitFrame(1000);
         } else if (IsHybridType(static_cast<int>(ctx_.device_type)) &&
                    decoder_->NeedsPackets()) {
-            // fallback（DECORD_HYBRID_PUSH_THREAD=0）：旧行为——消费线程推包
+            // fallback（DECORD_HYBRID_PUSH_THREAD=0）：旧行为——消费线程推包；
+            // 并内联服务 force-head 请求（fallback 无供料线程，泵单线程
+            // 不变量=消费线程——C-79 审计发现的漏服务 bug）
             PushNext();
             if (!eof_) ++pkts_pushed_;  // prefetch accounting
+            decoder_->ServicePumpRequest();
         } else if (decoder_->NeedsPackets()) {
             PushNext();
             // 与 top-up 同口径：EOF 后 PushNext 是空转，不计入

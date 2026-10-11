@@ -173,7 +173,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                     // 成熟前被 50/50 交替盲派（CPU 臂超分 200+ 帧 = 慢臂
                     // 尾部 0.24s+；_probe_hybrid_startup 实测）。挂起零
                     // 成本：包缓存即为此设计。防饿死例外：①某侧空转
-                    // （sess_.side_pending_==0）→ 盲派给空侧——纯库存读数，
+                    // （side_pending_==0）→ 盲派给空侧——纯库存读数，
                     // 无速率假设；②头部强制派工（force_head，Pop 饿死
                     // 解锁）：库存残帧互锁时由消费线程经 Pop 重驱泵并
                     // 强制分配头部 GOP。双空走 PickFeedSide（gop0 GPU
@@ -195,8 +195,8 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         sess_.alloc_seq_ += 'H';
                     } else if (cpu_.ProductionRate() <= 0.0 ||
                                gpu_rate_landed_.load(std::memory_order_relaxed) <= 0.0) {
-                        const bool cpu_idle = sess_.side_pending_[SIDE_CPU] == 0;
-                        const bool gpu_idle = sess_.side_pending_[SIDE_GPU] == 0;
+                        const bool cpu_idle = side_pending_[SIDE_CPU].load(std::memory_order_relaxed) == 0;
+                        const bool gpu_idle = side_pending_[SIDE_GPU].load(std::memory_order_relaxed) == 0;
                         if (!cpu_idle && !gpu_idle) {
                             held_unassigned = true;
                             break;
@@ -264,7 +264,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                         const int64_t cap = (g.side == SIDE_CPU)
                                                 ? static_cast<int64_t>(queue_frames_)
                                                 : static_cast<int64_t>(ready_cap_frames_);
-                        if (sess_.side_pending_[g.side] >= cap) {
+                        if (side_pending_[g.side].load(std::memory_order_relaxed) >= cap) {
                             earlier_pending[(int)g.side] = true;
                             continue;
                         }
@@ -390,7 +390,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                             (long long)g.id,
                             (it->dst == s && g.id > it->after_gop) ? " MATCH" : "");
                         if (it->dst == s && g.id > it->after_gop) {
-                            ++sess_.side_pending_[s];
+                            side_pending_[s].fetch_add(1, std::memory_order_relaxed);
                             kicks_[s].fetch_add(1, std::memory_order_relaxed);
                             kicks_to_send.emplace_back(s, std::move(it->pkt));
                             it = sess_.pending_kicks_.erase(it);
@@ -400,19 +400,19 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                     }
                 }
             }
-            ++sess_.side_pending_[s];
+            side_pending_[s].fetch_add(1, std::memory_order_relaxed);
             // 2026-09-19 冻结前清理：此处原有 arm_kick 恒假分支（其唯一
             // 赋值点在 fef3c4b 重设计时删除），连带 kick_dst 死变量。
             // 现直接走"已武装则按债务克隆"的活分支。
             if (sess_.kick_side_ != Side(-1)) {
-                if (sess_.side_pending_[sess_.kick_side_] - sess_.kick_cloned_ <= 0) {
+                if (side_pending_[sess_.kick_side_].load(std::memory_order_relaxed) - sess_.kick_cloned_ <= 0) {
                     sess_.kick_side_ = Side(-1);
                     sess_.kick_owed_ = sess_.kick_cloned_ = 0;
                 } else if (is_key) {
                     sess_.kick_side_ = Side(-1);
                     sess_.kick_owed_ = sess_.kick_cloned_ = 0;
                 } else if (s != sess_.kick_side_ && sess_.kick_cloned_ < kick_guard_) {
-                    ++sess_.side_pending_[sess_.kick_side_];
+                    side_pending_[sess_.kick_side_].fetch_add(1, std::memory_order_relaxed);
                     ++sess_.kick_cloned_;
                     fb_clones_.fetch_add(1, std::memory_order_relaxed);
                     clone_debt = true;
@@ -488,7 +488,7 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
             for (auto it = sess_.pending_kicks_.begin(); it != sess_.pending_kicks_.end();) {
                 tr2probe::add("[tr2] KICK-backstop dst=%d pts=%lld after_gop=%lld\n", (int)it->dst,
                               (long long)it->pkt->pts, (long long)it->after_gop);
-                ++sess_.side_pending_[it->dst];
+                side_pending_[it->dst].fetch_add(1, std::memory_order_relaxed);
                 kicks_[it->dst].fetch_add(1, std::memory_order_relaxed);
                 eof_kicks.emplace_back(it->dst, std::move(it->pkt));
                 it = sess_.pending_kicks_.erase(it);
@@ -574,7 +574,7 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
                         late_feeds_.fetch_add(1, std::memory_order_relaxed);
                         const Side s2 = own->side;
                         if (s2 != Side(-1)) {
-                            ++sess_.side_pending_[s2];
+                            side_pending_[s2].fetch_add(1, std::memory_order_relaxed);
                             if (s2 == SIDE_CPU) {
                                 cpu_.Push(std::move(pkt), runtime::NDArray());
                             } else {
@@ -761,8 +761,8 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                     fprintf(stderr,
                             "\n[pop-stall3] unassigned-head eq=%zu gops=%zu "
                             "pend=%d/%d infl=%lld fp=%d\n",
-                            eqn, gsz, (int)sess_.side_pending_[0], (int)sess_.side_pending_[1],
-                            (long long)(sess_.side_pending_[0] + sess_.side_pending_[1]),
+                            eqn, gsz, (int)side_pending_[0].load(std::memory_order_relaxed), (int)side_pending_[1].load(std::memory_order_relaxed),
+                            (long long)(side_pending_[0].load(std::memory_order_relaxed) + side_pending_[1].load(std::memory_order_relaxed)),
                             (int)sess_.eof_pushed_);
                     fflush(stderr);
                 }
@@ -783,14 +783,14 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
         // 排空（EOF 或窗缘）已武装后不适用——交给下方 eof-starve 网
         // （1s 时间门 + GPU 侧 pending==0 判别，鲁棒于池互锁长停）。
         if (!(sess_.eof_pushed_ || sess_.range_end_pushed_) && ch.expected > 0 &&
-            ch.emitted < ch.expected && sess_.side_pending_[ch.side] == 0) {
+            ch.emitted < ch.expected && side_pending_[ch.side].load(std::memory_order_relaxed) == 0) {
             bool close_it = false;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 if (sess_.emit_queue_.size() > 1 &&
                     sess_.emit_queue_.front().start_pts == ch.start_pts &&
                     sess_.emit_queue_.front().emitted == ch.emitted &&
-                    sess_.side_pending_[ch.side] == 0) {
+                    side_pending_[ch.side].load(std::memory_order_relaxed) == 0) {
                     sess_.emit_queue_.pop_front();
                     close_it = true;
                 }
@@ -864,8 +864,8 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                                 " infl=%lld cud=%lld/%lld/%lld\n",
                                 (int)s, crdy, rdy, (int)ch.side, (long long)ch.start_pts,
                                 (long long)ch.end_pts, (long long)ch.expected,
-                                (long long)ch.emitted, (int)sess_.side_pending_[0],
-                                (int)sess_.side_pending_[1], (long long)cpu_.QueueDepth(),
+                                (long long)ch.emitted, (int)side_pending_[0].load(std::memory_order_relaxed),
+                                (int)side_pending_[1].load(std::memory_order_relaxed), (long long)cpu_.QueueDepth(),
                                 (long long)cpu_.PendingDepth(), qpk, eqn, stm,
                                 (long long)gpu_pool_.DiagFree(), (long long)gpu_pool_.DiagCreated(),
                                 (long long)up_pool_.DiagFree(), (long long)up_pool_.DiagCreated(),
@@ -873,7 +873,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                                 (int)sess_.eof_cache_, (long long)kicks_[0].load(),
                                 (long long)kicks_[1].load(), (int)sess_.kick_side_,
                                 sess_.kick_cloned_, sess_.kick_owed_,
-                                (long long)(sess_.side_pending_[0] + sess_.side_pending_[1]), cud_p,
+                                (long long)(side_pending_[0].load(std::memory_order_relaxed) + side_pending_[1].load(std::memory_order_relaxed)), cud_p,
                                 cud_b, cud_o);
                     }
                 }
@@ -927,7 +927,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
             // 包缓存时 demux 秒完，sess_.eof_pushed_ 在**消费中段**即置位，而
             // GPU 臂池互锁的合法停滞 ≥3s（formats 运行捕获）会被 1s 网
             // 误关有帧 chunk → 帧永久丢失 → stream 套件 3/5 FATAL。v2
-            // 对 GPU 侧增加 sess_.side_pending_[s]==0 门：该侧仍有在途工作
+            // 对 GPU 侧增加 side_pending_[s]==0 门：该侧仍有在途工作
             // （已解码未上载/未消费的帧都计入 pending，合法互锁停滞必然
             // pending>0）时永不强关，只在「该侧确无任何可再到达的帧」时
             // 收口。CPU 半边保持首轮语义（16/16 绿证据面，不加门）：软解
@@ -938,7 +938,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
             // 重做注（2026-10-08）：窗缘排空（range_end_pushed_）同入此
             // 网——窗界 flush 后 marker 顺序竞态的失配形态与 EOF 同构。
             if ((sess_.eof_pushed_ || sess_.range_end_pushed_) && !sess_.emit_queue_.empty() &&
-                (s == SIDE_CPU || sess_.side_pending_[s] == 0)) {
+                (s == SIDE_CPU || side_pending_[s].load(std::memory_order_relaxed) == 0)) {
                 const auto now_tp = std::chrono::steady_clock::now();
                 if (!eof_starve_on_) {
                     eof_starve_on_ = true;
@@ -949,7 +949,14 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                     bool closed = false;
                     {
                         std::lock_guard<std::mutex> lk(mtx_);
-                        if (!sess_.emit_queue_.empty() && sess_.emit_queue_.front().id == ch.id) {
+                        // C-79：外层触发条件是无锁弱读（eof_pushed_/emit_queue_
+                        // 由供料线程写）——动门（关队头 chunk）前在锁内复核
+                        if (!(sess_.eof_pushed_ || sess_.range_end_pushed_) ||
+                            sess_.emit_queue_.empty() ||
+                            !(s == SIDE_CPU ||
+                              side_pending_[s].load(std::memory_order_relaxed) == 0)) {
+                            eof_starve_on_ = false;
+                        } else if (sess_.emit_queue_.front().id == ch.id) {
                             sess_.emit_queue_.pop_front();
                             closed = true;
                         }
@@ -987,12 +994,15 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                             .count() >= 3000) {
                         gpu_arm_stall_.fetch_add(1, std::memory_order_relaxed);
                         arm_stalled_.store(true, std::memory_order_release);
+                        int ph_ = -1;
+                        int64_t ph_age_ = -1;
+                        gpu_->DiagPhase(&ph_, &ph_age_);
                         fprintf(stderr,
                                 "[hybrid] GPU arm stalled: CU decode worker "
-                                "frozen (pkt_queue=%lld unconsumed, "
-                                "reorder=0, no output 3s) - signaling "
+                                "frozen (pkt_queue=%lld unconsumed, reorder=0, "
+                                "no output 3s, phase=%d age=%lldms) - signaling "
                                 "VideoReader self-heal\n",
-                                (long long)cp_);
+                                (long long)cp_, ph_, (long long)ph_age_);
                         fflush(stderr);
                     }
                 } else if (frozen_sig || gpu_stall_fg_ != fg_now) {
@@ -1060,15 +1070,15 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                             "\n[stale-drain] n=%lld head=(side%d,%lld,%lld) "
                             "pend=%d/%d em=%lld/%lld eq=%zu fp=%d\n",
                             (long long)stale_in_call, (int)ch.side, (long long)ch.start_pts,
-                            (long long)ch.end_pts, (int)sess_.side_pending_[0],
-                            (int)sess_.side_pending_[1], (long long)ch.emitted,
+                            (long long)ch.end_pts, (int)side_pending_[0].load(std::memory_order_relaxed),
+                            (int)side_pending_[1].load(std::memory_order_relaxed), (long long)ch.emitted,
                             (long long)ch.expected, sess_.emit_queue_.size(),
                             (int)sess_.eof_pushed_);
                     fflush(stderr);
                 }
             }
             std::lock_guard<std::mutex> lk(mtx_);
-            --sess_.side_pending_[s];
+            side_pending_[s].fetch_sub(1, std::memory_order_relaxed);
             continue;
         }
         if (ch.end_pts != INT64_MAX && f.pts >= ch.end_pts) {
@@ -1107,7 +1117,7 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                     sess_.emit_queue_.pop_front();
                 }
             }
-            --sess_.side_pending_[s];
+            side_pending_[s].fetch_sub(1, std::memory_order_relaxed);
             ++sess_.emitted_total_;
         }
         frames_out_[s]++;
@@ -1127,10 +1137,17 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                     int64_t cp = -1, cb = -1, co = -1;
                     if (gpu_) gpu_->DiagDepths(&cp, &cb, &co);
                     std::size_t crdy = 0, rdy = 0;
+                    int64_t gi_ = -1, gn_ = -1;
                     {
                         std::lock_guard<std::mutex> lk(rmtx_);
                         crdy = sess_.cpu_ready_.size();
                         rdy = sess_.ready_.size();
+                    }
+                    {
+                        // C-79：gi/gops 由供料线程写——诊断打印读也入锁
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        gi_ = sess_.feed_gop_idx_;
+                        gn_ = static_cast<int64_t>(sess_.gops_.size());
                     }
                     fprintf(stderr,
                             "\n[emit-tl] t=%.2f total=%lld c=%lld(+%lld) g=%lld(+%lld) rate=%.0f"
@@ -1142,8 +1159,8 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                             (long long)cpu_.QueueDepth(), (long long)cpu_.PendingDepth(),
                             (long long)cpu_.RawDepth(), (long long)cp, (long long)cb, (long long)co,
                             crdy, rdy,
-                            (long long)sess_.side_pending_[0], (long long)sess_.side_pending_[1],
-                            (long long)sess_.feed_gop_idx_, sess_.gops_.size());
+                            (long long)side_pending_[0].load(std::memory_order_relaxed), (long long)side_pending_[1].load(std::memory_order_relaxed),
+                            gi_, gn_);
                     tl_tp = now;
                     tl_c = c;
                     tl_g = g;

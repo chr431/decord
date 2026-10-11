@@ -213,7 +213,7 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
         return SIDE_GPU;  // 消融：AV1 纯 GPU（复评对照臂）
     }
     if (sess_.eof_cache_ && sess_.gop_seq_ - sess_.feed_gop_idx_ <= 10) {
-        return sess_.side_pending_[SIDE_CPU] <= sess_.side_pending_[SIDE_GPU] ? SIDE_CPU : SIDE_GPU;
+        return side_pending_[SIDE_CPU].load(std::memory_order_relaxed) <= side_pending_[SIDE_GPU].load(std::memory_order_relaxed) ? SIDE_CPU : SIDE_GPU;
     }
     if (sess_.chunks_assigned_[SIDE_CPU] == 0) {
         return sess_.chunks_assigned_[SIDE_GPU] >= 1 ? SIDE_CPU : SIDE_GPU;
@@ -246,7 +246,7 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
         }
         if (window_remaining <= 10 * gop_est) {
             // ETA 口径（首版 least-pending 实测大回归 1.6-1.7s：
-            // sess_.side_pending_ 含按序合并的等待发射帧——GPU 臂解码完成但
+            // side_pending_ 含按序合并的等待发射帧——GPU 臂解码完成但
             // 排在 CPU chunk 后等发射时 pending 虚高，尾被系统性派给
             // 慢的 CPU 臂）。ETA=未解码余量/实测速率：谁先腾手给谁；
             // 速率未熟退回供水比例（下方 water-fill）。未解码余量走
@@ -339,7 +339,7 @@ int64_t HybridThreadedDecoder::UndecodedBacklog(Side s) {
             std::lock_guard<std::mutex> lk(rmtx_);
             inv += sess_.cpu_ready_.size();
         }
-        return std::max<int64_t>(sess_.side_pending_[SIDE_CPU] - static_cast<int64_t>(inv), 0);
+        return std::max<int64_t>(side_pending_[SIDE_CPU].load(std::memory_order_relaxed) - static_cast<int64_t>(inv), 0);
     }
     std::size_t inv = 0;
     {
@@ -359,7 +359,7 @@ int64_t HybridThreadedDecoder::UndecodedBacklog(Side s) {
         (void)cb;
         if (co > 0) inv += static_cast<std::size_t>(co);
     }
-    return std::max<int64_t>(sess_.side_pending_[SIDE_GPU] - static_cast<int64_t>(inv), 0);
+    return std::max<int64_t>(side_pending_[SIDE_GPU].load(std::memory_order_relaxed) - static_cast<int64_t>(inv), 0);
 }
 
 }  // namespace decord

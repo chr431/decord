@@ -205,7 +205,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  给另一侧分 GOP，而这类 chunk 永远不会被喂包 —— Pop 卡死在队头
      * （实测 `[pop-stall] side=1 crdy=637 rdy=0 …`：数百帧已上载的 CPU
      *  存货被一个不会来的 GPU chunk 堵死，且 force-close 安全网因
-     *  sess_.side_pending_[GPU]≠0 而正确地不敢关它）。 */
+     *  side_pending_[GPU]≠0 而正确地不敢关它）。 */
     Side ForcedSide() const;
     /*! rief pts 	o 呈现序帧号（kf 表近似，调度用） */
     /*! \brief chunk [start,end) 的期望帧数（查 kf 索引；0=未知） */
@@ -345,7 +345,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool NeedsPackets() const override {
         if (sess_.eof_cache_) return false;
         if (sess_.kick_side_ != Side(-1) &&
-            sess_.side_pending_[sess_.kick_side_] - sess_.kick_cloned_ > 0) {
+            side_pending_[sess_.kick_side_].load(std::memory_order_relaxed) - sess_.kick_cloned_ > 0) {
             return true;
         }
         // 硬窗界（区间版，2026-10-08 重做）：窗缘已知（已见起始帧号 ≥
@@ -362,7 +362,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
         if (sess_.cache_bytes_ < cache_budget_) return true;
         const int64_t cpu_cap = static_cast<int64_t>(queue_frames_);
         const int64_t gpu_cap = static_cast<int64_t>(ready_cap_frames_);
-        return sess_.side_pending_[SIDE_CPU] < cpu_cap || sess_.side_pending_[SIDE_GPU] < gpu_cap;
+        return side_pending_[SIDE_CPU].load(std::memory_order_relaxed) < cpu_cap || side_pending_[SIDE_GPU].load(std::memory_order_relaxed) < gpu_cap;
     }
 
     /*! \brief GPU 输出缓冲池（有界，阻塞 Acquire）。声明在 gpu_ 之前：
@@ -463,9 +463,9 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  KICK_BURST=5/16 的"猜重排深度"设计——16 对 bf16 金字塔（实测
      *  重排深度 17）仍不够，调参只是压概率不是消除）：
      *
-     *  切换时刻快照离场侧债务 `sess_.kick_owed_ = sess_.side_pending_[side]`（含
+     *  切换时刻快照离场侧债务 `sess_.kick_owed_ = side_pending_[side]`（含
      *  kick IDR 克隆包）；此后每个非 key 包，只要债务未清偿
-     *  （`sess_.side_pending_[side] − sess_.kick_cloned_ > 0`：切换前路由的帧仍有
+     *  （`side_pending_[side] − sess_.kick_cloned_ > 0`：切换前路由的帧仍有
      *  滞留——发射与陈旧丢弃都减 pending，克隆自身加 pending 故扣除）
      *  就克隆一份喂给离场侧，驱动其 DPB 交出滞留帧；**清偿由解码器
      *  实际产出闭环**，不依赖任何重排深度假设。解除/作废：
@@ -582,7 +582,6 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
         bool eof_pushed_ = false;           ///< **真 EOF** 排空已武装（重做：窗缘不再复用此标志）
         bool range_end_pushed_ = false;     ///< 硬窗缘排空已武装（重做新增）
         int64_t emitted_total_ = 0;         ///< 全局已发射帧数（消费位置）
-        int64_t side_pending_[2] = {0, 0};  ///< 各侧已路由未发射帧数（包粒度精确）
         bool eof_flush_out_ = false;        ///< 臂排空标记已实际发出（锁外发送）
         // ── GPU 喂料（lcv_mtx_；demux 写 / lander 读）──
         std::deque<ffmpeg::AVPacketPtr> gpu_pkt_q_;  ///< 待喂 GPU 包（Push 永不阻塞的关键）
@@ -628,6 +627,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     int prefetch_frames_ = 384;   ///< demux 领先深度建议（包）
 
     std::atomic<int64_t> frames_out_[2]{};
+        std::atomic<int64_t> side_pending_[2]{};  ///< C-79：已路由未发射（泵[供料线程]写/发射[消费线程]核销/判据读三处跨线程——原子化根治形式竞态；ResetRouting 显式清零）
     // ── 非打印测量（2026-09-12，§7.2 先量后做）──────────────────────
     // 热路径只做 relaxed 整数累加，**不打 stderr**；唯一输出点是 Stop()
     // 里 `DECORD_HYBRID_STATS` 门控的一次性汇总块（析构时触发，不在被测
@@ -662,7 +662,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     // marker 顺序竞态（侧排空 marker 在 sess_.eof_pushed_ 置位前被「吞掉」
     // 分支误食）→ chunk 会计与实际产出永久失配 → 队头侧零产出。1s 空窗
     // （时间基准，防大 GOP 突发误伤）+ GPU 侧真·尾部判别门
-    // （sess_.side_pending_[s]==0；2026-09-28 对称扩展 v2——首轮裸对称版因
+    // （side_pending_[s]==0；2026-09-28 对称扩展 v2——首轮裸对称版因
     // GPU 臂合法池互锁停滞 ≥3s 被误关而回退，CPU 半边保持首轮语义）后
     // 按 force-close 语义关队头 chunk。
     std::chrono::steady_clock::time_point eof_starve_tp_{};

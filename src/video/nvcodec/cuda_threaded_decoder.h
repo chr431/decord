@@ -71,6 +71,31 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
          *  环）。混合解码器 Pop 空手时用来自证 8 帧卡在哪一层：pkt>0 =
          *  解析线程停摆；pkt=0 而 bufs/ord 非零 = 解码/转换在途；
          *  三全零 = NVDEC DPB 扣留（等驱动它的后续包）。 */
+        /*! rief C-79 竞态取证：解析线程相位（原子枚举 + 变更时刻）。
+         *  冻结签名 pkt>0/bufs>0/ord==0 时指认卡点（POP_WAIT=取包、
+         *  BSF、PARSE=驱动内、CB_* 回调、CTX_PUSH=线程入口卡上下文）。 */
+        enum class Phase : int { None=0, CtxPush, PopWait, Bsf, Parse, CbSeq, CbDec, CbDisp, Exit };
+        void DiagPhase(int *phase, int64_t *age_ms) {
+            *phase = static_cast<int>(diag_phase_.load(std::memory_order_acquire));
+            *age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - diag_phase_tp_).count();
+        }
+        void SetPhase(Phase p) {
+            diag_phase_.store(static_cast<int>(p), std::memory_order_release);
+            diag_phase_tp_ = std::chrono::steady_clock::now();
+        }
+        /*! 回调相位 RAII：进入记回调相位，退出回到 Parse（回调同步于
+         *  cuvidParseVideoData 内）——冻结时相位即卡点。仅诊断线程自身
+         *  顺序写。 */
+        struct PhaseKeeper {
+            CUThreadedDecoder* d_;
+            Phase prev_;
+            explicit PhaseKeeper(CUThreadedDecoder* d, Phase cur)
+                : d_(d), prev_(static_cast<Phase>(d->diag_phase_.load(std::memory_order_relaxed))) {
+                d->SetPhase(cur);
+            }
+            ~PhaseKeeper() { d_->SetPhase(prev_); }
+        };
         void DiagDepths(int64_t *pkt, int64_t *bufs, int64_t *ord) {
             *pkt = pkt_queue_ ? static_cast<int64_t>(pkt_queue_->Size()) : -1;
             *bufs = frame_queue_ ? static_cast<int64_t>(frame_queue_->Size()) : -1;
@@ -83,6 +108,8 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
         int64_t DecodeBusyUs() const {
             return dec_busy_us_.load(std::memory_order_relaxed);
         }
+        std::atomic<int> diag_phase_{0};
+        std::chrono::steady_clock::time_point diag_phase_tp_ = std::chrono::steady_clock::now();
         int64_t DecodeBusyPics() const {
             return dec_busy_pics_.load(std::memory_order_relaxed);
         }

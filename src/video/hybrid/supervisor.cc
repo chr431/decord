@@ -625,8 +625,10 @@ void HybridThreadedDecoder::StopGpuWorker() {
 }
 
 void HybridThreadedDecoder::SetDecodeWindowRange(int64_t lo, int64_t hi) {
-    // 与 NeedsPackets/PumpFeed 同线程（消费线程），无竞态。跨会话存活：
-    // reader 每次 seek 落锚重推（RefreshWindowRange），无累积。
+    // C-79 审计修正注释：NeedsPackets/PumpFeed 已在供料线程（C-78）——
+    // 无竞态的真实保证是**调用点都在停泊窗内或线程启动前**：设窗=reader
+    // 构造期（供料线程未启动）；重推=Seek 的 ParkHybridPushThread 区间。
+    // 跨会话存活：reader 每次 seek 落锚重推（RefreshWindowRange），无累积。
     // hi ≤ lo = 撤销窗（全片读）。
     window_lo_ = lo;
     window_hi_ = hi;
@@ -820,6 +822,8 @@ void HybridThreadedDecoder::ResetRouting() {
         std::lock_guard<std::mutex> lk2(lcv_mtx_);
         std::lock_guard<std::mutex> lk3(rmtx_);
         sess_ = SessionState{};
+        side_pending_[0].store(0, std::memory_order_relaxed);  // C-79：迁出 SessionState（原子不可聚合重置）
+        side_pending_[1].store(0, std::memory_order_relaxed);
     }
     // kf 索引保留：Seek 后复用帧数表
 }

@@ -51,7 +51,7 @@ void HybridThreadedDecoder::FlightRecorderLoop() {
             eofp = sess_.eof_pushed_;
             armf = sess_.arm_flush_sent_;
             eofo = sess_.eof_flush_out_;
-            hpend = sess_.side_pending_[0] + sess_.side_pending_[1];
+            hpend = side_pending_[0].load(std::memory_order_relaxed) + side_pending_[1].load(std::memory_order_relaxed);
         }
         std::size_t crdy = 0, rdy = 0;
         {
@@ -139,8 +139,8 @@ void HybridThreadedDecoder::DumpState(const char* tag) const {
         "crdy=%zu rdy=%zu qpk=%zu gfl=%lld cq=%lld cp=%lld "
         "cud=%lld/%lld/%lld "
         "fc=%lld fg=%lld em=%lld fe=%lld eof=%d%d%d drained=%d\n",
-        tag, eq, hside, (long long)hs, (long long)hexp, (long long)hem, (int)sess_.side_pending_[0],
-        (int)sess_.side_pending_[1], crdy, rdy, qpk, (long long)gfl, (long long)cpu_.QueueDepth(),
+        tag, eq, hside, (long long)hs, (long long)hexp, (long long)hem, (int)side_pending_[0].load(std::memory_order_relaxed),
+        (int)side_pending_[1].load(std::memory_order_relaxed), crdy, rdy, qpk, (long long)gfl, (long long)cpu_.QueueDepth(),
         (long long)cpu_.PendingDepth(), (long long)cud_p, (long long)cud_b, (long long)cud_o,
         (long long)frames_out_[0].load(std::memory_order_relaxed),
         (long long)frames_out_[1].load(std::memory_order_relaxed), (long long)sess_.emitted_total_,

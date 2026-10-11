@@ -265,6 +265,7 @@ int CUDAAPI CUThreadedDecoder::HandlePictureDisplay(void* user_data,
 }
 
 int CUThreadedDecoder::HandlePictureSequence_(CUVIDEOFORMAT* format) {
+    PhaseKeeper pk_(this, Phase::CbSeq);
     // width_ = format->coded_width;
     // height_ = format->coded_height;
     frame_base_ = {static_cast<int>(format->frame_rate.denominator),
@@ -274,6 +275,7 @@ int CUThreadedDecoder::HandlePictureSequence_(CUVIDEOFORMAT* format) {
 
 int CUThreadedDecoder::HandlePictureDecode_(CUVIDPICPARAMS* pic_params) {
     if (!run_.load()) return 0;
+    PhaseKeeper pk_(this, Phase::CbDec);
     CHECK(decoder_.Initialized());
     // CHECK_GE(pic_params->CurrPicIdx, 0);
     // CHECK_LT(pic_params->CurrPicIdx, permits_.size());
@@ -366,6 +368,7 @@ cudaEvent_t CUThreadedDecoder::PopFrameEvent() {
 
 int CUThreadedDecoder::HandlePictureDisplay_(CUVIDPARSERDISPINFO* disp_info) {
     if (!run_.load()) return 0;
+    PhaseKeeper pk_(this, Phase::CbDisp);
     // Release the previous deferred mapping before enqueuing this frame's
     // conversion (its kernel finished during the last decode interval).
     FlushDeferred();
@@ -534,13 +537,17 @@ void CUThreadedDecoder::LaunchThread() {
 }
 
 void CUThreadedDecoder::LaunchThreadImpl() {
+    SetPhase(Phase::CtxPush);
     ctx_.Push();
+    SetPhase(Phase::PopWait);
     // LOG(INFO) << "LaunchThread, thread id: " << std::this_thread::get_id();
     while (run_.load()) {
         bool ret;
         AVPacketPtr avpkt = nullptr;
+        SetPhase(Phase::PopWait);
         ret = pkt_queue_->Pop(&avpkt);
         if (!ret) {
+            SetPhase(Phase::Exit);
             // Flush the deferred mapping before the thread exits (context
             // stays current on this thread).
             FlushDeferred();
@@ -550,6 +557,7 @@ void CUThreadedDecoder::LaunchThreadImpl() {
         pkt_room_cv_.notify_one();
 
         if (avpkt && avpkt->size) {
+            SetPhase(Phase::Bsf);
             // Strip side data before BSF: the hardware decoder only needs raw
             // bitstream data.  FFmpeg 8.x may attach side data (HDR metadata,
             // display matrix, etc.) to every packet; clearing it avoids
@@ -571,6 +579,7 @@ void CUThreadedDecoder::LaunchThreadImpl() {
                     cupkt.timestamp = filtered_avpkt->pts;
                 }
 
+                SetPhase(Phase::Parse);
                 if (!CHECK_CUDA_CALL(nv::cuvidParseVideoData(parser_, &cupkt))) {
                     LOG(FATAL) << "Problem decoding packet";
                 }
@@ -583,6 +592,7 @@ void CUThreadedDecoder::LaunchThreadImpl() {
         } else {
             CUVIDSOURCEDATAPACKET cupkt = {0};
             cupkt.flags = CUVID_PKT_ENDOFSTREAM;
+            SetPhase(Phase::Parse);
             if (!CHECK_CUDA_CALL(nv::cuvidParseVideoData(parser_, &cupkt))) {
                 LOG(FATAL) << "Problem decoding packet";
             }
