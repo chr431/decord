@@ -248,32 +248,15 @@ HybridThreadedDecoder::Side HybridThreadedDecoder::PickFeedSide() {
             // ETA 口径（首版 least-pending 实测大回归 1.6-1.7s：
             // sess_.side_pending_ 含按序合并的等待发射帧——GPU 臂解码完成但
             // 排在 CPU chunk 后等发射时 pending 虚高，尾被系统性派给
-            // 慢的 CPU 臂）。ETA=未解码余量/实测速率：pending 扣除
-            // 已解码存货（CPU=filter 队列深，GPU=sess_.ready_/sess_.cpu_ready_），
-            // 谁先腾手给谁；速率未熟退回供水比例（下方 water-fill）。
+            // 慢的 CPU 臂）。ETA=未解码余量/实测速率：谁先腾手给谁；
+            // 速率未熟退回供水比例（下方 water-fill）。未解码余量走
+            // C-73 的 side-pure UndecodedBacklog（首版把 cpu_ready_
+            // 记进 GPU 存货账户，gpu-out 模式两侧互换——见 .h 注释）。
             const double r_c = cpu_.ProductionRate();
             const double r_g = gpu_rate_landed_.load(std::memory_order_relaxed);
             if (r_c > 0.0 && r_g > 0.0) {
-                std::size_t gpu_inv = 0;
-                {
-                    std::lock_guard<std::mutex> lk(rmtx_);
-                    gpu_inv = sess_.ready_.size() + (out_cuda_ ? sess_.cpu_ready_.size() : 0);
-                }
-                // 已解码存货另含 cuvid reorder 输出队列（LandStep 尚未
-                // 收割；co≤0 时诊断口径未启用，跳过）。宿主包队列与
-                // cuvid parser/解码在途属未解码工作，不扣——首版把
-                // 它们误计入存货（低估 GPU 余量），已更正。
-                if (gpu_) {
-                    int64_t cp = 0, cb = 0, co = 0;
-                    gpu_->DiagDepths(&cp, &cb, &co);
-                    (void)cp;
-                    (void)cb;
-                    if (co > 0) gpu_inv += static_cast<std::size_t>(co);
-                }
-                const int64_t cpu_und =
-                    std::max<int64_t>(sess_.side_pending_[SIDE_CPU] - cpu_.QueueDepth(), 0);
-                const int64_t gpu_und = std::max<int64_t>(
-                    sess_.side_pending_[SIDE_GPU] - static_cast<int64_t>(gpu_inv), 0);
+                const int64_t cpu_und = UndecodedBacklog(SIDE_CPU);
+                const int64_t gpu_und = UndecodedBacklog(SIDE_GPU);
                 return (static_cast<double>(cpu_und) / r_c <= static_cast<double>(gpu_und) / r_g)
                            ? SIDE_CPU
                            : SIDE_GPU;
@@ -342,6 +325,41 @@ ffmpeg::AVPacketPtr HybridThreadedDecoder::CloneCachePacket(int64_t seq) {
     AVPacket* c = av_packet_clone(src.get());
     if (!c) return nullptr;
     return ffmpeg::AVPacketPtr(c, [](AVPacket* p) { av_packet_free(&p); });
+}
+
+int64_t HybridThreadedDecoder::UndecodedBacklog(Side s) {
+    // C-73：side-pure 未解码积压（口径与 ETA 尾规则/force_head 空闲判据
+    // 共用——见 hybrid_threaded_decoder.h 注释）。side_pending_ 的读法与
+    // 两个调用点的既有实践一致（写方持 mtx_，读方弱读，量级容差判 0）。
+    if (s == SIDE_CPU) {
+        std::size_t inv = cpu_.QueueDepth();  // filter 后帧队列 = 已解码可发射存货
+        if (out_cuda_) {
+            // gpu-out：上载线程已把帧从 cpu_ 提走攒进 cpu_ready_（H2D 完
+            // 成才入队），同属已解码存货——C-72 首版漏记此处 = CPU 虚忙。
+            std::lock_guard<std::mutex> lk(rmtx_);
+            inv += sess_.cpu_ready_.size();
+        }
+        return std::max<int64_t>(sess_.side_pending_[SIDE_CPU] - static_cast<int64_t>(inv), 0);
+    }
+    std::size_t inv = 0;
+    {
+        // ready_ 两种模式均只收 GPU 帧与 drain marker（CPU 臂帧走 cpu_/
+        // cpu_ready_ 账户，见 PopSide）——首版把 cpu_ready_ 记到此处。
+        std::lock_guard<std::mutex> lk(rmtx_);
+        inv = sess_.ready_.size();
+    }
+    inv += static_cast<std::size_t>(
+        std::max<int64_t>(d2h_inflight_.load(std::memory_order_relaxed), 0));
+    // cuvid reorder 输出队列（LandStep 尚未收割；co≤0 = 诊断口径未启用）。
+    // 宿主包队列与 cuvid parser/解码在途属未解码工作，不扣。
+    if (gpu_) {
+        int64_t cp = 0, cb = 0, co = 0;
+        gpu_->DiagDepths(&cp, &cb, &co);
+        (void)cp;
+        (void)cb;
+        if (co > 0) inv += static_cast<std::size_t>(co);
+    }
+    return std::max<int64_t>(sess_.side_pending_[SIDE_GPU] - static_cast<int64_t>(inv), 0);
 }
 
 }  // namespace decord

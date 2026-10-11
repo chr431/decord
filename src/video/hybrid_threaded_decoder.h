@@ -276,6 +276,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
     bool d2h_valid_[kD2HRingSlots] = {};
     bool d2h_pooled_[kD2HRingSlots] = {};  ///< host 帧来自 pinned 池（收割零拷贝）
     int64_t d2h_seq_ = 0;
+    std::atomic<int64_t> d2h_inflight_{0};  ///< 环内在途帧数（已解码未落地 ready_）
     std::size_t d2h_bytes_ = 0;
     void* d2h_stream_ = nullptr;  ///< D2H 专用非阻塞流（与 NVDEC 流并行）
     /*! \brief pinned 主机帧池（CPU-out）：D2H 直达最终帧，消除暂存
@@ -573,6 +574,15 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  用启动启发（gop0 GPU / gop1 CPU 采样）。速率未熟期的分配挂起与
      *  防饿死盲派见 PumpFeed（2026-09-18 启动轮）。 */
     Side PickFeedSide();
+    /*! \brief 各侧**未解码**积压（C-73，side-pure 口径）：     *  side_pending_（已路由未发射）扣除该侧已解码存货——CPU 侧 =
+     *  filter 后帧队列 + gpu-out 模式的 cpu_ready_ 上载存货；GPU 侧 =
+     *  sess_.ready_（两模式均只收 GPU 帧）+ D2H 环在途 + cuvid 输出
+     *  队列。发射按流序合并时，快侧已解码帧挂在 pending 里等轮次——
+     *  把「等发射」误判成「解码忙」会让 force-head 反复喂忙侧（C-72
+     *  的病，首版修法把 cpu_ready_ 记进 GPU 账户、D2H 环漏记，gpu-out
+     *  模式两侧账户互换 = h264 998fps 锁死实录 alloc=PiHHHHHHHH）。
+     *  存货含少量 marker（≤chunk 数+EOF），高估存货 ≤ 数帧，不级联。 */
+    int64_t UndecodedBacklog(Side s);
     /*! 打开/关闭当前 GOP（仅 Push 线程持 mtx_ 时调用；Close 从
      *  sess_.emit_queue_.back().end_pts 取终点，expected 写回 chunk）。 */
     void OpenGopLocked(int64_t pts);

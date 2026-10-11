@@ -844,10 +844,29 @@ NDArray VideoReader::NextFrameImpl() {
                                ? DECORD_PREFETCH_DEPTH_HYBRID
                                : DECORD_PREFETCH_DEPTH_BASE;
     prefetch_depth = std::max(prefetch_depth, decoder_->SuggestPrefetchDepth());
-    while (!eof_ && pkts_pushed_ - frames_popped_ < prefetch_depth - 1) {
-        PushNext();
-        if (!eof_) {
-            ++pkts_pushed_;  // real packet; PushNext sets eof_ when it pushed the flush
+    if (IsHybridType(static_cast<int>(ctx_.device_type))) {
+        // C-74（2026-10-11）：hybrid 顶饱门改 NeedsPackets（缓存字节预算
+        // + 硬窗缘 + 银行满逃生门，全部现成）。旧 pkts_pushed_-
+        // frames_popped_ 计账对 hybrid 永久虚高（侧丢弃/kick 克隆不核销，
+        // 下方 D3 注释自认），顶饱循环恒不触发——供给退化为重试循环的
+        // 每帧 1 包：demux 永远追不上发射，臂银行持续净消耗
+        // （h264 全片 cpk 5592→0 单调枯竭、cud 恒 21/28，CPU 臂实得
+        // 1890pkt/s vs 解码力 2333/s），臂解码供给被消费节奏钳制
+        // = 2657fps 自指上限的根源。改后 demux 独立冲刺到缓存预算，
+        // 臂银行由泵深供；DECORD_PREFETCH_DEPTH_HYBRID 保底仍生效
+        // （SuggestPrefetchDepth 取 max 的旧行为）。
+        while (!eof_ && decoder_->NeedsPackets()) {
+            PushNext();
+            if (!eof_) {
+                ++pkts_pushed_;  // real packet; PushNext sets eof_ when it pushed the flush
+            }
+        }
+    } else {
+        while (!eof_ && pkts_pushed_ - frames_popped_ < prefetch_depth - 1) {
+            PushNext();
+            if (!eof_) {
+                ++pkts_pushed_;  // real packet; PushNext sets eof_ when it pushed the flush
+            }
         }
     }
     bool ret = false;

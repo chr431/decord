@@ -426,6 +426,28 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
                 return (int)std::max<double>(double(lo), std::min<double>(v, double(hi)));
             };
             const double fb_roi = (double)frame_bytes_;
+            // CPU 臂银行重算（C-70/C-76 宿主输出扩展）：ComputeBudgets 的
+            // queue_frames_ 按**全帧**字节算出 1536 帧帽（4.8GB RAM 时代
+            // 的保守界），但 ROI 输出下 frame 项只有 KB 级 —— 1536 帧
+            // 仅 ~8MB，对侧（GPU）值日期的发射停顿盖不住（h264 GPU 头
+            // 阻塞 1.39s 期间 CPU 臂银行只够 ~0.5s，实测 27% 闲置）。
+            // 重算：ROI 帧按 RAM 预算放开；解码线程背压解耦到 raw 队列
+            // 并按全帧字节预算（768MB）封顶 —— 全帧内存风险由 raw 帽
+            // 独立承担，ROI 银行不再被合并计价错杀。2026-10-11 前此块
+            // 只在 out_cuda_ 内执行——引擎转宿主输出（C-76）后 GPU 置速
+            // 的码（av1：GPU 1706 > CPU 1349）快臂 CPU 冲顶 1536 帽停转
+            // （全片 av1 82.9% vs gpu-out 87.8%），宿主输出同样需要深银行。
+            if (fb_roi > 0) {
+                const int hi_q = std::max(4096, (int)(512.0 * 1048576 / fb_roi));
+                queue_frames_ = clampi(ram_budget_ * 0.45 / fb_roi, 96, hi_q);
+                cpu_.SetQueueDepth(queue_frames_);
+                const int64_t raw_bytes =
+                    static_cast<int64_t>(width_) > 0 && static_cast<int64_t>(height_) > 0
+                    ? static_cast<int64_t>(width_) * height_ * 3 / 2
+                    : 3 * 1024 * 1024;
+                cpu_.SetRawQueueFrames(
+                    clampi(768.0 * 1024 * 1024 / static_cast<double>(raw_bytes), 128, 4096));
+            }
             if (out_cuda_ && fb_roi > 0) {
                 // 帧数钳制按参考全帧（3.1MB）定价：ROI 帧 ~3.6KB 时
                 // 字节预算本允许 10^5 帧级，旧固定帽（8192/4096）在
@@ -438,23 +460,6 @@ void HybridThreadedDecoder::SetRoi(int x1, int y1, int x2, int y2) {
                 gpu_pool_frames_ = clampi(vram_budget_ * 0.65 / fb_roi, 96, hi_gpu);
                 up_pool_frames_ = clampi(vram_budget_ * 0.35 / fb_roi, 48, hi_up);
                 ready_cap_frames_ = gpu_pool_frames_ + up_pool_frames_ + 64;
-                // CPU 臂银行（2026-09-13 缺口分解）：ComputeBudgets 的
-                // queue_frames_ 按**全帧**字节算出 1536 帧帽（4.8GB RAM 时代
-                // 的保守界），但 ROI 输出下 frame 项只有 KB 级 —— 1536 帧
-                // 仅 ~8MB，对侧（GPU）值日期的发射停顿盖不住（h264 GPU 头
-                // 阻塞 1.39s 期间 CPU 臂银行只够 ~0.5s，实测 27% 闲置）。
-                // 重算：ROI 帧按 RAM 预算放开到 4096；解码线程背压解耦到
-                // raw 队列并按全帧字节预算（768MB）封顶 —— 全帧内存风险
-                // 由 raw 帽独立承担，ROI 银行不再被合并计价错杀。
-                const int hi_q = std::max(4096, (int)(512.0 * 1048576 / fb_roi));
-                queue_frames_ = clampi(ram_budget_ * 0.45 / fb_roi, 96, hi_q);
-                cpu_.SetQueueDepth(queue_frames_);
-                const int64_t raw_bytes =
-                    static_cast<int64_t>(width_) > 0 && static_cast<int64_t>(height_) > 0
-                        ? static_cast<int64_t>(width_) * height_ * 3 / 2
-                        : 3 * 1024 * 1024;
-                cpu_.SetRawQueueFrames(
-                    clampi(768.0 * 1024 * 1024 / static_cast<double>(raw_bytes), 128, 4096));
             }
         }
         gpu_pool_.Reset(gpu_pool_frames_, gpu_frame_shape_, kUInt8, DLDevice{kDLCUDA, device_id_});

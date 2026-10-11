@@ -9,6 +9,7 @@
 #include "../nvcodec/cuda_threaded_decoder.h"
 
 #include <dmlc/logging.h>
+#include <cstring>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -171,6 +172,7 @@ bool HybridThreadedDecoder::LandStep() {
                 d2h_pooled_[k] = true;
                 d2h_valid_[k] = true;
                 ++d2h_seq_;
+                d2h_inflight_.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
             // 无流/事件：池块上同步 D2H（罕见兜底），直接交付
@@ -199,6 +201,7 @@ bool HybridThreadedDecoder::LandStep() {
         d2h_gpu_[k] = f;  // 源保活（D2H 完成前不回池）
         d2h_valid_[k] = true;
         ++d2h_seq_;
+        d2h_inflight_.fetch_add(1, std::memory_order_relaxed);
     }
     return true;
 }
@@ -225,6 +228,7 @@ bool HybridThreadedDecoder::HarvestD2H(int k) {
     d2h_host_[k] = runtime::NDArray();
     d2h_gpu_[k] = runtime::NDArray();  // 源回池
     d2h_valid_[k] = false;
+    d2h_inflight_.fetch_sub(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -245,8 +249,10 @@ void HybridThreadedDecoder::FlushD2H() {
         d2h_host_[k] = runtime::NDArray();
         d2h_gpu_[k] = runtime::NDArray();
         d2h_valid_[k] = false;
+        d2h_inflight_.fetch_sub(1, std::memory_order_relaxed);
     }
     d2h_seq_ = 0;
+    d2h_inflight_.store(0, std::memory_order_relaxed);
 }
 
 void HybridThreadedDecoder::AbortInflight() {
@@ -264,6 +270,7 @@ void HybridThreadedDecoder::AbortInflight() {
         }
     }
     d2h_seq_ = 0;
+    d2h_inflight_.store(0, std::memory_order_relaxed);
     if (up_stream_ != nullptr) {
         cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(up_stream_));
     }

@@ -181,31 +181,16 @@ void HybridThreadedDecoder::PumpFeed(bool force_head) {
                     // 生效）。
                     const bool force_this = force_head && k == sess_.feed_gop_idx_;
                     if (force_this) {
-                        // C-72（2026-10-11）：空闲判据改**未解码积压**。
-                        // 旧 side_pending_==0 统计"已路由未发射"——发射按
-                        // 流序合并，慢侧未轮到时快侧已解码的帧也在
-                        // pending 里挂着 → 把"等发射轮次"误判成"解码忙"
-                        // → force 连续把 GOP 派给 GPU（alloc=PiHHHHHHHH
-                        // 实录），CPU 臂只拿采样 chunk = 1004fps 锁死形态。
-                        // 口径与 ETA 规则一致：pending 扣已解码存货。
-                        std::size_t inv_h = 0;
-                        {
-                            std::lock_guard<std::mutex> lk(rmtx_);
-                            inv_h = sess_.ready_.size() + (out_cuda_ ? sess_.cpu_ready_.size() : 0);
-                        }
-                        if (gpu_) {
-                            int64_t cp0 = 0, cb0 = 0, co0 = 0;
-                            gpu_->DiagDepths(&cp0, &cb0, &co0);
-                            (void)cp0;
-                            (void)cb0;
-                            if (co0 > 0) inv_h += static_cast<std::size_t>(co0);
-                        }
-                        const int64_t und_c =
-                            std::max<int64_t>(sess_.side_pending_[SIDE_CPU] - cpu_.QueueDepth(), 0);
-                        const int64_t und_g = std::max<int64_t>(
-                            sess_.side_pending_[SIDE_GPU] - static_cast<int64_t>(inv_h), 0);
-                        const bool ci = und_c == 0;
-                        const bool gi = und_g == 0;
+                        // C-72（2026-10-11）：空闲判据改**未解码积压**
+                        // （side_pending_ 统计"已路由未发射"，按序合并下快侧
+                        // 已解码帧挂在 pending 等轮次 = 把"等发射"误判成
+                        // "解码忙"）。C-73：口径收进 side-pure 的
+                        // UndecodedBacklog——首版修法在 gpu-out 模式把
+                        // cpu_ready_ 记进 GPU 账户、CPU 侧漏记同一存货
+                        // = 两侧账户互换，998fps 锁死复现
+                        // （alloc=PiHHHHHHHH、mode=gpu-out 实录）。
+                        const bool ci = UndecodedBacklog(SIDE_CPU) == 0;
+                        const bool gi = UndecodedBacklog(SIDE_GPU) == 0;
                         g.side = (ci && gi) ? PickFeedSide() : (ci ? SIDE_CPU : SIDE_GPU);
                         sess_.alloc_seq_ += 'H';
                     } else if (cpu_.ProductionRate() <= 0.0 ||
@@ -1128,11 +1113,26 @@ bool HybridThreadedDecoder::Pop(runtime::NDArray* frame) {
                     auto now = std::chrono::steady_clock::now();
                     double dt = std::chrono::duration<double>(now - tl_tp).count();
                     int64_t c = frames_out_[0].load(), g = frames_out_[1].load();
+                    int64_t cp = -1, cb = -1, co = -1;
+                    if (gpu_) gpu_->DiagDepths(&cp, &cb, &co);
+                    std::size_t crdy = 0, rdy = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(rmtx_);
+                        crdy = sess_.cpu_ready_.size();
+                        rdy = sess_.ready_.size();
+                    }
                     fprintf(stderr,
-                            "\n[emit-tl] t=%.2f total=%lld c=%lld(+%lld) g=%lld(+%lld) rate=%.0f",
+                            "\n[emit-tl] t=%.2f total=%lld c=%lld(+%lld) g=%lld(+%lld) rate=%.0f"
+                            " cq=%lld cpk=%lld craw=%lld cud=%lld/%lld/%lld crdy=%zu rdy=%zu"
+                            " pend=%lld/%lld gi=%lld/%zu",
                             std::chrono::duration<double>(now.time_since_epoch()).count(),
                             (long long)tl_total, (long long)c, (long long)(c - tl_c), (long long)g,
-                            (long long)(g - tl_g), dt > 0 ? 256.0 / dt : 0.0);
+                            (long long)(g - tl_g), dt > 0 ? 256.0 / dt : 0.0,
+                            (long long)cpu_.QueueDepth(), (long long)cpu_.PendingDepth(),
+                            (long long)cpu_.RawDepth(), (long long)cp, (long long)cb, (long long)co,
+                            crdy, rdy,
+                            (long long)sess_.side_pending_[0], (long long)sess_.side_pending_[1],
+                            (long long)sess_.feed_gop_idx_, sess_.gops_.size());
                     tl_tp = now;
                     tl_c = c;
                     tl_g = g;

@@ -136,6 +136,9 @@ class FFMPEGThreadedDecoder final : public ThreadedDecoderInterface {
             return (pkt_queue_ ? pkt_queue_->Size() : 0)
                  + (raw_queue_ ? raw_queue_->Size() : 0);
         }
+        /*! \brief raw 队列单列深度（已解码未 filter 的全帧）——混合调度
+         *  取证用：与 PendingDepth 的差定位"包在途"vs"filter 停摆"。 */
+        size_t RawDepth() const { return raw_queue_ ? raw_queue_->Size() : 0; }
         /*! 解码忙时累计（µs）与处理的包数（含 drain 哨兵）。忙时 = worker
          *  从取到包到该包解码处理完成的墙钟；Pop 阻塞（闲）不计入。混合
          *  解码器 Stop() 汇总用它区分「CPU 臂本身慢」与「CPU 臂闲置」。 */
