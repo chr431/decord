@@ -31,6 +31,9 @@
 #include <vector>
 
 namespace decord {
+namespace tr2probe {  // 定义在 pump.cc（取证探针，仅 DECORD_HYBRID_TRACE2 生效）
+void add(const char* fmt, ...);
+}  // namespace tr2probe
 
 runtime::NDArray HybridThreadedDecoder::ToHost(const runtime::NDArray& g) {
     CHECK(g.defined()) << "ToHost on undefined frame";
@@ -110,7 +113,11 @@ bool HybridThreadedDecoder::LandStep() {
         pinned_pool_->Acquire(&pooled);  // 失败 = 本次走暂存路径
     }
     runtime::NDArray f;
-    if (!gpu_->Pop(&f) || !f.defined()) return false;
+    const auto _tp0 = std::chrono::steady_clock::now();
+    const bool _pok = gpu_->Pop(&f);
+    tr2probe::add("[tr2] POP %.0fus defined=%d", std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - _tp0).count(), (int)f.defined());
+    if (!_pok || !f.defined()) return false;
     // 产出速率统计已外迁 GpuFrameProduced（CU display 线程逐帧触
     // 发，生产侧口径 2026-09-18）：落地线程排空 reorder 积压时会以
     // D2H 提交速度连 pop（假折 689655fps），生产侧不受积压影响；
@@ -338,7 +345,12 @@ bool HybridThreadedDecoder::FeedStep() {
         sess_.gpu_pkt_q_.push_front(std::move(pkt));
         return false;
     }
-    gpu_->Push(std::move(pkt), buf);
+    {
+        const auto _tp1 = std::chrono::steady_clock::now();
+        gpu_->Push(std::move(pkt), buf);
+        tr2probe::add("[tr2] PUSH %.0fus", std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - _tp1).count());
+    }
     return true;
 }
 

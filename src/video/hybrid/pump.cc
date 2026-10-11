@@ -528,7 +528,7 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
             }
             sess_.eof_cache_ = true;
         }
-        PumpFeed();
+        if (!push_batch_) PumpFeed();  // C-77：批量区间批末一次泵送
         return;
     }
     const bool is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
@@ -600,7 +600,7 @@ void HybridThreadedDecoder::Push(ffmpeg::AVPacketPtr pkt, runtime::NDArray buf) 
             ++sess_.cache_seq_;
         }
     }
-    PumpFeed();
+    if (!push_batch_) PumpFeed();  // C-77：批量区间批末一次泵送
 }
 
 void HybridThreadedDecoder::OpenGopLocked(int64_t pts) {

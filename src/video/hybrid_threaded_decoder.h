@@ -323,6 +323,11 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  kick 债务无条件放行（见 sess_.kick_side_ 注释，§16.1 第一层死锁）。
      *  Push/NeedsPackets/PumpFeed 同在消费线程（VideoReader 单线程
      *  demux），路由状态无竞态。 */
+    void BeginPushBatch() override { push_batch_ = true; }
+    void EndPushBatch() override {
+        push_batch_ = false;
+        PumpFeed();
+    }
     bool NeedsPackets() const override {
         if (sess_.eof_cache_) return false;
         if (sess_.kick_side_ != Side(-1) &&
@@ -380,6 +385,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
      *  同线程串行，GPU 落地节奏被上载拖住、NVDEC 被迫降速（实测 hevc
      *  hybrid_gpu 反而 0.71x 于纯 GPU）。 */
     std::thread uploader_;
+    bool push_batch_ = false;  ///< C-77：批量推包区间内 Push 不逐包泵送（仅消费线程读写）
     std::atomic<bool> lander_run_{false};
     /*! \brief 停滞飞行记录器线程（DECORD_HYBRID_FLIGHT=1 启动，4Hz
      *  快照到 decord_hybrid_flight.log；消费者路径零接触，取证用） */

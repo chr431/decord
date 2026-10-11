@@ -855,12 +855,30 @@ NDArray VideoReader::NextFrameImpl() {
         // = 2657fps 自指上限的根源。改后 demux 独立冲刺到缓存预算，
         // 臂银行由泵深供；DECORD_PREFETCH_DEPTH_HYBRID 保底仍生效
         // （SuggestPrefetchDepth 取 max 的旧行为）。
+        // C-77（2026-10-11 校准重叠轮）：批量推包区间——Push 只入缓存，
+        // 区间末一次 PumpFeed。此前每包一次泵扫描（O(gops)+锁）×24K 包
+        // ≈0.4s 全部落在首帧路径（tr2 实测：消费线程每帧 115ms =
+        // 384 包 burst × ~0.3ms/包泵开销；EMIT 间隔 113ms 精确吻合）。
+        // 批量化后整文件 demux+单次泵 ≈0.45s 集中付清（demux 在消费
+        // 线程上的结构性串行，独立 demux 线程属传输重设计范围）。
+        // 每 kPumpQuantum 包泵一次：纯批末一次会把解码启动推迟到整个
+        // demux 之后（实测 next974 0.007→0.71s = 银行未预填）；纯逐包则
+        // 泵扫描 ×24K ≈0.4s。量子取 512 包 ≈ 数 GOP 的臂粮食，泵开销
+        // /512 且解码随 demux 并行启动。
+        decoder_->BeginPushBatch();
+        int since_pump = 0;
         while (!eof_ && decoder_->NeedsPackets()) {
             PushNext();
             if (!eof_) {
                 ++pkts_pushed_;  // real packet; PushNext sets eof_ when it pushed the flush
             }
+            if (++since_pump >= 512) {
+                decoder_->EndPushBatch();
+                decoder_->BeginPushBatch();
+                since_pump = 0;
+            }
         }
+        decoder_->EndPushBatch();
     } else {
         while (!eof_ && pkts_pushed_ - frames_popped_ < prefetch_depth - 1) {
             PushNext();

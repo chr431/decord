@@ -97,6 +97,12 @@ class ThreadedDecoderInterface {
          *  无条件重试推包曾以消费轮询速度把 demux 拉到解码前面
          *  10+ chunks —— 盲阶段路由决策全部跑在速率学习之前。 */
         virtual bool NeedsPackets() const { return true; }
+
+        /*! rief 批量推包区间（C-77）：Begin 后 Push 只入缓存、End 时
+         *  一次 PumpFeed——顶饱循环每包一次泵扫描（O(gops)+锁 ×24K 包
+         *  ≈0.4s）只在批末付一次。默认空实现（仅 hybrid 覆写）。 */
+        virtual void BeginPushBatch() {}
+        virtual void EndPushBatch() {}
         virtual void SuggestDiscardPTS(std::vector<int64_t> dts) = 0;
         virtual void ClearDiscardPTS() = 0;
         /*! hybrid 遥测快照（"k=v;k=v" 协议字符串；非 hybrid 实现返回空）。
