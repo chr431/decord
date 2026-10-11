@@ -662,6 +662,7 @@ std::string HybridThreadedDecoder::HybridStatsProbe() {
     kv("frames_g", frames_out_[1].load());
     kv("chunks_c", sess_.chunks_assigned_[0]);
     kv("chunks_g", sess_.chunks_assigned_[1]);
+    out += "alloc_seq=" + sess_.alloc_seq_ + ";";
     kv("kicks_c", kicks_[0].load());
     kv("kicks_g", kicks_[1].load());
     kv("clones", fb_clones_.load());
@@ -741,9 +742,11 @@ void HybridThreadedDecoder::Stop() {
         // 一次性汇总（非打印测量协议的唯一输出点；析构时触发，不在被测
         // 墙钟窗口内）。口径见 .h「非打印测量」注释。
         fprintf(stderr,
-                "\n[hybrid-stats] mode=%s frames c=%lld g=%lld chunks c=%d g=%d"
+                "\n[hybrid-stats] alloc=%s mode=%s frames c=%lld g=%lld chunks c=%d g=%d"
                 " kicks c=%lld g=%lld clones=%lld\n",
-                out_cuda_ ? "gpu-out" : "cpu-out", (long long)frames_out_[0].load(),
+                sess_.alloc_seq_.c_str(),
+                out_cuda_ ? "gpu-out" : "cpu-out",
+                (long long)frames_out_[0].load(),
                 (long long)frames_out_[1].load(), sess_.chunks_assigned_[0],
                 sess_.chunks_assigned_[1], (long long)kicks_[0].load(), (long long)kicks_[1].load(),
                 (long long)fb_clones_.load());

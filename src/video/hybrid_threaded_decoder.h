@@ -545,6 +545,7 @@ class HybridThreadedDecoder : public ThreadedDecoderInterface {
         int64_t cache_base_seq_ = 0;                 ///< pkt_cache_.front() 的绝对序列号
         size_t cache_bytes_ = 0;                     ///< 在缓压缩字节（NeedsPackets 预算用）
         std::vector<GopRec> gops_;                   ///< 全部 GOP 的缓存记账
+        std::string alloc_seq_;                      ///< C-71 取证：派工决策序列（分支 tag + 侧别）
         int64_t feed_gop_idx_ = 0;                   ///< 下一个未供 GOP 的 gops_ 下标
         bool eof_cache_ = false;                     ///< demux EOF 已入缓
         bool arm_flush_sent_ = false;                ///< 排空标记已武装（幂等）
